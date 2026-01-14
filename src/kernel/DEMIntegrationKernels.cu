@@ -1,6 +1,7 @@
 // DEM integration related custom kernels
 #include <DEMHelperKernels.cuh>
 #include <DEM/Defines.h>
+#include <SimParamsConst.cuh>
 _kernelIncludes_;
 
 // Apply presecibed velocity and report whether the `true' physics should be skipped, rather than added on top of
@@ -25,9 +26,11 @@ inline __device__ void applyPrescribedVel(bool& LinVelXPrescribed,
                                           T4 oriQx,
                                           T4 oriQy,
                                           T4 oriQz,
+                                          deme::DEMDataDT* granData,
                                           deme::bodyID_t ownerID,
                                           const deme::family_t& family,
                                           const float& t) {
+    _velPrescriptionRuntime_;
     switch (family) {
         _velPrescriptionStrategy_;
         default:
@@ -55,9 +58,11 @@ inline __device__ void applyPrescribedPos(bool& LinXPrescribed,
                                           T4 omgBarX,
                                           T4 omgBarY,
                                           T4 omgBarZ,
+                                          deme::DEMDataDT* granData,
                                           deme::bodyID_t ownerID,
                                           const deme::family_t& family,
                                           const float& t) {
+    _posPrescriptionRuntime_;
     switch (family) {
         _posPrescriptionStrategy_;
         default:
@@ -87,9 +92,11 @@ inline __device__ void applyAddedAcceleration(T1& accX,
                                               T6 omgBarX,
                                               T6 omgBarY,
                                               T6 omgBarZ,
+                                              deme::DEMDataDT* granData,
                                               deme::bodyID_t ownerID,
                                               const deme::family_t& family,
                                               const float& t) {
+    _accPrescriptionRuntime_;
     switch (family) {
         _accPrescriptionStrategy_;
         default:
@@ -116,13 +123,13 @@ inline __device__ void integrateVelPos(deme::bodyID_t ownerID,
 
     {
         // Now XYZ gets the old position. We can write them directly back, then it is equivalent to being LinPrescribed.
-        voxelIDToPosition<double, deme::voxelID_t, deme::subVoxelPos_t>(
+        voxelIDToPositionConst<double, deme::voxelID_t, deme::subVoxelPos_t>(
             X, Y, Z, granData->voxelID[ownerID], granData->locX[ownerID], granData->locY[ownerID],
-            granData->locZ[ownerID], _nvXp2_, _nvYp2_, _voxelSize_, _l_);
+            granData->locZ[ownerID]);
         // Do this and we get the `true' pos... Needed for prescription
-        X += (double)simParams->LBFX;
-        Y += (double)simParams->LBFY;
-        Z += (double)simParams->LBFZ;
+        X += (double)DEME_SimParamsConst.LBFX;
+        Y += (double)DEME_SimParamsConst.LBFY;
+        Z += (double)DEME_SimParamsConst.LBFZ;
 
         // The user may directly change v and omgBar info in global memory in applyPrescribedVel (XYZ and oriQ in this
         // call are read-only)
@@ -130,13 +137,14 @@ inline __device__ void integrateVelPos(deme::bodyID_t ownerID,
                            RotVelYPrescribed, RotVelZPrescribed, granData->vX[ownerID], granData->vY[ownerID],
                            granData->vZ[ownerID], granData->omgBarX[ownerID], granData->omgBarY[ownerID],
                            granData->omgBarZ[ownerID], X, Y, Z, granData->oriQw[ownerID], granData->oriQx[ownerID],
-                           granData->oriQy[ownerID], granData->oriQz[ownerID], ownerID, family_code, (float)t);
+                           granData->oriQy[ownerID], granData->oriQz[ownerID], granData, ownerID, family_code,
+                           (float)t);
         // The user may directly change oriQ info (vX and omgBar in this call are read-only)
         applyPrescribedPos(LinXPrescribed, LinYPrescribed, LinZPrescribed, RotPrescribed, X, Y, Z,
                            granData->oriQw[ownerID], granData->oriQx[ownerID], granData->oriQy[ownerID],
                            granData->oriQz[ownerID], granData->vX[ownerID], granData->vY[ownerID],
                            granData->vZ[ownerID], granData->omgBarX[ownerID], granData->omgBarY[ownerID],
-                           granData->omgBarZ[ownerID], ownerID, family_code, (float)t);
+                           granData->omgBarZ[ownerID], granData, ownerID, family_code, (float)t);
     }
 
     // Operation phase...
@@ -149,22 +157,22 @@ inline __device__ void integrateVelPos(deme::bodyID_t ownerID,
                                Y, Z, granData->oriQw[ownerID], granData->oriQx[ownerID], granData->oriQy[ownerID],
                                granData->oriQz[ownerID], granData->vX[ownerID], granData->vY[ownerID],
                                granData->vZ[ownerID], granData->omgBarX[ownerID], granData->omgBarY[ownerID],
-                               granData->omgBarZ[ownerID], ownerID, family_code, (float)t);
+                               granData->omgBarZ[ownerID], granData, ownerID, family_code, (float)t);
 
         if (!LinVelXPrescribed) {
-            v_update.x = (granData->aX[ownerID] + extra_acc.x + simParams->Gx) * h;
+            v_update.x = (granData->aX[ownerID] + extra_acc.x + DEME_SimParamsConst.Gx) * h;
             granData->vX[ownerID] += v_update.x;
         } else {
             old_v.x = granData->vX[ownerID];
         }
         if (!LinVelYPrescribed) {
-            v_update.y = (granData->aY[ownerID] + extra_acc.y + simParams->Gy) * h;
+            v_update.y = (granData->aY[ownerID] + extra_acc.y + DEME_SimParamsConst.Gy) * h;
             granData->vY[ownerID] += v_update.y;
         } else {
             old_v.y = granData->vY[ownerID];
         }
         if (!LinVelZPrescribed) {
-            v_update.z = (granData->aZ[ownerID] + extra_acc.z + simParams->Gz) * h;
+            v_update.z = (granData->aZ[ownerID] + extra_acc.z + DEME_SimParamsConst.Gz) * h;
             granData->vZ[ownerID] += v_update.z;
         } else {
             old_v.z = granData->vZ[ownerID];
@@ -206,12 +214,12 @@ inline __device__ void integrateVelPos(deme::bodyID_t ownerID,
             Z += (double)v.z * h;
         }
         // Undo the influence of LBF...
-        X -= (double)simParams->LBFX;
-        Y -= (double)simParams->LBFY;
-        Z -= (double)simParams->LBFZ;
-        positionToVoxelID<deme::voxelID_t, deme::subVoxelPos_t, double>(
+        X -= (double)DEME_SimParamsConst.LBFX;
+        Y -= (double)DEME_SimParamsConst.LBFY;
+        Z -= (double)DEME_SimParamsConst.LBFZ;
+        positionToVoxelIDConst<deme::voxelID_t, deme::subVoxelPos_t, double>(
             granData->voxelID[ownerID], granData->locX[ownerID], granData->locY[ownerID], granData->locZ[ownerID], X, Y,
-            Z, _nvXp2_, _nvYp2_, _voxelSize_, _l_);
+            Z);
 
         if (!RotPrescribed) {
             // Then integrate the quaternion
@@ -252,7 +260,7 @@ inline __device__ void integrateVelPos(deme::bodyID_t ownerID,
 //     IDPacker<deme::voxelID_t, deme::voxelID_t>(voxel, voxelX, voxelY, voxelZ, _nvXp2_, _nvYp2_);
 // }
 
-__global__ void integrateOwners(deme::DEMSimParams* simParams, deme::DEMDataDT* granData, double timeElapsed) {
+extern "C" __global__ void integrateOwners(deme::DEMSimParams* simParams, deme::DEMDataDT* granData, double timeElapsed) {
     deme::bodyID_t ownerID = blockIdx.x * blockDim.x + threadIdx.x;
     if (ownerID < simParams->nOwnerBodies) {
         // These 2 quantities mean the velocity and ang vel used for updating position/quaternion for this step.

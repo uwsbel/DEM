@@ -33,7 +33,7 @@ __device__ __forceinline__ float getApproxAbsVel(deme::DEMSimParams* simParams,
     return vel;
 }
 
-__global__ void computeMarginFromAbsv_implSph(deme::DEMSimParams* simParams,
+extern "C" __global__ void computeMarginFromAbsv_implSph(deme::DEMSimParams* simParams,
                                               deme::DEMDataKT* granData,
                                               const float* absVel_owner,
                                               const float* absAngVel_owner,
@@ -58,7 +58,7 @@ __global__ void computeMarginFromAbsv_implSph(deme::DEMSimParams* simParams,
     }
 }
 
-__global__ void computeMarginFromAbsv_implTri(deme::DEMSimParams* simParams,
+extern "C" __global__ void computeMarginFromAbsv_implTri(deme::DEMSimParams* simParams,
                                               deme::DEMDataKT* granData,
                                               const float* absVel_owner,
                                               const float* absAngVel_owner,
@@ -95,7 +95,7 @@ __global__ void computeMarginFromAbsv_implTri(deme::DEMSimParams* simParams,
     }
 }
 
-__global__ void computeMarginFromAbsv_implAnal(deme::DEMSimParams* simParams,
+extern "C" __global__ void computeMarginFromAbsv_implAnal(deme::DEMSimParams* simParams,
                                                deme::DEMDataKT* granData,
                                                const float* absVel_owner,
                                                const float* absAngVel_owner,

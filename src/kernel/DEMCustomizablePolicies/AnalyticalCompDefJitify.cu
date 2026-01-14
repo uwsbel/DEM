@@ -1,15 +1,15 @@
-// nAnalGM elements are in these arrays
-__constant__ __device__ deme::objType_t objType[] = {_objType_};
-__constant__ __device__ deme::bodyID_t objOwner[] = {_objOwner_};
-__constant__ __device__ float objNormal[] = {_objNormal_};
-__constant__ __device__ deme::materialsOffset_t objMaterial[] = {_objMaterial_};
-__constant__ __device__ float objRelPosX[] = {_objRelPosX_};
-__constant__ __device__ float objRelPosY[] = {_objRelPosY_};
-__constant__ __device__ float objRelPosZ[] = {_objRelPosZ_};
-__constant__ __device__ float objRotX[] = {_objRotX_};
-__constant__ __device__ float objRotY[] = {_objRotY_};
-__constant__ __device__ float objRotZ[] = {_objRotZ_};
-__constant__ __device__ float objSize1[] = {_objSize1_};
-__constant__ __device__ float objSize2[] = {_objSize2_};
-__constant__ __device__ float objSize3[] = {_objSize3_};
-__constant__ __device__ float objMass[] = {_objMass_};
+// Fixed-capacity analytical constants; values are uploaded at runtime.
+extern "C" __device__ __constant__ __attribute__((used)) deme::objType_t objType[512];
+extern "C" __device__ __constant__ __attribute__((used)) deme::bodyID_t objOwner[512];
+extern "C" __device__ __constant__ __attribute__((used)) float objNormal[512];
+extern "C" __device__ __constant__ __attribute__((used)) deme::materialsOffset_t objMaterial[512];
+extern "C" __device__ __constant__ __attribute__((used)) float objRelPosX[512];
+extern "C" __device__ __constant__ __attribute__((used)) float objRelPosY[512];
+extern "C" __device__ __constant__ __attribute__((used)) float objRelPosZ[512];
+extern "C" __device__ __constant__ __attribute__((used)) float objRotX[512];
+extern "C" __device__ __constant__ __attribute__((used)) float objRotY[512];
+extern "C" __device__ __constant__ __attribute__((used)) float objRotZ[512];
+extern "C" __device__ __constant__ __attribute__((used)) float objSize1[512];
+extern "C" __device__ __constant__ __attribute__((used)) float objSize2[512];
+extern "C" __device__ __constant__ __attribute__((used)) float objSize3[512];
+extern "C" __device__ __constant__ __attribute__((used)) float objMass[512];

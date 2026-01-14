@@ -27,6 +27,7 @@
 #include "Defines.h"
 #include "Structs.h"
 #include "AuxClasses.h"
+#include <unordered_set>
 
 namespace deme {
 
@@ -295,6 +296,10 @@ class DEMDynamicThread {
     // Volume values
     DualArray<float> volumeOwnerBody = DualArray<float>(&m_approxHostBytesUsed, &m_approxDeviceBytesUsed);
 
+    // Material property tables (flattened global arrays)
+    DualArray<float> materialProps1D = DualArray<float>(&m_approxHostBytesUsed, &m_approxDeviceBytesUsed);
+    DualArray<float> materialProps2D = DualArray<float>(&m_approxHostBytesUsed, &m_approxDeviceBytesUsed);
+
     // The distinct sphere radii values
     DualArray<float> radiiSphere = DualArray<float>(&m_approxHostBytesUsed, &m_approxDeviceBytesUsed);
 
@@ -491,6 +496,16 @@ class DEMDynamicThread {
     // that means geometries should be considered in contact when they are physically in contact.
     DualArray<float> familyExtraMarginSize = DualArray<float>(&m_approxHostBytesUsed, &m_approxDeviceBytesUsed);
 
+    // Runtime family prescriptions (constant-only path)
+    DualArray<float3> familyPrescLinVel = DualArray<float3>(&m_approxHostBytesUsed, &m_approxDeviceBytesUsed);
+    DualArray<float3> familyPrescRotVel = DualArray<float3>(&m_approxHostBytesUsed, &m_approxDeviceBytesUsed);
+    DualArray<float3> familyPrescLinPos = DualArray<float3>(&m_approxHostBytesUsed, &m_approxDeviceBytesUsed);
+    DualArray<float3> familyPrescAcc = DualArray<float3>(&m_approxHostBytesUsed, &m_approxDeviceBytesUsed);
+    DualArray<float3> familyPrescAngAcc = DualArray<float3>(&m_approxHostBytesUsed, &m_approxDeviceBytesUsed);
+    DualArray<uint32_t> familyPrescSetMask = DualArray<uint32_t>(&m_approxHostBytesUsed, &m_approxDeviceBytesUsed);
+    DualArray<uint32_t> familyPrescPrescribedMask =
+        DualArray<uint32_t>(&m_approxHostBytesUsed, &m_approxDeviceBytesUsed);
+
     // dT's copy of "clump template and their names" map
     std::unordered_map<unsigned int, std::string> templateNumNameMap;
 
@@ -520,6 +535,7 @@ class DEMDynamicThread {
   public:
     friend class DEMSolver;
     friend class DEMKinematicThread;
+    friend class DEMInspector;
 
     DEMDynamicThread(WorkerReportChannel* pPager, ThreadManager* pSchedSup, const GpuManager::StreamInfo& sInfo)
         : pPagerToMain(pPager), pSchedSupport(pSchedSup), streamInfo(sInfo) {
@@ -772,7 +788,16 @@ class DEMDynamicThread {
                           const std::vector<float>& mesh_obj_mass_types,
                           const std::vector<float3>& mesh_obj_moi_types,
                           const std::vector<std::shared_ptr<DEMMaterial>>& loaded_materials,
+                          const std::vector<float>& material_props_1d,
+                          const std::vector<float>& material_props_2d,
                           const std::vector<notStupidBool_t>& family_mask_matrix,
+                          const std::vector<float3>& family_presc_lin_vel,
+                          const std::vector<float3>& family_presc_rot_vel,
+                          const std::vector<float3>& family_presc_lin_pos,
+                          const std::vector<float3>& family_presc_acc,
+                          const std::vector<float3>& family_presc_ang_acc,
+                          const std::vector<uint32_t>& family_presc_set_mask,
+                          const std::vector<uint32_t>& family_presc_prescribed_mask,
                           const std::set<unsigned int>& no_output_families);
 
     /// Initialized arrays
@@ -800,7 +825,16 @@ class DEMDynamicThread {
                        const std::vector<float3>& mesh_obj_moi_jit_types,
                        const std::vector<inertiaOffset_t>& mesh_obj_mass_offsets,
                        const std::vector<std::shared_ptr<DEMMaterial>>& loaded_materials,
+                       const std::vector<float>& material_props_1d,
+                       const std::vector<float>& material_props_2d,
                        const std::vector<notStupidBool_t>& family_mask_matrix,
+                       const std::vector<float3>& family_presc_lin_vel,
+                       const std::vector<float3>& family_presc_rot_vel,
+                       const std::vector<float3>& family_presc_lin_pos,
+                       const std::vector<float3>& family_presc_acc,
+                       const std::vector<float3>& family_presc_ang_acc,
+                       const std::vector<uint32_t>& family_presc_set_mask,
+                       const std::vector<uint32_t>& family_presc_prescribed_mask,
                        const std::set<unsigned int>& no_output_families,
                        std::vector<std::shared_ptr<DEMTrackedObj>>& tracked_objs);
 

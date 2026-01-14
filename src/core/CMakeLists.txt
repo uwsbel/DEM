@@ -14,12 +14,6 @@ configure_file(
 )
 
 
-message(STATUS "${core_message} Extracting NVIDIA Jitify header...") 
-configure_file(
-	${NVIDIAJitifyPath}/jitify.hpp
-	${CMAKE_BINARY_DIR}/src/jitify/jitify.hpp
-	COPYONLY
-)
 
 add_library(core OBJECT)
 
@@ -112,13 +106,6 @@ install(
 		${CMAKE_INSTALL_INCLUDEDIR}/core
 )
 
-# Install Third-party Headers 
-install(
-	FILES 
-		"${NVIDIAJitifyPath}/jitify.hpp"
-	DESTINATION 
-		${CMAKE_INSTALL_INCLUDEDIR}/jitify
-)
 
 
 # --------------------------------------------------------- #
@@ -215,4 +202,3 @@ set_target_properties(
 
 # Make sure this target is generated **AFTER** the build-tree version 
 add_dependencies(DEMERuntimeDataHelper_install DEMERuntimeDataHelper)
-

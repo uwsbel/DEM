@@ -1,5 +1,6 @@
 // DEM kernels used for quarrying (statistical) information from the current simulation system
 #include <DEM/Defines.h>
+#include <SimParamsConst.cuh>
 #include <DEMHelperKernels.cuh>
 _kernelIncludes_;
 
@@ -10,7 +11,7 @@ _clumpTemplateDefs_;
 // _massDefs_;
 // _moiDefs_;
 
-__global__ void inspectSphereProperty(deme::DEMDataDT* granData,
+extern "C" __global__ void inspectSphereProperty(deme::DEMDataDT* granData,
                                       deme::DEMSimParams* simParams,
                                       float* quantity,
                                       deme::notStupidBool_t* not_in_region,
@@ -29,9 +30,9 @@ __global__ void inspectSphereProperty(deme::DEMDataDT* granData,
         // Use an input named exactly `sphereID' which is the id of this sphere component
         { _componentAcqStrat_; }
 
-        voxelIDToPosition<double, deme::voxelID_t, deme::subVoxelPos_t>(
+        voxelIDToPositionConst<double, deme::voxelID_t, deme::subVoxelPos_t>(
             ownerX, ownerY, ownerZ, granData->voxelID[myOwner], granData->locX[myOwner], granData->locY[myOwner],
-            granData->locZ[myOwner], _nvXp2_, _nvYp2_, _voxelSize_, _l_);
+            granData->locZ[myOwner]);
         oriQw = granData->oriQw[myOwner];
         oriQx = granData->oriQx[myOwner];
         oriQy = granData->oriQy[myOwner];
@@ -40,9 +41,9 @@ __global__ void inspectSphereProperty(deme::DEMDataDT* granData,
 
         // Use sphereXYZ to determine if this sphere is in the region that should be counted
         // And don't forget adding LBF as an offset
-        float X = ownerX + myRelPos.x + simParams->LBFX;
-        float Y = ownerY + myRelPos.y + simParams->LBFY;
-        float Z = ownerZ + myRelPos.z + simParams->LBFZ;
+        float X = ownerX + myRelPos.x + DEME_SimParamsConst.LBFX;
+        float Y = ownerY + myRelPos.y + DEME_SimParamsConst.LBFY;
+        float Z = ownerZ + myRelPos.z + DEME_SimParamsConst.LBFZ;
         { _inRegionPolicy_; }
 
         // Now it's a problem of what quantity to query

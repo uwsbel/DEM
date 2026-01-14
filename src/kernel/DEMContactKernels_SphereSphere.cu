@@ -1,5 +1,6 @@
 // DEM contact detection-related custom kernels
 #include <DEM/Defines.h>
+#include <SimParamsConst.cuh>
 #include <DEMCollisionKernels_SphSph.cuh>
 _kernelIncludes_;
 
@@ -41,9 +42,9 @@ inline __device__ void fillSharedMemSpheres(deme::DEMSimParams* simParams,
     }
 
     // These locations does not include the LBF offset
-    voxelIDToPosition<double, deme::voxelID_t, deme::subVoxelPos_t>(
+    voxelIDToPositionConst<double, deme::voxelID_t, deme::subVoxelPos_t>(
         ownerX, ownerY, ownerZ, granData->voxelID[ownerID], granData->locX[ownerID], granData->locY[ownerID],
-        granData->locZ[ownerID], _nvXp2_, _nvYp2_, _voxelSize_, _l_);
+        granData->locZ[ownerID]);
     float myOriQw = granData->oriQw[ownerID];
     float myOriQx = granData->oriQx[ownerID];
     float myOriQy = granData->oriQy[ownerID];
@@ -80,7 +81,7 @@ inline __device__ bool calcContactPoint(deme::DEMSimParams* simParams,
     return in_contact;
 }
 
-__global__ void getNumberOfSphereContactsEachBin(deme::DEMSimParams* simParams,
+extern "C" __global__ void getNumberOfSphereContactsEachBin(deme::DEMSimParams* simParams,
                                                  deme::DEMDataKT* granData,
                                                  deme::bodyID_t* sphereIDsEachBinTouches_sorted,
                                                  deme::binID_t* activeBinIDs,
@@ -256,7 +257,7 @@ __global__ void getNumberOfSphereContactsEachBin(deme::DEMSimParams* simParams,
     }
 }
 
-__global__ void populateSphereContactPairsEachBin(deme::DEMSimParams* simParams,
+extern "C" __global__ void populateSphereContactPairsEachBin(deme::DEMSimParams* simParams,
                                                   deme::DEMDataKT* granData,
                                                   deme::bodyID_t* sphereIDsEachBinTouches_sorted,
                                                   deme::binID_t* activeBinIDs,

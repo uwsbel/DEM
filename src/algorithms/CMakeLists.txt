@@ -20,6 +20,11 @@ target_link_libraries(
 	PUBLIC CUB::CUB
 )
 
+target_compile_options(
+	algorithms
+	PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-diag-suppress=20044>
+)
+
 ### HOST HEADERS ONLY (.h, .hpp) ###
 set(algorithms_interface
 	${CMAKE_CURRENT_SOURCE_DIR}/DEMStaticDeviceSubroutines.h
@@ -37,6 +42,7 @@ set(algorithms_sources
 	${CMAKE_CURRENT_SOURCE_DIR}/DEMCubWrappers.cu 
 	${CMAKE_CURRENT_SOURCE_DIR}/DEMDynamicMisc.cu
 	${CMAKE_CURRENT_SOURCE_DIR}/DEMMiscKernels.cu
+	${CMAKE_CURRENT_SOURCE_DIR}/SimParamsConstDef.cu
 )
 
 target_sources(

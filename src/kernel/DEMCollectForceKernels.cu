@@ -8,7 +8,7 @@ _massDefs_;
 _moiDefs_;
 
 // computes a ./ b
-__global__ void forceToAcc(deme::DEMDataDT* granData, size_t n) {
+extern "C" __global__ void forceToAcc(deme::DEMDataDT* granData, size_t n) {
     deme::contactPairs_t myID = blockIdx.x * blockDim.x + threadIdx.x;
     if (myID < n) {
         deme::contact_t thisCntType = granData->contactTypePatch[myID];

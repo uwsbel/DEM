@@ -98,7 +98,7 @@ const std::string INSP_CODE_CLUMP_KE = R"V0G0N(
 
 const std::string INSP_CODE_CLUMP_APPROX_VOL = R"V0G0N(
     size_t myVolOffset = granData->inertiaPropOffsets[myOwner];
-    float myVol = volumeProperties[myVolOffset];
+    float myVol = granData->volumeOwnerBody[myVolOffset];
     quantity[myOwner] = myVol;
 )V0G0N";
 
@@ -302,6 +302,17 @@ void DEMInspector::Initialize(const std::unordered_map<std::string, std::string>
         DEME_ERROR(std::string(
             "Sorry, an inspector object you are using is not implemented yet.\nConsider letting the developers "
             "know this and they may help you."));
+    }
+    if (inspection_kernel) {
+        sys->uploadJitifiedSimParamsConst(inspection_kernel, kernel_name, dT->streamInfo.device,
+                                          dT->streamInfo.stream);
+        if (thing_to_insp == INSPECT_ENTITY_TYPE::SPHERE) {
+            sys->uploadJitifiedClumpTemplates(inspection_kernel, kernel_name, dT->streamInfo.device,
+                                              dT->streamInfo.stream);
+        }
+    }
+    if (sys->jitify_mass_moi && inspection_kernel && thing_to_insp != INSPECT_ENTITY_TYPE::SPHERE) {
+        sys->uploadJitifiedMassProperties(inspection_kernel, kernel_name, dT->streamInfo.device, dT->streamInfo.stream);
     }
     initialized = true;
 }

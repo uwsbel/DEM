@@ -213,7 +213,7 @@ __device__ __forceinline__ void calculatePatchContactForces_impl(deme::DEMSimPar
 }
 
 // 3 specialized kernels for patch-based contact types
-__global__ void calculatePatchContactForces_SphTri(deme::DEMSimParams* simParams,
+extern "C" __global__ void calculatePatchContactForces_SphTri(deme::DEMSimParams* simParams,
                                                    deme::DEMDataDT* granData,
                                                    const double* finalAreas,
                                                    const float3* finalNormals,
@@ -229,7 +229,7 @@ __global__ void calculatePatchContactForces_SphTri(deme::DEMSimParams* simParams
     }
 }
 
-__global__ void calculatePatchContactForces_TriTri(deme::DEMSimParams* simParams,
+extern "C" __global__ void calculatePatchContactForces_TriTri(deme::DEMSimParams* simParams,
                                                    deme::DEMDataDT* granData,
                                                    const double* finalAreas,
                                                    const float3* finalNormals,
@@ -245,7 +245,7 @@ __global__ void calculatePatchContactForces_TriTri(deme::DEMSimParams* simParams
     }
 }
 
-__global__ void calculatePatchContactForces_TriAnal(deme::DEMSimParams* simParams,
+extern "C" __global__ void calculatePatchContactForces_TriAnal(deme::DEMSimParams* simParams,
                                                     deme::DEMDataDT* granData,
                                                     const double* finalAreas,
                                                     const float3* finalNormals,

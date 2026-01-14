@@ -1,5 +1,6 @@
 // DEM contact detection-related custom kernels
 #include <DEM/Defines.h>
+#include <SimParamsConst.cuh>
 #include <DEMCollisionKernels_SphTri_TriTri.cuh>
 _kernelIncludes_;
 
@@ -38,9 +39,9 @@ inline __device__ void fillSharedMemTriangles(deme::DEMSimParams* simParams,
     float3 ownerXYZ;
     float3 node1, node2, node3;
 
-    voxelIDToPosition<float, deme::voxelID_t, deme::subVoxelPos_t>(
+    voxelIDToPositionConst<float, deme::voxelID_t, deme::subVoxelPos_t>(
         ownerXYZ.x, ownerXYZ.y, ownerXYZ.z, granData->voxelID[ownerID], granData->locX[ownerID],
-        granData->locY[ownerID], granData->locZ[ownerID], _nvXp2_, _nvYp2_, _voxelSize_, _l_);
+        granData->locY[ownerID], granData->locZ[ownerID]);
     float myOriQw = granData->oriQw[ownerID];
     float myOriQx = granData->oriQx[ownerID];
     float myOriQy = granData->oriQy[ownerID];
@@ -100,9 +101,9 @@ inline __device__ void fillSharedMemSpheres(deme::DEMSimParams* simParams,
     }
 
     // These locations does not include the LBF offset
-    voxelIDToPosition<float, deme::voxelID_t, deme::subVoxelPos_t>(
+    voxelIDToPositionConst<float, deme::voxelID_t, deme::subVoxelPos_t>(
         ownerX, ownerY, ownerZ, granData->voxelID[ownerID], granData->locX[ownerID], granData->locY[ownerID],
-        granData->locZ[ownerID], _nvXp2_, _nvYp2_, _voxelSize_, _l_);
+        granData->locZ[ownerID]);
     float myOriQw = granData->oriQw[ownerID];
     float myOriQx = granData->oriQx[ownerID];
     float myOriQy = granData->oriQy[ownerID];
@@ -228,7 +229,7 @@ inline __device__ bool checkPrismPrismContact(deme::DEMSimParams* simParams,
     return in_contact;
 }
 
-__global__ void getNumberOfTriangleContactsEachBin(deme::DEMSimParams* simParams,
+extern "C" __global__ void getNumberOfTriangleContactsEachBin(deme::DEMSimParams* simParams,
                                                    deme::DEMDataKT* granData,
                                                    deme::bodyID_t* sphereIDsEachBinTouches_sorted,
                                                    deme::binID_t* activeBinIDs,
@@ -500,7 +501,7 @@ __global__ void getNumberOfTriangleContactsEachBin(deme::DEMSimParams* simParams
     }
 }
 
-__global__ void populateTriangleContactsEachBin(deme::DEMSimParams* simParams,
+extern "C" __global__ void populateTriangleContactsEachBin(deme::DEMSimParams* simParams,
                                                 deme::DEMDataKT* granData,
                                                 deme::bodyID_t* sphereIDsEachBinTouches_sorted,
                                                 deme::binID_t* activeBinIDs,

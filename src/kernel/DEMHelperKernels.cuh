@@ -11,6 +11,13 @@
 #else
     #include <DEM/Defines.h>
 #endif
+#ifdef __CUDACC__
+    #if __has_include("SimParamsConst.cuh")
+        #include "SimParamsConst.cuh"
+    #else
+        #include <SimParamsConst.cuh>
+    #endif
+#endif
 
 //   __device__ voxelID_t position2VoxelID
 
@@ -89,12 +96,12 @@ __host__ __device__ T2 clampBetween(const T1& data, const T2& low, const T2& hig
 
 // Chops a long ID (typically voxelID) into XYZ components
 template <typename T1, typename T2>
-__host__ __device__ void IDChopper(T1& X,
-                                   T1& Y,
-                                   T1& Z,
-                                   const T2& ID,
-                                   const unsigned char& nvXp2,
-                                   const unsigned char& nvYp2) {
+__host__ __device__ __forceinline__ void IDChopper(T1& X,
+                                                   T1& Y,
+                                                   T1& Z,
+                                                   const T2& ID,
+                                                   const unsigned char& nvXp2,
+                                                   const unsigned char& nvYp2) {
     X = ID & (((T1)1 << nvXp2) - 1);  // & operation here equals modulo
     Y = (ID >> nvXp2) & (((T1)1 << nvYp2) - 1);
     Z = (ID) >> (nvXp2 + nvYp2);
@@ -102,12 +109,12 @@ __host__ __device__ void IDChopper(T1& X,
 
 // Packs XYZ components back to a long ID (typically voxelID)
 template <typename T1, typename T2>
-__host__ __device__ void IDPacker(T1& ID,
-                                  const T2& X,
-                                  const T2& Y,
-                                  const T2& Z,
-                                  const unsigned char& nvXp2,
-                                  const unsigned char& nvYp2) {
+__host__ __device__ __forceinline__ void IDPacker(T1& ID,
+                                                  const T2& X,
+                                                  const T2& Y,
+                                                  const T2& Z,
+                                                  const unsigned char& nvXp2,
+                                                  const unsigned char& nvYp2) {
     ID = X;
     ID += Y << nvXp2;
     ID += Z << (nvXp2 + nvYp2);
@@ -115,17 +122,17 @@ __host__ __device__ void IDPacker(T1& ID,
 
 // From a voxelID to (usually double-precision) xyz coordinate
 template <typename T1, typename T2, typename T3>
-__host__ __device__ void voxelIDToPosition(T1& X,
-                                           T1& Y,
-                                           T1& Z,
-                                           const T2& ID,
-                                           const T3& subPosX,
-                                           const T3& subPosY,
-                                           const T3& subPosZ,
-                                           const unsigned char& nvXp2,
-                                           const unsigned char& nvYp2,
-                                           const T1& voxelSize,
-                                           const T1& l) {
+__host__ __device__ __forceinline__ void voxelIDToPosition(T1& X,
+                                                           T1& Y,
+                                                           T1& Z,
+                                                           const T2& ID,
+                                                           const T3& subPosX,
+                                                           const T3& subPosY,
+                                                           const T3& subPosZ,
+                                                           const unsigned char& nvXp2,
+                                                           const unsigned char& nvYp2,
+                                                           const T1& voxelSize,
+                                                           const T1& l) {
     T2 voxelIDX, voxelIDY, voxelIDZ;
     IDChopper<T2, T2>(voxelIDX, voxelIDY, voxelIDZ, ID, nvXp2, nvYp2);
     X = (T1)voxelIDX * voxelSize + (T1)subPosX * l;
@@ -135,17 +142,17 @@ __host__ __device__ void voxelIDToPosition(T1& X,
 
 // From xyz coordinate (usually double-precision) to voxelID
 template <typename T1, typename T2, typename T3>
-__host__ __device__ void positionToVoxelID(T1& ID,
-                                           T2& subPosX,
-                                           T2& subPosY,
-                                           T2& subPosZ,
-                                           const T3& X,
-                                           const T3& Y,
-                                           const T3& Z,
-                                           const unsigned char& nvXp2,
-                                           const unsigned char& nvYp2,
-                                           const T3& voxelSize,
-                                           const T3& l) {
+__host__ __device__ __forceinline__ void positionToVoxelID(T1& ID,
+                                                           T2& subPosX,
+                                                           T2& subPosY,
+                                                           T2& subPosZ,
+                                                           const T3& X,
+                                                           const T3& Y,
+                                                           const T3& Z,
+                                                           const unsigned char& nvXp2,
+                                                           const unsigned char& nvYp2,
+                                                           const T3& voxelSize,
+                                                           const T3& l) {
     deme::voxelID_t voxelNumX = X / voxelSize;
     deme::voxelID_t voxelNumY = Y / voxelSize;
     deme::voxelID_t voxelNumZ = Z / voxelSize;
@@ -157,6 +164,56 @@ __host__ __device__ void positionToVoxelID(T1& ID,
     ID += voxelNumY << nvXp2;
     ID += voxelNumZ << (nvXp2 + nvYp2);
 }
+
+#ifdef __CUDACC__
+// Const-memory fast paths for runtime sim params.
+template <typename T1, typename T2, typename T3>
+__device__ __forceinline__ void voxelIDToPositionConst(T1& X,
+                                                       T1& Y,
+                                                       T1& Z,
+                                                       const T2& ID,
+                                                       const T3& subPosX,
+                                                       const T3& subPosY,
+                                                       const T3& subPosZ) {
+    const T2 maskX = static_cast<T2>(DEME_SimParamsConst.voxelMaskX);
+    const T2 maskY = static_cast<T2>(DEME_SimParamsConst.voxelMaskY);
+    const T2 shiftX = static_cast<T2>(DEME_SimParamsConst.nvXp2);
+    const T2 shiftZ = static_cast<T2>(DEME_SimParamsConst.nvXp2nvYp2);
+    const T1 voxelSize = static_cast<T1>(DEME_SimParamsConst.voxelSize);
+    const T1 l = static_cast<T1>(DEME_SimParamsConst.l);
+    const T2 voxelIDX = ID & maskX;
+    const T2 voxelIDY = (ID >> shiftX) & maskY;
+    const T2 voxelIDZ = ID >> shiftZ;
+    X = (T1)voxelIDX * voxelSize + (T1)subPosX * l;
+    Y = (T1)voxelIDY * voxelSize + (T1)subPosY * l;
+    Z = (T1)voxelIDZ * voxelSize + (T1)subPosZ * l;
+}
+
+template <typename T1, typename T2, typename T3>
+__device__ __forceinline__ void positionToVoxelIDConst(T1& ID,
+                                                       T2& subPosX,
+                                                       T2& subPosY,
+                                                       T2& subPosZ,
+                                                       const T3& X,
+                                                       const T3& Y,
+                                                       const T3& Z) {
+    const T3 invVoxelSize = static_cast<T3>(DEME_SimParamsConst.invVoxelSize);
+    const T3 invL = static_cast<T3>(DEME_SimParamsConst.invL);
+    const T3 voxelSize = static_cast<T3>(DEME_SimParamsConst.voxelSize);
+    const T1 shiftX = static_cast<T1>(DEME_SimParamsConst.nvXp2);
+    const T1 shiftZ = static_cast<T1>(DEME_SimParamsConst.nvXp2nvYp2);
+    const deme::voxelID_t voxelNumX = X * invVoxelSize;
+    const deme::voxelID_t voxelNumY = Y * invVoxelSize;
+    const deme::voxelID_t voxelNumZ = Z * invVoxelSize;
+    subPosX = (X - (T3)voxelNumX * voxelSize) * invL;
+    subPosY = (Y - (T3)voxelNumY * voxelSize) * invL;
+    subPosZ = (Z - (T3)voxelNumZ * voxelSize) * invL;
+
+    ID = voxelNumX;
+    ID += voxelNumY << shiftX;
+    ID += voxelNumZ << shiftZ;
+}
+#endif
 
 template <typename T1, typename T2>
 __host__ __device__ void

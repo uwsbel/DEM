@@ -1,5 +1,10 @@
 deme::clumpComponentOffset_t myCompOffset = granData->clumpComponentOffset[sphereID];
-if (myCompOffset != deme::RESERVED_CLUMP_COMPONENT_OFFSET) {
+if (simParams->nJitifiableClumpComponents == simParams->nDistinctClumpComponents) {
+    myRelPos.x = CDRelPosX[myCompOffset];
+    myRelPos.y = CDRelPosY[myCompOffset];
+    myRelPos.z = CDRelPosZ[myCompOffset];
+    myRadius = Radii[myCompOffset];
+} else if (myCompOffset != deme::RESERVED_CLUMP_COMPONENT_OFFSET) {
     myRelPos.x = CDRelPosX[myCompOffset];
     myRelPos.y = CDRelPosY[myCompOffset];
     myRelPos.z = CDRelPosZ[myCompOffset];

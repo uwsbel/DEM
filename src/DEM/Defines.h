@@ -161,6 +161,52 @@ const unsigned int DEFAULT_CLUMP_FAMILY_NUM = 0;
 constexpr unsigned int RESERVED_FAMILY_NUM = ((unsigned int)1 << (sizeof(family_t) * DEME_BITS_PER_BYTE)) - 1;
 // The number of all possible families is known: it depends on family_t
 constexpr size_t NUM_AVAL_FAMILIES = (size_t)1 << (sizeof(family_t) * DEME_BITS_PER_BYTE);
+
+// Family prescription masks (runtime path for constant prescriptions)
+constexpr uint32_t DEME_FAMILY_PRESC_SET_LINVEL_X = 1u << 0;
+constexpr uint32_t DEME_FAMILY_PRESC_SET_LINVEL_Y = 1u << 1;
+constexpr uint32_t DEME_FAMILY_PRESC_SET_LINVEL_Z = 1u << 2;
+constexpr uint32_t DEME_FAMILY_PRESC_SET_ROTVEL_X = 1u << 3;
+constexpr uint32_t DEME_FAMILY_PRESC_SET_ROTVEL_Y = 1u << 4;
+constexpr uint32_t DEME_FAMILY_PRESC_SET_ROTVEL_Z = 1u << 5;
+constexpr uint32_t DEME_FAMILY_PRESC_SET_LINPOS_X = 1u << 6;
+constexpr uint32_t DEME_FAMILY_PRESC_SET_LINPOS_Y = 1u << 7;
+constexpr uint32_t DEME_FAMILY_PRESC_SET_LINPOS_Z = 1u << 8;
+constexpr uint32_t DEME_FAMILY_PRESC_SET_ACC_X = 1u << 9;
+constexpr uint32_t DEME_FAMILY_PRESC_SET_ACC_Y = 1u << 10;
+constexpr uint32_t DEME_FAMILY_PRESC_SET_ACC_Z = 1u << 11;
+constexpr uint32_t DEME_FAMILY_PRESC_SET_ANGACC_X = 1u << 12;
+constexpr uint32_t DEME_FAMILY_PRESC_SET_ANGACC_Y = 1u << 13;
+constexpr uint32_t DEME_FAMILY_PRESC_SET_ANGACC_Z = 1u << 14;
+
+constexpr uint32_t DEME_FAMILY_PRESC_SET_LINVEL_MASK =
+    DEME_FAMILY_PRESC_SET_LINVEL_X | DEME_FAMILY_PRESC_SET_LINVEL_Y | DEME_FAMILY_PRESC_SET_LINVEL_Z;
+constexpr uint32_t DEME_FAMILY_PRESC_SET_ROTVEL_MASK =
+    DEME_FAMILY_PRESC_SET_ROTVEL_X | DEME_FAMILY_PRESC_SET_ROTVEL_Y | DEME_FAMILY_PRESC_SET_ROTVEL_Z;
+constexpr uint32_t DEME_FAMILY_PRESC_SET_LINPOS_MASK =
+    DEME_FAMILY_PRESC_SET_LINPOS_X | DEME_FAMILY_PRESC_SET_LINPOS_Y | DEME_FAMILY_PRESC_SET_LINPOS_Z;
+constexpr uint32_t DEME_FAMILY_PRESC_SET_ACC_MASK =
+    DEME_FAMILY_PRESC_SET_ACC_X | DEME_FAMILY_PRESC_SET_ACC_Y | DEME_FAMILY_PRESC_SET_ACC_Z;
+constexpr uint32_t DEME_FAMILY_PRESC_SET_ANGACC_MASK =
+    DEME_FAMILY_PRESC_SET_ANGACC_X | DEME_FAMILY_PRESC_SET_ANGACC_Y | DEME_FAMILY_PRESC_SET_ANGACC_Z;
+
+constexpr uint32_t DEME_FAMILY_PRESC_FLAG_LINVEL_X = 1u << 0;
+constexpr uint32_t DEME_FAMILY_PRESC_FLAG_LINVEL_Y = 1u << 1;
+constexpr uint32_t DEME_FAMILY_PRESC_FLAG_LINVEL_Z = 1u << 2;
+constexpr uint32_t DEME_FAMILY_PRESC_FLAG_ROTVEL_X = 1u << 3;
+constexpr uint32_t DEME_FAMILY_PRESC_FLAG_ROTVEL_Y = 1u << 4;
+constexpr uint32_t DEME_FAMILY_PRESC_FLAG_ROTVEL_Z = 1u << 5;
+constexpr uint32_t DEME_FAMILY_PRESC_FLAG_LINPOS_X = 1u << 6;
+constexpr uint32_t DEME_FAMILY_PRESC_FLAG_LINPOS_Y = 1u << 7;
+constexpr uint32_t DEME_FAMILY_PRESC_FLAG_LINPOS_Z = 1u << 8;
+constexpr uint32_t DEME_FAMILY_PRESC_FLAG_ROTPOS = 1u << 9;
+
+constexpr uint32_t DEME_FAMILY_PRESC_FLAG_LINVEL_MASK =
+    DEME_FAMILY_PRESC_FLAG_LINVEL_X | DEME_FAMILY_PRESC_FLAG_LINVEL_Y | DEME_FAMILY_PRESC_FLAG_LINVEL_Z;
+constexpr uint32_t DEME_FAMILY_PRESC_FLAG_ROTVEL_MASK =
+    DEME_FAMILY_PRESC_FLAG_ROTVEL_X | DEME_FAMILY_PRESC_FLAG_ROTVEL_Y | DEME_FAMILY_PRESC_FLAG_ROTVEL_Z;
+constexpr uint32_t DEME_FAMILY_PRESC_FLAG_LINPOS_MASK =
+    DEME_FAMILY_PRESC_FLAG_LINPOS_X | DEME_FAMILY_PRESC_FLAG_LINPOS_Y | DEME_FAMILY_PRESC_FLAG_LINPOS_Z;
 // Reserved clump template mark number, used to indicate the largest inertiaOffset number (currently not used since all
 // inertia properties are jitified)
 constexpr inertiaOffset_t RESERVED_INERTIA_OFFSET = ((size_t)1 << (sizeof(inertiaOffset_t) * DEME_BITS_PER_BYTE)) - 1;
@@ -171,10 +217,14 @@ constexpr clumpComponentOffset_t RESERVED_CLUMP_COMPONENT_OFFSET =
 // Used to be compared against, so we know if some of the sphere components need to stay in global memory
 constexpr unsigned int THRESHOLD_CANT_JITIFY_ALL_COMP =
     DEME_MIN(DEME_MIN(RESERVED_CLUMP_COMPONENT_OFFSET, DEME_THRESHOLD_BIG_CLUMP), DEME_THRESHOLD_TOO_MANY_SPHERE_COMP);
+// Fixed capacity for clump component constants stored in constant memory.
+constexpr size_t DEME_CLUMP_COMPONENT_CONST_CAPACITY = THRESHOLD_CANT_JITIFY_ALL_COMP;
 // Max size change the bin auto-adjust algorithm can apply to the bin size per step
 constexpr float BIN_SIZE_MAX_CHANGE_RATE = 0.2;
 // Safety factor for hertz const adative time step
 constexpr double N_DT = 16.0;
+// Fixed capacity for material property arrays stored in global memory.
+constexpr size_t DEME_MATERIAL_PROP_CAPACITY = 64;
 
 // Some enums...
 // Stepping method
@@ -242,6 +292,37 @@ struct DEMSimParamsDynamic {
     float expSafetyMulti;
     // Expand safety parameter (adder for the max vel)
     float expSafetyAdder;
+};
+
+// A structure for storing static simulation parameters (uploaded to constant memory).
+struct DEMSimParamsConst {
+    // Number of voxels in the X direction, expressed as a power of 2
+    unsigned char nvXp2;
+    // Number of voxels in the Y direction, expressed as a power of 2
+    unsigned char nvYp2;
+    // Number of voxels in the Z direction, expressed as a power of 2
+    unsigned char nvZp2;
+    // nvXp2 + nvYp2, precomputed for voxel ID shifts
+    unsigned char nvXp2nvYp2;
+    // Voxel ID masks for unpacking
+    voxelID_t voxelMaskX;
+    voxelID_t voxelMaskY;
+    // Smallest length unit
+    double l;
+    // Precomputed inverse of l
+    double invL;
+    // Double-precision single voxel size
+    double voxelSize;
+    // Precomputed inverse of voxelSize
+    double invVoxelSize;
+    // Coordinate of the left-bottom-front point of the simulation world
+    float LBFX;
+    float LBFY;
+    float LBFZ;
+    // Gravitational acceleration
+    float Gx;
+    float Gy;
+    float Gz;
 };
 
 // A structure for storing mostly static simulation parameters.
@@ -368,6 +449,14 @@ struct DEMDataDT {
     notStupidBool_t* familyMasks;
     // Extra margin size
     float* familyExtraMarginSize;
+    // Family prescription (runtime constants)
+    float3* familyPrescLinVel;
+    float3* familyPrescRotVel;
+    float3* familyPrescLinPos;
+    float3* familyPrescAcc;
+    float3* familyPrescAngAcc;
+    uint32_t* familyPrescSetMask;
+    uint32_t* familyPrescPrescribedMask;
 
     // Some dT's own work array pointers
     float3* contactForces;
@@ -424,6 +513,8 @@ struct DEMDataDT {
     float* mmiYY;
     float* mmiZZ;
     float* volumeOwnerBody;
+    float* materialProps1D;
+    float* materialProps2D;
 
     // Wildcards. These are some quantities that you can associate with contact pairs and objects. Very
     // typically, contact history info in Hertzian model in this DEM tool is a wildcard, and electric charges can be

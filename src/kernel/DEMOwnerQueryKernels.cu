@@ -1,5 +1,6 @@
 // DEM kernels used for quarrying (statistical) information from the current simulation system
 #include <DEM/Defines.h>
+#include <SimParamsConst.cuh>
 #include <DEMHelperKernels.cuh>
 _kernelIncludes_;
 
@@ -8,7 +9,7 @@ _massDefs_;
 _moiDefs_;
 _volumeDefs_;
 
-__global__ void inspectOwnerProperty(deme::DEMDataDT* granData,
+extern "C" __global__ void inspectOwnerProperty(deme::DEMDataDT* granData,
                                      deme::DEMSimParams* simParams,
                                      float* quantity,
                                      deme::notStupidBool_t* not_in_region,
@@ -32,9 +33,9 @@ __global__ void inspectOwnerProperty(deme::DEMDataDT* granData,
             // Use an input named exactly `myOwner' which is the id of this owner
             { _moiAcqStrat_; }
 
-            voxelIDToPosition<double, deme::voxelID_t, deme::subVoxelPos_t>(
+            voxelIDToPositionConst<double, deme::voxelID_t, deme::subVoxelPos_t>(
                 ownerX, ownerY, ownerZ, granData->voxelID[myOwner], granData->locX[myOwner], granData->locY[myOwner],
-                granData->locZ[myOwner], _nvXp2_, _nvYp2_, _voxelSize_, _l_);
+                granData->locZ[myOwner]);
             oriQw = granData->oriQw[myOwner];
             oriQx = granData->oriQx[myOwner];
             oriQy = granData->oriQy[myOwner];
@@ -42,9 +43,9 @@ __global__ void inspectOwnerProperty(deme::DEMDataDT* granData,
 
             // Use sphereXYZ to determine if this sphere is in the region that should be counted
             // And don't forget adding LBF as an offset
-            float X = ownerX + simParams->LBFX;
-            float Y = ownerY + simParams->LBFY;
-            float Z = ownerZ + simParams->LBFZ;
+            float X = ownerX + DEME_SimParamsConst.LBFX;
+            float Y = ownerY + DEME_SimParamsConst.LBFY;
+            float Z = ownerZ + DEME_SimParamsConst.LBFZ;
             { _inRegionPolicy_; }
 
             // Now it's a problem of what quantity to query

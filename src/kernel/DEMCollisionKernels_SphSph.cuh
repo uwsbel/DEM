@@ -14,14 +14,13 @@ inline __device__ void equipOwnerPosRot(deme::DEMSimParams* simParams,
                                         double3& ownerPos,
                                         double3& bodyPos,
                                         float4& oriQ) {
-    voxelIDToPosition<double, deme::voxelID_t, deme::subVoxelPos_t>(
+    voxelIDToPositionConst<double, deme::voxelID_t, deme::subVoxelPos_t>(
         ownerPos.x, ownerPos.y, ownerPos.z, granData->voxelID[myOwner], granData->locX[myOwner],
-        granData->locY[myOwner], granData->locZ[myOwner], simParams->nvXp2, simParams->nvYp2, simParams->voxelSize,
-        simParams->l);
+        granData->locY[myOwner], granData->locZ[myOwner]);
     // Do this and we get the `true' pos...
-    ownerPos.x += simParams->LBFX;
-    ownerPos.y += simParams->LBFY;
-    ownerPos.z += simParams->LBFZ;
+    ownerPos.x += DEME_SimParamsConst.LBFX;
+    ownerPos.y += DEME_SimParamsConst.LBFY;
+    ownerPos.z += DEME_SimParamsConst.LBFZ;
     oriQ.w = granData->oriQw[myOwner];
     oriQ.x = granData->oriQx[myOwner];
     oriQ.y = granData->oriQy[myOwner];

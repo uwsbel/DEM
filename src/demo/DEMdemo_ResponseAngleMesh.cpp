@@ -88,6 +88,8 @@ int main() {
     DEMSim.SetMeshOutputFormat("STL");
     DEMSim.SetNoForceRecord();
     DEMSim.SetMeshUniversalContact(true);
+
+
     const float mm_to_m = 0.001f;
     const float drum_inner_radius = 0.1f;  // 200 mm diameter
     const float wall_clearance = 0.002f;   // leave a small gap to the mantle
@@ -139,7 +141,7 @@ int main() {
     auto cap_tracker = DEMSim.Track(end_caps);
 
     // Sample 5000 particles inside the cylindrical volume with a small wall clearance.
-    const unsigned int target_particles = 5000;
+    const unsigned int target_particles = 15000;
     const float sample_radius = drum_inner_radius - wall_clearance - tri_radius;
     const float sample_halfheight = drum_height / 2.0f - wall_clearance - tri_radius;
     HCPSampler sampler(tri_diag * 1.05f);

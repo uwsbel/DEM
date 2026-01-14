@@ -85,6 +85,13 @@ void DEMDynamicThread::packDataPointers() {
 
     familyMaskMatrix.bindDevicePointer(&(granData->familyMasks));
     familyExtraMarginSize.bindDevicePointer(&(granData->familyExtraMarginSize));
+    familyPrescLinVel.bindDevicePointer(&(granData->familyPrescLinVel));
+    familyPrescRotVel.bindDevicePointer(&(granData->familyPrescRotVel));
+    familyPrescLinPos.bindDevicePointer(&(granData->familyPrescLinPos));
+    familyPrescAcc.bindDevicePointer(&(granData->familyPrescAcc));
+    familyPrescAngAcc.bindDevicePointer(&(granData->familyPrescAngAcc));
+    familyPrescSetMask.bindDevicePointer(&(granData->familyPrescSetMask));
+    familyPrescPrescribedMask.bindDevicePointer(&(granData->familyPrescPrescribedMask));
 
     contactForces.bindDevicePointer(&(granData->contactForces));
     contactTorque_convToForce.bindDevicePointer(&(granData->contactTorque_convToForce));
@@ -112,6 +119,8 @@ void DEMDynamicThread::packDataPointers() {
     clumpComponentOffsetExt.bindDevicePointer(&(granData->clumpComponentOffsetExt));
     sphereMaterialOffset.bindDevicePointer(&(granData->sphereMaterialOffset));
     volumeOwnerBody.bindDevicePointer(&(granData->volumeOwnerBody));
+    materialProps1D.bindDevicePointer(&(granData->materialProps1D));
+    materialProps2D.bindDevicePointer(&(granData->materialProps2D));
 
     // Mesh and analytical-related
     ownerTriMesh.bindDevicePointer(&(granData->ownerTriMesh));
@@ -248,6 +257,13 @@ void DEMDynamicThread::migrateDataToDevice() {
 
     familyMaskMatrix.toDeviceAsync(streamInfo.stream);
     familyExtraMarginSize.toDeviceAsync(streamInfo.stream);
+    familyPrescLinVel.toDeviceAsync(streamInfo.stream);
+    familyPrescRotVel.toDeviceAsync(streamInfo.stream);
+    familyPrescLinPos.toDeviceAsync(streamInfo.stream);
+    familyPrescAcc.toDeviceAsync(streamInfo.stream);
+    familyPrescAngAcc.toDeviceAsync(streamInfo.stream);
+    familyPrescSetMask.toDeviceAsync(streamInfo.stream);
+    familyPrescPrescribedMask.toDeviceAsync(streamInfo.stream);
 
     contactForces.toDeviceAsync(streamInfo.stream);
     contactTorque_convToForce.toDeviceAsync(streamInfo.stream);
@@ -271,6 +287,8 @@ void DEMDynamicThread::migrateDataToDevice() {
     clumpComponentOffsetExt.toDeviceAsync(streamInfo.stream);
     sphereMaterialOffset.toDeviceAsync(streamInfo.stream);
     volumeOwnerBody.toDeviceAsync(streamInfo.stream);
+    materialProps1D.toDeviceAsync(streamInfo.stream);
+    materialProps2D.toDeviceAsync(streamInfo.stream);
 
     ownerTriMesh.toDeviceAsync(streamInfo.stream);
     ownerPatchMesh.toDeviceAsync(streamInfo.stream);
@@ -730,7 +748,16 @@ void DEMDynamicThread::registerPolicies(const std::unordered_map<unsigned int, s
                                         const std::vector<float>& mesh_obj_mass_types,
                                         const std::vector<float3>& mesh_obj_moi_types,
                                         const std::vector<std::shared_ptr<DEMMaterial>>& loaded_materials,
+                                        const std::vector<float>& material_props_1d,
+                                        const std::vector<float>& material_props_2d,
                                         const std::vector<notStupidBool_t>& family_mask_matrix,
+                                        const std::vector<float3>& family_presc_lin_vel,
+                                        const std::vector<float3>& family_presc_rot_vel,
+                                        const std::vector<float3>& family_presc_lin_pos,
+                                        const std::vector<float3>& family_presc_acc,
+                                        const std::vector<float3>& family_presc_ang_acc,
+                                        const std::vector<uint32_t>& family_presc_set_mask,
+                                        const std::vector<uint32_t>& family_presc_prescribed_mask,
                                         const std::set<unsigned int>& no_output_families) {
     // No modification for the arrays in this function. They can only be completely re-constructed.
 
@@ -773,9 +800,48 @@ void DEMDynamicThread::registerPolicies(const std::unordered_map<unsigned int, s
         k++;
     }
 
+    // Store material property tables in global arrays (flattened)
+    if (!material_props_1d.empty()) {
+        DEME_DUAL_ARRAY_RESIZE(materialProps1D, material_props_1d.size(), 0.f);
+        for (size_t i = 0; i < material_props_1d.size(); i++) {
+            materialProps1D[i] = material_props_1d.at(i);
+        }
+    } else {
+        DEME_DUAL_ARRAY_RESIZE(materialProps1D, 0, 0.f);
+    }
+    if (!material_props_2d.empty()) {
+        DEME_DUAL_ARRAY_RESIZE(materialProps2D, material_props_2d.size(), 0.f);
+        for (size_t i = 0; i < material_props_2d.size(); i++) {
+            materialProps2D[i] = material_props_2d.at(i);
+        }
+    } else {
+        DEME_DUAL_ARRAY_RESIZE(materialProps2D, 0, 0.f);
+    }
+
     // Store family mask
     for (size_t i = 0; i < family_mask_matrix.size(); i++)
         familyMaskMatrix[i] = family_mask_matrix.at(i);
+
+    // Store runtime family prescriptions (constant-only path)
+    DEME_DUAL_ARRAY_RESIZE(familyPrescLinVel, NUM_AVAL_FAMILIES, make_float3(0.f, 0.f, 0.f));
+    DEME_DUAL_ARRAY_RESIZE(familyPrescRotVel, NUM_AVAL_FAMILIES, make_float3(0.f, 0.f, 0.f));
+    DEME_DUAL_ARRAY_RESIZE(familyPrescLinPos, NUM_AVAL_FAMILIES, make_float3(0.f, 0.f, 0.f));
+    DEME_DUAL_ARRAY_RESIZE(familyPrescAcc, NUM_AVAL_FAMILIES, make_float3(0.f, 0.f, 0.f));
+    DEME_DUAL_ARRAY_RESIZE(familyPrescAngAcc, NUM_AVAL_FAMILIES, make_float3(0.f, 0.f, 0.f));
+    DEME_DUAL_ARRAY_RESIZE(familyPrescSetMask, NUM_AVAL_FAMILIES, 0u);
+    DEME_DUAL_ARRAY_RESIZE(familyPrescPrescribedMask, NUM_AVAL_FAMILIES, 0u);
+
+    const float3 zero3 = make_float3(0.f, 0.f, 0.f);
+    for (size_t i = 0; i < NUM_AVAL_FAMILIES; i++) {
+        familyPrescLinVel[i] = (i < family_presc_lin_vel.size()) ? family_presc_lin_vel.at(i) : zero3;
+        familyPrescRotVel[i] = (i < family_presc_rot_vel.size()) ? family_presc_rot_vel.at(i) : zero3;
+        familyPrescLinPos[i] = (i < family_presc_lin_pos.size()) ? family_presc_lin_pos.at(i) : zero3;
+        familyPrescAcc[i] = (i < family_presc_acc.size()) ? family_presc_acc.at(i) : zero3;
+        familyPrescAngAcc[i] = (i < family_presc_ang_acc.size()) ? family_presc_ang_acc.at(i) : zero3;
+        familyPrescSetMask[i] = (i < family_presc_set_mask.size()) ? family_presc_set_mask.at(i) : 0u;
+        familyPrescPrescribedMask[i] =
+            (i < family_presc_prescribed_mask.size()) ? family_presc_prescribed_mask.at(i) : 0u;
+    }
 
     // Store clump naming map
     templateNumNameMap = template_number_name_map;
@@ -1305,15 +1371,26 @@ void DEMDynamicThread::initGPUArrays(const std::vector<std::shared_ptr<DEMClumpB
                                      const std::vector<float3>& mesh_obj_moi_jit_types,
                                      const std::vector<inertiaOffset_t>& mesh_obj_mass_offsets,
                                      const std::vector<std::shared_ptr<DEMMaterial>>& loaded_materials,
+                                     const std::vector<float>& material_props_1d,
+                                     const std::vector<float>& material_props_2d,
                                      const std::vector<notStupidBool_t>& family_mask_matrix,
+                                     const std::vector<float3>& family_presc_lin_vel,
+                                     const std::vector<float3>& family_presc_rot_vel,
+                                     const std::vector<float3>& family_presc_lin_pos,
+                                     const std::vector<float3>& family_presc_acc,
+                                     const std::vector<float3>& family_presc_ang_acc,
+                                     const std::vector<uint32_t>& family_presc_set_mask,
+                                     const std::vector<uint32_t>& family_presc_prescribed_mask,
                                      const std::set<unsigned int>& no_output_families,
                                      std::vector<std::shared_ptr<DEMTrackedObj>>& tracked_objs) {
     // Get the info into the GPU memory from the host side. Can this process be more efficient? Maybe, but it's
     // initialization anyway.
 
     registerPolicies(template_number_name_map, clump_templates, ext_obj_mass_types, ext_obj_moi_types,
-                     mesh_obj_mass_jit_types, mesh_obj_moi_jit_types, loaded_materials, family_mask_matrix,
-                     no_output_families);
+                     mesh_obj_mass_jit_types, mesh_obj_moi_jit_types, loaded_materials, material_props_1d,
+                     material_props_2d, family_mask_matrix, family_presc_lin_vel, family_presc_rot_vel,
+                     family_presc_lin_pos, family_presc_acc, family_presc_ang_acc, family_presc_set_mask,
+                     family_presc_prescribed_mask, no_output_families);
 
     // For initialization, owner array offset is 0
     populateEntityArrays(input_clump_batches, input_ext_obj_xyz, input_ext_obj_rot, input_ext_obj_family,

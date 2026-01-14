@@ -7,16 +7,60 @@
 #include "API.h"
 #include "Defines.h"
 #include "utils/HostSideHelpers.hpp"
+#include "kernel/SimParamsConst.cuh"
 
 #include <iostream>
 #include <fstream>
 #include <thread>
 #include <chrono>
+#include <cctype>
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <algorithm>
 #include <map>
 #include <tuple>
+#include <type_traits>
+
+namespace {
+// Fixed constant-memory capacity for jitified mass/MOI arrays (floats). Sized to leave room for other constants.
+constexpr size_t kMassConstCapacity = 1024;
+// Keep analytical constants well within device constant memory (~64 KB budget per module).
+constexpr size_t kAnalyticConstCapacity = 512;
+
+std::string trim_ascii(const std::string& input) {
+    size_t start = 0;
+    size_t end = input.size();
+    while (start < end && std::isspace(static_cast<unsigned char>(input[start]))) {
+        start++;
+    }
+    while (end > start && std::isspace(static_cast<unsigned char>(input[end - 1]))) {
+        end--;
+    }
+    return input.substr(start, end - start);
+}
+
+bool parse_float_literal(const std::string& input, float& out) {
+    std::string s = trim_ascii(input);
+    if (s.empty()) {
+        return false;
+    }
+    if (s.back() == 'f' || s.back() == 'F') {
+        s.pop_back();
+        if (s.empty()) {
+            return false;
+        }
+    }
+    char* end = nullptr;
+    errno = 0;
+    out = std::strtof(s.c_str(), &end);
+    if (end == s.c_str() || *end != '\0') {
+        return false;
+    }
+    return errno != ERANGE;
+}
+}
 
 namespace deme {
 
@@ -114,9 +158,11 @@ void DEMSolver::generatePolicyResources() {
     // Process the loaded materials. The pre-process of external objects and clumps could add more materials, so this
     // call need to go after those pre-process ones.
     figureOutMaterialProxies();
+    prepareMaterialProps();
 
     // Based on user input, prepare family_mask_matrix (family contact map matrix)
     figureOutFamilyMasks();
+    prepareFamilyPrescriptions();
 
     // Decide bin size (for contact detection)
     decideBinSize();
@@ -231,9 +277,31 @@ void DEMSolver::postResourceGenChecksAndTabKeeping() {
             nJitifiableClumpTopo = nDistinctClumpBodyTopologies;
             nJitifiableClumpComponents = nDistinctClumpComponents;
         }
+    } else {
+        nJitifiableClumpTopo = 0;
+        nJitifiableClumpComponents = 0;
+    }
+
+    // Conservative constant memory budget across devices we will launch on.
+    size_t min_const_mem = std::numeric_limits<size_t>::max();
+    {
+        int devices[] = {dT->streamInfo.device, kT->streamInfo.device};
+        for (int dev : devices) {
+            cudaDeviceProp prop{};
+            if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+                min_const_mem = std::min(min_const_mem, static_cast<size_t>(prop.totalConstMem));
+            }
+        }
     }
 
     if (jitify_mass_moi) {
+        if (nDistinctMassProperties > kMassConstCapacity) {
+            DEME_WARNING(
+                "Mass/MOI jitification is disabled because %u entries exceed the fixed constant capacity (%zu). "
+                "Call DisableJitifyMassProperties() to suppress this message.",
+                nDistinctMassProperties, kMassConstCapacity);
+            jitify_mass_moi = false;
+        }
         // Sanity check for final number of mass properties/inertia offsets
         if (nDistinctMassProperties >= std::numeric_limits<inertiaOffset_t>::max()) {
             DEME_ERROR(
@@ -248,28 +316,60 @@ void DEMSolver::postResourceGenChecksAndTabKeeping() {
         // over-subscribing the device constant memory, which results in CUDA_ERROR_INVALID_PTX at JIT time.
         {
             constexpr size_t kBytesPerMassEntry = 4 * sizeof(float);  // mass + 3 MOI components
-            // Use the most conservative constant memory size across the devices we will launch on.
-            int devices[] = {dT->streamInfo.device, kT->streamInfo.device};
-            size_t min_const_mem = std::numeric_limits<size_t>::max();
-            for (int dev : devices) {
-                cudaDeviceProp prop{};
-                if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
-                    min_const_mem = std::min(min_const_mem, static_cast<size_t>(prop.totalConstMem));
-                }
-            }
             if (min_const_mem != std::numeric_limits<size_t>::max()) {
-                const size_t needed_bytes = kBytesPerMassEntry * nDistinctMassProperties;
+                const size_t needed_bytes = kBytesPerMassEntry * kMassConstCapacity;
                 // Keep a small safety margin for other constant symbols.
                 const size_t safety_margin = 1024;
                 if (needed_bytes + safety_margin > min_const_mem) {
                     DEME_WARNING(
-                        "Mass/MOI jitification would require %zu bytes of constant memory for %u entries, "
+                        "Mass/MOI jitification would reserve %zu bytes of constant memory (capacity %zu entries), "
                         "exceeding device capacity (%zu bytes). Falling back to flattened mass properties. "
                         "Call DisableJitifyMassProperties() to suppress this message.",
-                        needed_bytes, nDistinctMassProperties, min_const_mem);
+                        needed_bytes, kMassConstCapacity, min_const_mem);
                     jitify_mass_moi = false;
                 }
             }
+        }
+    }
+
+    if (min_const_mem != std::numeric_limits<size_t>::max()) {
+        constexpr size_t kBytesPerMassEntry = 4 * sizeof(float);   // mass + 3 MOI components
+        constexpr size_t kBytesPerClumpComp = 4 * sizeof(float);   // radii + 3 relpos arrays
+        constexpr size_t kAnalyticFloatArrays = 11;                // normal + relpos(3) + rot(3) + size(3) + mass
+        const size_t analytic_bytes =
+            kAnalyticConstCapacity *
+            (sizeof(objType_t) + sizeof(bodyID_t) + sizeof(materialsOffset_t) + kAnalyticFloatArrays * sizeof(float));
+        size_t mass_bytes = jitify_mass_moi ? kBytesPerMassEntry * kMassConstCapacity : 0;
+        size_t clump_bytes =
+            jitify_clump_templates ? kBytesPerClumpComp * DEME_CLUMP_COMPONENT_CONST_CAPACITY : 0;
+        size_t total_bytes = analytic_bytes + mass_bytes + clump_bytes;
+        const size_t safety_margin = 1024;
+
+        if (total_bytes + safety_margin > min_const_mem && jitify_mass_moi) {
+            DEME_WARNING(
+                "Mass/MOI jitification is disabled because constant memory budget (%zu bytes) would be exceeded "
+                "(estimated %zu bytes incl. analytical/clump constants).",
+                min_const_mem, total_bytes + safety_margin);
+            jitify_mass_moi = false;
+            mass_bytes = 0;
+            total_bytes = analytic_bytes + clump_bytes;
+        }
+        if (total_bytes + safety_margin > min_const_mem && jitify_clump_templates) {
+            DEME_WARNING(
+                "Clump template jitification is disabled because constant memory budget (%zu bytes) would be exceeded "
+                "(estimated %zu bytes incl. analytical constants).",
+                min_const_mem, total_bytes + safety_margin);
+            jitify_clump_templates = false;
+            nJitifiableClumpTopo = 0;
+            nJitifiableClumpComponents = 0;
+            clump_bytes = 0;
+            total_bytes = analytic_bytes;
+        }
+        if (total_bytes + safety_margin > min_const_mem) {
+            DEME_ERROR(
+                "Estimated constant memory usage (%zu bytes incl. safety margin) exceeds device capacity (%zu bytes). "
+                "Reduce analytical/clump counts or disable jitification options.",
+                total_bytes + safety_margin, min_const_mem);
         }
     }
 
@@ -314,6 +414,10 @@ void DEMSolver::addAnalCompTemplate(const objType_t type,
 }
 
 void DEMSolver::jitifyKernels() {
+    JitHelper::setCacheDir(std::filesystem::path(m_kernel_cache_dir));
+    JitHelper::setCacheTag(m_kernel_cache_tag);
+    JitHelper::setRequireCache(m_require_kernel_cache);
+
     equipClumpTemplates(m_subs);
     equipSimParams(m_subs);
     equipMassMoiVolume(m_subs);
@@ -347,12 +451,191 @@ void DEMSolver::jitifyKernels() {
     kT_build.join();
     dT_build.join();
 
+    auto upload_sim_params = [&](const std::shared_ptr<JitHelper::CachedProgram>& prog,
+                                 const std::vector<const char*>& kernels,
+                                 int device,
+                                 cudaStream_t stream) {
+        if (!prog) {
+            return;
+        }
+        for (const char* kernel : kernels) {
+            uploadJitifiedSimParamsConst(prog, kernel, device, stream);
+        }
+    };
+    auto upload_mass = [&](const std::shared_ptr<JitHelper::CachedProgram>& prog,
+                           const std::vector<const char*>& kernels,
+                           int device,
+                           cudaStream_t stream) {
+        if (!prog) {
+            return;
+        }
+        for (const char* kernel : kernels) {
+            uploadJitifiedMassProperties(prog, kernel, device, stream);
+        }
+    };
+    auto upload_material = [&](const std::shared_ptr<JitHelper::CachedProgram>& prog,
+                               const std::vector<const char*>& kernels,
+                               int device,
+                               cudaStream_t stream) {
+        if (!prog) {
+            return;
+        }
+        for (const char* kernel : kernels) {
+            uploadJitifiedMaterialProperties(prog, kernel, device, stream);
+        }
+    };
+    auto upload_clump = [&](const std::shared_ptr<JitHelper::CachedProgram>& prog,
+                            const std::vector<const char*>& kernels,
+                            int device,
+                            cudaStream_t stream) {
+        if (!prog) {
+            return;
+        }
+        for (const char* kernel : kernels) {
+            uploadJitifiedClumpTemplates(prog, kernel, device, stream);
+        }
+    };
+    auto upload_analytical = [&](const std::shared_ptr<JitHelper::CachedProgram>& prog,
+                                 const std::vector<const char*>& kernels,
+                                 int device,
+                                 cudaStream_t stream) {
+        if (!prog) {
+            return;
+        }
+        for (const char* kernel : kernels) {
+            uploadJitifiedAnalytical(prog, kernel, device, stream);
+        }
+    };
+
+    upload_sim_params(kT->bin_sphere_kernels,
+                      {"getNumberOfBinsEachSphereTouches", "populateBinSphereTouchingPairs"},
+                      kT->streamInfo.device, kT->streamInfo.stream);
+    upload_clump(kT->bin_sphere_kernels,
+                 {"getNumberOfBinsEachSphereTouches", "populateBinSphereTouchingPairs"},
+                 kT->streamInfo.device, kT->streamInfo.stream);
+    upload_analytical(kT->bin_sphere_kernels,
+                      {"getNumberOfBinsEachSphereTouches", "populateBinSphereTouchingPairs"},
+                      kT->streamInfo.device, kT->streamInfo.stream);
+    upload_sim_params(kT->bin_triangle_kernels,
+                      {"makeTriangleSandwich", "getNumberOfBinsEachTriangleTouches",
+                       "populateBinTriangleTouchingPairs", "mapTriActiveBinsToSphActiveBins"},
+                      kT->streamInfo.device, kT->streamInfo.stream);
+    upload_analytical(kT->bin_triangle_kernels,
+                      {"makeTriangleSandwich", "getNumberOfBinsEachTriangleTouches",
+                       "populateBinTriangleTouchingPairs", "mapTriActiveBinsToSphActiveBins"},
+                      kT->streamInfo.device, kT->streamInfo.stream);
+    upload_sim_params(kT->sphere_contact_kernels,
+                      {"populateSphereContactPairsEachBin", "getNumberOfSphereContactsEachBin"},
+                      kT->streamInfo.device, kT->streamInfo.stream);
+    upload_clump(kT->sphere_contact_kernels,
+                 {"populateSphereContactPairsEachBin", "getNumberOfSphereContactsEachBin"},
+                 kT->streamInfo.device, kT->streamInfo.stream);
+    upload_sim_params(kT->sphTri_contact_kernels,
+                      {"getNumberOfTriangleContactsEachBin", "populateTriangleContactsEachBin"},
+                      kT->streamInfo.device, kT->streamInfo.stream);
+    upload_clump(kT->sphTri_contact_kernels,
+                 {"getNumberOfTriangleContactsEachBin", "populateTriangleContactsEachBin"},
+                 kT->streamInfo.device, kT->streamInfo.stream);
+    upload_analytical(kT->misc_kernels,
+                      {"computeMarginFromAbsv_implSph", "computeMarginFromAbsv_implTri",
+                       "computeMarginFromAbsv_implAnal"},
+                      kT->streamInfo.device, kT->streamInfo.stream);
+    upload_clump(kT->misc_kernels,
+                 {"computeMarginFromAbsv_implSph", "computeMarginFromAbsv_implTri", "computeMarginFromAbsv_implAnal"},
+                 kT->streamInfo.device, kT->streamInfo.stream);
+
+    upload_sim_params(dT->cal_force_kernels,
+                      {"calculatePrimitiveContactForces_SphSph", "calculatePrimitiveContactForces_SphTri",
+                       "calculatePrimitiveContactForces_SphAnal", "calculatePrimitiveContactForces_TriTri",
+                       "calculatePrimitiveContactForces_TriAnal"},
+                      dT->streamInfo.device, dT->streamInfo.stream);
+    upload_clump(dT->cal_force_kernels,
+                 {"calculatePrimitiveContactForces_SphSph", "calculatePrimitiveContactForces_SphTri",
+                  "calculatePrimitiveContactForces_SphAnal", "calculatePrimitiveContactForces_TriTri",
+                  "calculatePrimitiveContactForces_TriAnal"},
+                 dT->streamInfo.device, dT->streamInfo.stream);
+    upload_mass(dT->cal_force_kernels,
+                {"calculatePrimitiveContactForces_SphSph", "calculatePrimitiveContactForces_SphTri",
+                 "calculatePrimitiveContactForces_SphAnal", "calculatePrimitiveContactForces_TriTri",
+                 "calculatePrimitiveContactForces_TriAnal"},
+                dT->streamInfo.device, dT->streamInfo.stream);
+    upload_material(dT->cal_force_kernels,
+                    {"calculatePrimitiveContactForces_SphSph", "calculatePrimitiveContactForces_SphTri",
+                     "calculatePrimitiveContactForces_SphAnal", "calculatePrimitiveContactForces_TriTri",
+                     "calculatePrimitiveContactForces_TriAnal"},
+                    dT->streamInfo.device, dT->streamInfo.stream);
+    upload_analytical(dT->cal_force_kernels,
+                      {"calculatePrimitiveContactForces_SphSph", "calculatePrimitiveContactForces_SphTri",
+                       "calculatePrimitiveContactForces_SphAnal", "calculatePrimitiveContactForces_TriTri",
+                       "calculatePrimitiveContactForces_TriAnal"},
+                      dT->streamInfo.device, dT->streamInfo.stream);
+    upload_sim_params(dT->cal_patch_force_kernels,
+                      {"calculatePatchContactForces_SphTri", "calculatePatchContactForces_TriTri",
+                       "calculatePatchContactForces_TriAnal"},
+                      dT->streamInfo.device, dT->streamInfo.stream);
+    upload_clump(dT->cal_patch_force_kernels,
+                 {"calculatePatchContactForces_SphTri", "calculatePatchContactForces_TriTri",
+                  "calculatePatchContactForces_TriAnal"},
+                 dT->streamInfo.device, dT->streamInfo.stream);
+    upload_mass(dT->cal_patch_force_kernels,
+                {"calculatePatchContactForces_SphTri", "calculatePatchContactForces_TriTri",
+                 "calculatePatchContactForces_TriAnal"},
+                dT->streamInfo.device, dT->streamInfo.stream);
+    upload_material(dT->cal_patch_force_kernels,
+                    {"calculatePatchContactForces_SphTri", "calculatePatchContactForces_TriTri",
+                     "calculatePatchContactForces_TriAnal"},
+                    dT->streamInfo.device, dT->streamInfo.stream);
+    upload_analytical(dT->cal_patch_force_kernels,
+                      {"calculatePatchContactForces_SphTri", "calculatePatchContactForces_TriTri",
+                       "calculatePatchContactForces_TriAnal"},
+                      dT->streamInfo.device, dT->streamInfo.stream);
+    upload_sim_params(dT->integrator_kernels, {"integrateOwners"}, dT->streamInfo.device, dT->streamInfo.stream);
+    upload_mass(dT->collect_force_kernels, {"forceToAcc"}, dT->streamInfo.device, dT->streamInfo.stream);
+    upload_sim_params(dT->mod_kernels, {"applyFamilyChanges"}, dT->streamInfo.device, dT->streamInfo.stream);
+    upload_mass(dT->mod_kernels, {"applyFamilyChanges"}, dT->streamInfo.device, dT->streamInfo.stream);
+    if (jitify_mass_moi) {
+        if (m_approx_vel_func && m_approx_vel_func->inspection_kernel) {
+            uploadJitifiedMassProperties(m_approx_vel_func->inspection_kernel, m_approx_vel_func->kernel_name,
+                                         dT->streamInfo.device, dT->streamInfo.stream);
+        }
+        if (m_approx_angvel_func && m_approx_angvel_func->inspection_kernel) {
+            uploadJitifiedMassProperties(m_approx_angvel_func->inspection_kernel, m_approx_angvel_func->kernel_name,
+                                         dT->streamInfo.device, dT->streamInfo.stream);
+        }
+    }
+    if (m_approx_vel_func && m_approx_vel_func->inspection_kernel) {
+        uploadJitifiedSimParamsConst(m_approx_vel_func->inspection_kernel, m_approx_vel_func->kernel_name,
+                                     dT->streamInfo.device, dT->streamInfo.stream);
+        if (m_approx_vel_func->thing_to_insp == INSPECT_ENTITY_TYPE::SPHERE) {
+            uploadJitifiedClumpTemplates(m_approx_vel_func->inspection_kernel, m_approx_vel_func->kernel_name,
+                                         dT->streamInfo.device, dT->streamInfo.stream);
+        }
+    }
+    if (m_approx_angvel_func && m_approx_angvel_func->inspection_kernel) {
+        uploadJitifiedSimParamsConst(m_approx_angvel_func->inspection_kernel, m_approx_angvel_func->kernel_name,
+                                     dT->streamInfo.device, dT->streamInfo.stream);
+        if (m_approx_angvel_func->thing_to_insp == INSPECT_ENTITY_TYPE::SPHERE) {
+            uploadJitifiedClumpTemplates(m_approx_angvel_func->inspection_kernel, m_approx_angvel_func->kernel_name,
+                                         dT->streamInfo.device, dT->streamInfo.stream);
+        }
+    }
+
     // Eagerly initialize user-created inspectors so their kernels compile before first use
     for (auto& insp : m_inspectors) {
         if (insp) {
             insp->Initialize(m_subs, m_jitify_options, true);
             if (insp->inspection_kernel) {
                 insp->inspection_kernel->kernel(insp->kernel_name).instantiate();
+                uploadJitifiedSimParamsConst(insp->inspection_kernel, insp->kernel_name, dT->streamInfo.device,
+                                             dT->streamInfo.stream);
+                if (insp->thing_to_insp == INSPECT_ENTITY_TYPE::SPHERE) {
+                    uploadJitifiedClumpTemplates(insp->inspection_kernel, insp->kernel_name, dT->streamInfo.device,
+                                                 dT->streamInfo.stream);
+                }
+                if (jitify_mass_moi && insp->thing_to_insp != INSPECT_ENTITY_TYPE::SPHERE) {
+                    uploadJitifiedMassProperties(insp->inspection_kernel, insp->kernel_name, dT->streamInfo.device,
+                                                 dT->streamInfo.stream);
+                }
             }
         }
     }
@@ -1037,6 +1320,198 @@ void DEMSolver::figureOutFamilyMasks() {
     }
 }
 
+void DEMSolver::prepareFamilyPrescriptions() {
+    const size_t n_families = NUM_AVAL_FAMILIES;
+    m_family_presc_lin_vel.assign(n_families, make_float3(0.f, 0.f, 0.f));
+    m_family_presc_rot_vel.assign(n_families, make_float3(0.f, 0.f, 0.f));
+    m_family_presc_lin_pos.assign(n_families, make_float3(0.f, 0.f, 0.f));
+    m_family_presc_acc.assign(n_families, make_float3(0.f, 0.f, 0.f));
+    m_family_presc_ang_acc.assign(n_families, make_float3(0.f, 0.f, 0.f));
+    m_family_presc_set_mask.assign(n_families, 0u);
+    m_family_presc_prescribed_mask.assign(n_families, 0u);
+
+    m_use_family_prescription_runtime = false;
+    bool any_prescription = false;
+
+    for (const auto& preInfo : m_unique_family_prescription) {
+        if (!preInfo.used) {
+            continue;
+        }
+        any_prescription = true;
+
+        if (preInfo.linPosPre != "none" || preInfo.linVelPre != "none" || preInfo.rotVelPre != "none" ||
+            preInfo.accPre != "none" || preInfo.angAccPre != "none" || preInfo.oriQ != "none") {
+            m_use_family_prescription_runtime = false;
+            return;
+        }
+
+        const unsigned int fam = preInfo.family;
+        float val = 0.f;
+
+        if (preInfo.linVelX != "none") {
+            if (!parse_float_literal(preInfo.linVelX, val)) {
+                m_use_family_prescription_runtime = false;
+                return;
+            }
+            m_family_presc_lin_vel.at(fam).x = val;
+            m_family_presc_set_mask.at(fam) |= DEME_FAMILY_PRESC_SET_LINVEL_X;
+        }
+        if (preInfo.linVelY != "none") {
+            if (!parse_float_literal(preInfo.linVelY, val)) {
+                m_use_family_prescription_runtime = false;
+                return;
+            }
+            m_family_presc_lin_vel.at(fam).y = val;
+            m_family_presc_set_mask.at(fam) |= DEME_FAMILY_PRESC_SET_LINVEL_Y;
+        }
+        if (preInfo.linVelZ != "none") {
+            if (!parse_float_literal(preInfo.linVelZ, val)) {
+                m_use_family_prescription_runtime = false;
+                return;
+            }
+            m_family_presc_lin_vel.at(fam).z = val;
+            m_family_presc_set_mask.at(fam) |= DEME_FAMILY_PRESC_SET_LINVEL_Z;
+        }
+
+        if (preInfo.rotVelX != "none") {
+            if (!parse_float_literal(preInfo.rotVelX, val)) {
+                m_use_family_prescription_runtime = false;
+                return;
+            }
+            m_family_presc_rot_vel.at(fam).x = val;
+            m_family_presc_set_mask.at(fam) |= DEME_FAMILY_PRESC_SET_ROTVEL_X;
+        }
+        if (preInfo.rotVelY != "none") {
+            if (!parse_float_literal(preInfo.rotVelY, val)) {
+                m_use_family_prescription_runtime = false;
+                return;
+            }
+            m_family_presc_rot_vel.at(fam).y = val;
+            m_family_presc_set_mask.at(fam) |= DEME_FAMILY_PRESC_SET_ROTVEL_Y;
+        }
+        if (preInfo.rotVelZ != "none") {
+            if (!parse_float_literal(preInfo.rotVelZ, val)) {
+                m_use_family_prescription_runtime = false;
+                return;
+            }
+            m_family_presc_rot_vel.at(fam).z = val;
+            m_family_presc_set_mask.at(fam) |= DEME_FAMILY_PRESC_SET_ROTVEL_Z;
+        }
+
+        if (preInfo.linPosX != "none") {
+            if (!parse_float_literal(preInfo.linPosX, val)) {
+                m_use_family_prescription_runtime = false;
+                return;
+            }
+            m_family_presc_lin_pos.at(fam).x = val;
+            m_family_presc_set_mask.at(fam) |= DEME_FAMILY_PRESC_SET_LINPOS_X;
+        }
+        if (preInfo.linPosY != "none") {
+            if (!parse_float_literal(preInfo.linPosY, val)) {
+                m_use_family_prescription_runtime = false;
+                return;
+            }
+            m_family_presc_lin_pos.at(fam).y = val;
+            m_family_presc_set_mask.at(fam) |= DEME_FAMILY_PRESC_SET_LINPOS_Y;
+        }
+        if (preInfo.linPosZ != "none") {
+            if (!parse_float_literal(preInfo.linPosZ, val)) {
+                m_use_family_prescription_runtime = false;
+                return;
+            }
+            m_family_presc_lin_pos.at(fam).z = val;
+            m_family_presc_set_mask.at(fam) |= DEME_FAMILY_PRESC_SET_LINPOS_Z;
+        }
+
+        if (preInfo.accX != "none") {
+            if (!parse_float_literal(preInfo.accX, val)) {
+                m_use_family_prescription_runtime = false;
+                return;
+            }
+            m_family_presc_acc.at(fam).x = val;
+            m_family_presc_set_mask.at(fam) |= DEME_FAMILY_PRESC_SET_ACC_X;
+        }
+        if (preInfo.accY != "none") {
+            if (!parse_float_literal(preInfo.accY, val)) {
+                m_use_family_prescription_runtime = false;
+                return;
+            }
+            m_family_presc_acc.at(fam).y = val;
+            m_family_presc_set_mask.at(fam) |= DEME_FAMILY_PRESC_SET_ACC_Y;
+        }
+        if (preInfo.accZ != "none") {
+            if (!parse_float_literal(preInfo.accZ, val)) {
+                m_use_family_prescription_runtime = false;
+                return;
+            }
+            m_family_presc_acc.at(fam).z = val;
+            m_family_presc_set_mask.at(fam) |= DEME_FAMILY_PRESC_SET_ACC_Z;
+        }
+
+        if (preInfo.angAccX != "none") {
+            if (!parse_float_literal(preInfo.angAccX, val)) {
+                m_use_family_prescription_runtime = false;
+                return;
+            }
+            m_family_presc_ang_acc.at(fam).x = val;
+            m_family_presc_set_mask.at(fam) |= DEME_FAMILY_PRESC_SET_ANGACC_X;
+        }
+        if (preInfo.angAccY != "none") {
+            if (!parse_float_literal(preInfo.angAccY, val)) {
+                m_use_family_prescription_runtime = false;
+                return;
+            }
+            m_family_presc_ang_acc.at(fam).y = val;
+            m_family_presc_set_mask.at(fam) |= DEME_FAMILY_PRESC_SET_ANGACC_Y;
+        }
+        if (preInfo.angAccZ != "none") {
+            if (!parse_float_literal(preInfo.angAccZ, val)) {
+                m_use_family_prescription_runtime = false;
+                return;
+            }
+            m_family_presc_ang_acc.at(fam).z = val;
+            m_family_presc_set_mask.at(fam) |= DEME_FAMILY_PRESC_SET_ANGACC_Z;
+        }
+
+        if (preInfo.linVelXPrescribed) {
+            m_family_presc_prescribed_mask.at(fam) |= DEME_FAMILY_PRESC_FLAG_LINVEL_X;
+        }
+        if (preInfo.linVelYPrescribed) {
+            m_family_presc_prescribed_mask.at(fam) |= DEME_FAMILY_PRESC_FLAG_LINVEL_Y;
+        }
+        if (preInfo.linVelZPrescribed) {
+            m_family_presc_prescribed_mask.at(fam) |= DEME_FAMILY_PRESC_FLAG_LINVEL_Z;
+        }
+        if (preInfo.rotVelXPrescribed) {
+            m_family_presc_prescribed_mask.at(fam) |= DEME_FAMILY_PRESC_FLAG_ROTVEL_X;
+        }
+        if (preInfo.rotVelYPrescribed) {
+            m_family_presc_prescribed_mask.at(fam) |= DEME_FAMILY_PRESC_FLAG_ROTVEL_Y;
+        }
+        if (preInfo.rotVelZPrescribed) {
+            m_family_presc_prescribed_mask.at(fam) |= DEME_FAMILY_PRESC_FLAG_ROTVEL_Z;
+        }
+        if (preInfo.linPosXPrescribed) {
+            m_family_presc_prescribed_mask.at(fam) |= DEME_FAMILY_PRESC_FLAG_LINPOS_X;
+        }
+        if (preInfo.linPosYPrescribed) {
+            m_family_presc_prescribed_mask.at(fam) |= DEME_FAMILY_PRESC_FLAG_LINPOS_Y;
+        }
+        if (preInfo.linPosZPrescribed) {
+            m_family_presc_prescribed_mask.at(fam) |= DEME_FAMILY_PRESC_FLAG_LINPOS_Z;
+        }
+        if (preInfo.rotPosPrescribed) {
+            m_family_presc_prescribed_mask.at(fam) |= DEME_FAMILY_PRESC_FLAG_ROTPOS;
+        }
+    }
+
+    if (!any_prescription) {
+        m_use_family_prescription_runtime = false;
+        return;
+    }
+    m_use_family_prescription_runtime = true;
+}
+
 void DEMSolver::addWorldBoundingBox() {
     // Now, add the bounding box for the simulation `world' if instructed.
     // Note the positions to add these planes are determined by the user-wanted box sizes, not m_boxXYZ which is the max
@@ -1207,6 +1682,8 @@ void DEMSolver::setSolverParams() {
 }
 
 void DEMSolver::setSimParams() {
+    // Force-link the sim param constant definition into the static library.
+    DEME_touchSimParamsConst();
     if ((!use_user_defined_expand_factor) && m_approx_max_vel < 1e-4f && m_suggestedFutureDrift > 0) {
         DEME_WARNING(
             "You instructed that the physics can stretch %u time steps into the future, and explicitly specified the "
@@ -1351,9 +1828,12 @@ void DEMSolver::initializeGPUArrays() {
         // Meshed obj physics properties
         m_mesh_obj_mass, m_mesh_obj_moi, m_mesh_mass_jit, m_mesh_moi_jit, m_mesh_mass_offsets,
         // Universal template info
-        m_loaded_materials,
+        m_loaded_materials, m_material_props_1d, m_material_props_2d,
         // Family mask
         m_family_mask_matrix,
+        // Family prescription (runtime constants)
+        m_family_presc_lin_vel, m_family_presc_rot_vel, m_family_presc_lin_pos, m_family_presc_acc,
+        m_family_presc_ang_acc, m_family_presc_set_mask, m_family_presc_prescribed_mask,
         // I/O and misc.
         m_no_output_families, m_tracked_objs);
 
@@ -1754,6 +2234,73 @@ inline void DEMSolver::equipFamilyOnFlyChanges(std::unordered_map<std::string, s
 
 inline void DEMSolver::equipFamilyPrescribedMotions(std::unordered_map<std::string, std::string>& strMap) {
     std::string velStr = " ", posStr = " ", accStr = " ";
+    std::string velRuntime = " ", posRuntime = " ", accRuntime = " ";
+    if (m_use_family_prescription_runtime) {
+        velRuntime =
+            "const uint32_t presc_set = granData->familyPrescSetMask[family];"
+            "const uint32_t presc_flags = granData->familyPrescPrescribedMask[family];"
+            "const uint32_t vel_set = presc_set & (deme::DEME_FAMILY_PRESC_SET_LINVEL_MASK | "
+            "deme::DEME_FAMILY_PRESC_SET_ROTVEL_MASK);"
+            "const uint32_t vel_flags = presc_flags & (deme::DEME_FAMILY_PRESC_FLAG_LINVEL_MASK | "
+            "deme::DEME_FAMILY_PRESC_FLAG_ROTVEL_MASK);"
+            "if ((vel_set | vel_flags) == 0) { return; }"
+            "const float3 lin_vel = granData->familyPrescLinVel[family];"
+            "const float3 rot_vel = granData->familyPrescRotVel[family];"
+            "if (vel_set & deme::DEME_FAMILY_PRESC_SET_LINVEL_X) { vX = lin_vel.x; }"
+            "if (vel_set & deme::DEME_FAMILY_PRESC_SET_LINVEL_Y) { vY = lin_vel.y; }"
+            "if (vel_set & deme::DEME_FAMILY_PRESC_SET_LINVEL_Z) { vZ = lin_vel.z; }"
+            "if (vel_set & deme::DEME_FAMILY_PRESC_SET_ROTVEL_X) { omgBarX = rot_vel.x; }"
+            "if (vel_set & deme::DEME_FAMILY_PRESC_SET_ROTVEL_Y) { omgBarY = rot_vel.y; }"
+            "if (vel_set & deme::DEME_FAMILY_PRESC_SET_ROTVEL_Z) { omgBarZ = rot_vel.z; }"
+            "LinVelXPrescribed = (vel_flags & deme::DEME_FAMILY_PRESC_FLAG_LINVEL_X) != 0;"
+            "LinVelYPrescribed = (vel_flags & deme::DEME_FAMILY_PRESC_FLAG_LINVEL_Y) != 0;"
+            "LinVelZPrescribed = (vel_flags & deme::DEME_FAMILY_PRESC_FLAG_LINVEL_Z) != 0;"
+            "RotVelXPrescribed = (vel_flags & deme::DEME_FAMILY_PRESC_FLAG_ROTVEL_X) != 0;"
+            "RotVelYPrescribed = (vel_flags & deme::DEME_FAMILY_PRESC_FLAG_ROTVEL_Y) != 0;"
+            "RotVelZPrescribed = (vel_flags & deme::DEME_FAMILY_PRESC_FLAG_ROTVEL_Z) != 0;"
+            "return;";
+        posRuntime =
+            "const uint32_t presc_set = granData->familyPrescSetMask[family];"
+            "const uint32_t presc_flags = granData->familyPrescPrescribedMask[family];"
+            "const uint32_t pos_set = presc_set & deme::DEME_FAMILY_PRESC_SET_LINPOS_MASK;"
+            "const uint32_t pos_flags = presc_flags & (deme::DEME_FAMILY_PRESC_FLAG_LINPOS_MASK | "
+            "deme::DEME_FAMILY_PRESC_FLAG_ROTPOS);"
+            "if ((pos_set | pos_flags) == 0) { return; }"
+            "const float3 lin_pos = granData->familyPrescLinPos[family];"
+            "if (pos_set & deme::DEME_FAMILY_PRESC_SET_LINPOS_X) { X = lin_pos.x; }"
+            "if (pos_set & deme::DEME_FAMILY_PRESC_SET_LINPOS_Y) { Y = lin_pos.y; }"
+            "if (pos_set & deme::DEME_FAMILY_PRESC_SET_LINPOS_Z) { Z = lin_pos.z; }"
+            "LinXPrescribed = (pos_flags & deme::DEME_FAMILY_PRESC_FLAG_LINPOS_X) != 0;"
+            "LinYPrescribed = (pos_flags & deme::DEME_FAMILY_PRESC_FLAG_LINPOS_Y) != 0;"
+            "LinZPrescribed = (pos_flags & deme::DEME_FAMILY_PRESC_FLAG_LINPOS_Z) != 0;"
+            "RotPrescribed = (pos_flags & deme::DEME_FAMILY_PRESC_FLAG_ROTPOS) != 0;"
+            "return;";
+        accRuntime =
+            "const uint32_t presc_set = granData->familyPrescSetMask[family];"
+            "const uint32_t acc_set = presc_set & (deme::DEME_FAMILY_PRESC_SET_ACC_MASK | "
+            "deme::DEME_FAMILY_PRESC_SET_ANGACC_MASK);"
+            "if (acc_set == 0) { return; }"
+            "const float3 acc = granData->familyPrescAcc[family];"
+            "const float3 ang_acc = granData->familyPrescAngAcc[family];"
+            "if (acc_set & deme::DEME_FAMILY_PRESC_SET_ACC_X) { accX = acc.x; }"
+            "if (acc_set & deme::DEME_FAMILY_PRESC_SET_ACC_Y) { accY = acc.y; }"
+            "if (acc_set & deme::DEME_FAMILY_PRESC_SET_ACC_Z) { accZ = acc.z; }"
+            "if (acc_set & deme::DEME_FAMILY_PRESC_SET_ANGACC_X) { angAccX = ang_acc.x; }"
+            "if (acc_set & deme::DEME_FAMILY_PRESC_SET_ANGACC_Y) { angAccY = ang_acc.y; }"
+            "if (acc_set & deme::DEME_FAMILY_PRESC_SET_ANGACC_Z) { angAccZ = ang_acc.z; }"
+            "return;";
+        strMap["_velPrescriptionRuntime_;"] = velRuntime;
+        strMap["_posPrescriptionRuntime_;"] = posRuntime;
+        strMap["_accPrescriptionRuntime_;"] = accRuntime;
+        strMap["_velPrescriptionStrategy_;"] = " ";
+        strMap["_posPrescriptionStrategy_;"] = " ";
+        strMap["_accPrescriptionStrategy_;"] = " ";
+        return;
+    }
+
+    strMap["_velPrescriptionRuntime_;"] = " ";
+    strMap["_posPrescriptionRuntime_;"] = " ";
+    strMap["_accPrescriptionRuntime_;"] = " ";
     for (const auto& preInfo : m_unique_family_prescription) {
         if (!preInfo.used) {
             continue;
@@ -1876,144 +2423,134 @@ inline void DEMSolver::equipFamilyPrescribedMotions(std::unordered_map<std::stri
 // }
 
 inline void DEMSolver::equipAnalGeoTemplates(std::unordered_map<std::string, std::string>& strMap) {
-    // Some sim systems can have 0 boundary entities in them. In this case, we have to ensure jitification does not fail
-    std::string objOwner, objType, objMat, objNormal, objRelPosX, objRelPosY, objRelPosZ, objRotX, objRotY, objRotZ,
-        objSize1, objSize2, objSize3, objMass;
+    m_anal_type_jit.clear();
+    m_anal_owner_jit.clear();
+    m_anal_normal_jit.clear();
+    m_anal_mat_jit.clear();
+    m_anal_relposx_jit.clear();
+    m_anal_relposy_jit.clear();
+    m_anal_relposz_jit.clear();
+    m_anal_rotx_jit.clear();
+    m_anal_roty_jit.clear();
+    m_anal_rotz_jit.clear();
+    m_anal_size1_jit.clear();
+    m_anal_size2_jit.clear();
+    m_anal_size3_jit.clear();
+    m_anal_mass_jit.clear();
+
+    if (nAnalGM > kAnalyticConstCapacity) {
+        DEME_ERROR(
+            "Number of analytical components (%u) exceeds the fixed constant capacity (%zu). Increase capacity or "
+            "reduce analytical geometry count.",
+            nAnalGM, kAnalyticConstCapacity);
+    }
+
     for (unsigned int i = 0; i < nAnalGM; i++) {
-        // External objects will be owners, and their IDs are following template-loaded simulation clumps
         bodyID_t myOwner = nOwnerClumps + m_anal_owner.at(i);
-        objOwner += std::to_string(myOwner) + ",";
-        objType += std::to_string(m_anal_types.at(i)) + ",";
-        objMat += std::to_string(m_anal_materials.at(i)) + ",";
-        objNormal += to_string_with_precision(m_anal_normals.at(i)) + ",";
-        objRelPosX += to_string_with_precision(m_anal_comp_pos.at(i).x) + ",";
-        objRelPosY += to_string_with_precision(m_anal_comp_pos.at(i).y) + ",";
-        objRelPosZ += to_string_with_precision(m_anal_comp_pos.at(i).z) + ",";
-        objRotX += to_string_with_precision(m_anal_comp_rot.at(i).x) + ",";
-        objRotY += to_string_with_precision(m_anal_comp_rot.at(i).y) + ",";
-        objRotZ += to_string_with_precision(m_anal_comp_rot.at(i).z) + ",";
-        objSize1 += to_string_with_precision(m_anal_size_1.at(i)) + ",";
-        objSize2 += to_string_with_precision(m_anal_size_2.at(i)) + ",";
-        objSize3 += to_string_with_precision(m_anal_size_3.at(i)) + ",";
-        // As for analytical object components, we just need to store mass, no MOI needed, since it's for for
-        // calculation only. When collecting acceleration of analytical owners, it gets that from long global arrays.
-        objMass += to_string_with_precision(m_ext_obj_mass.at(m_anal_owner.at(i))) + ",";
-    }
-    if (nAnalGM == 0) {
-        // If the user looks for trouble, jitifies 0 analytical entities, then put some junk there to make it
-        // compilable: those kernels won't be executed anyway
-        objOwner += "0";
-        objType += "0";
-        objMat += "0";
-        objNormal += "0";
-        objRelPosX += "0";
-        objRelPosY += "0";
-        objRelPosZ += "0";
-        objRotX += "0";
-        objRotY += "0";
-        objRotZ += "0";
-        objSize1 += "0";
-        objSize2 += "0";
-        objSize3 += "0";
-        objMass += "0";
+        m_anal_owner_jit.push_back(myOwner);
+        m_anal_type_jit.push_back(m_anal_types.at(i));
+        m_anal_mat_jit.push_back(m_anal_materials.at(i));
+        m_anal_normal_jit.push_back(m_anal_normals.at(i));
+        m_anal_relposx_jit.push_back(m_anal_comp_pos.at(i).x);
+        m_anal_relposy_jit.push_back(m_anal_comp_pos.at(i).y);
+        m_anal_relposz_jit.push_back(m_anal_comp_pos.at(i).z);
+        m_anal_rotx_jit.push_back(m_anal_comp_rot.at(i).x);
+        m_anal_roty_jit.push_back(m_anal_comp_rot.at(i).y);
+        m_anal_rotz_jit.push_back(m_anal_comp_rot.at(i).z);
+        m_anal_size1_jit.push_back(m_anal_size_1.at(i));
+        m_anal_size2_jit.push_back(m_anal_size_2.at(i));
+        m_anal_size3_jit.push_back(m_anal_size_3.at(i));
+        m_anal_mass_jit.push_back(m_ext_obj_mass.at(m_anal_owner.at(i)));
     }
 
-    std::unordered_map<std::string, std::string> array_content;
-    array_content["_objOwner_"] = objOwner;
-    array_content["_objType_"] = objType;
-    array_content["_objMaterial_"] = objMat;
-    array_content["_objNormal_"] = objNormal;
-    array_content["_objRelPosX_"] = objRelPosX;
-    array_content["_objRelPosY_"] = objRelPosY;
-    array_content["_objRelPosZ_"] = objRelPosZ;
-    array_content["_objRotX_"] = objRotX;
-    array_content["_objRotY_"] = objRotY;
-    array_content["_objRotZ_"] = objRotZ;
-    array_content["_objSize1_"] = objSize1;
-    array_content["_objSize2_"] = objSize2;
-    array_content["_objSize3_"] = objSize3;
-    array_content["_objMass_"] = objMass;
+    // Pad to fixed capacity
+    auto pad_vec = [](auto& v, size_t cap, auto pad_val) {
+        v.resize(cap, pad_val);
+    };
+    pad_vec(m_anal_owner_jit, kAnalyticConstCapacity, bodyID_t(0));
+    pad_vec(m_anal_type_jit, kAnalyticConstCapacity, objType_t(0));
+    pad_vec(m_anal_mat_jit, kAnalyticConstCapacity, materialsOffset_t(0));
+    pad_vec(m_anal_normal_jit, kAnalyticConstCapacity, 0.f);
+    pad_vec(m_anal_relposx_jit, kAnalyticConstCapacity, 0.f);
+    pad_vec(m_anal_relposy_jit, kAnalyticConstCapacity, 0.f);
+    pad_vec(m_anal_relposz_jit, kAnalyticConstCapacity, 0.f);
+    pad_vec(m_anal_rotx_jit, kAnalyticConstCapacity, 0.f);
+    pad_vec(m_anal_roty_jit, kAnalyticConstCapacity, 0.f);
+    pad_vec(m_anal_rotz_jit, kAnalyticConstCapacity, 0.f);
+    pad_vec(m_anal_size1_jit, kAnalyticConstCapacity, 0.f);
+    pad_vec(m_anal_size2_jit, kAnalyticConstCapacity, 0.f);
+    pad_vec(m_anal_size3_jit, kAnalyticConstCapacity, 0.f);
+    pad_vec(m_anal_mass_jit, kAnalyticConstCapacity, 0.f);
 
-    std::string analyticalEntityDefs = ANALYTICAL_COMPONENT_DEFINITIONS_JITIFIED();
-    analyticalEntityDefs = replace_patterns(analyticalEntityDefs, array_content);
-    if (ensure_kernel_line_num) {
-        analyticalEntityDefs = compact_code(analyticalEntityDefs);
-    }
-    strMap["_analyticalEntityDefs_;"] = analyticalEntityDefs;
-
-    // There is a special owner-only version used by force collection kernels. We have it here so we don't have not-used
-    // variable warnings while jitifying
-    strMap["_objOwner_"] = objOwner;
+    // Constant declarations are now fixed in AnalyticalCompDefJitify.cu; no per-run substitution needed.
+    strMap["_analyticalEntityDefs_;"] = ANALYTICAL_COMPONENT_DEFINITIONS_JITIFIED();
+    strMap["_objOwner_"] = "0";
 }
 
 inline void DEMSolver::equipMassMoiVolume(std::unordered_map<std::string, std::string>& strMap) {
     std::string massDefs, moiDefs, massAcqStrat, moiAcqStrat;
+    m_mass_props_jit_values.clear();
+    m_moi_x_jit_values.clear();
+    m_moi_y_jit_values.clear();
+    m_moi_z_jit_values.clear();
     // We only need to jitify and mass info offsets to kernels if we jitify them. If not, we just bring mass info as
     // floats from global memory.
-    if (jitify_mass_moi) {
-        std::string MassProperties, moiX, moiY, moiZ;
-        // Loop through all templates to jitify them
+    bool use_jit_mass = jitify_mass_moi;
+    if (use_jit_mass) {
+        // Build mass/MOI lists that will be uploaded to constant memory after jit compilation.
         for (unsigned int i = 0; i < m_template_clump_mass.size(); i++) {
-            MassProperties += to_string_with_precision(m_template_clump_mass.at(i)) + ",";
-            moiX += to_string_with_precision(m_template_clump_moi.at(i).x) + ",";
-            moiY += to_string_with_precision(m_template_clump_moi.at(i).y) + ",";
-            moiZ += to_string_with_precision(m_template_clump_moi.at(i).z) + ",";
+            m_mass_props_jit_values.push_back(m_template_clump_mass.at(i));
+            m_moi_x_jit_values.push_back(m_template_clump_moi.at(i).x);
+            m_moi_y_jit_values.push_back(m_template_clump_moi.at(i).y);
+            m_moi_z_jit_values.push_back(m_template_clump_moi.at(i).z);
         }
         for (unsigned int i = 0; i < m_ext_obj_mass.size(); i++) {
-            MassProperties += to_string_with_precision(m_ext_obj_mass.at(i)) + ",";
-            moiX += to_string_with_precision(m_ext_obj_moi.at(i).x) + ",";
-            moiY += to_string_with_precision(m_ext_obj_moi.at(i).y) + ",";
-            moiZ += to_string_with_precision(m_ext_obj_moi.at(i).z) + ",";
+            m_mass_props_jit_values.push_back(m_ext_obj_mass.at(i));
+            m_moi_x_jit_values.push_back(m_ext_obj_moi.at(i).x);
+            m_moi_y_jit_values.push_back(m_ext_obj_moi.at(i).y);
+            m_moi_z_jit_values.push_back(m_ext_obj_moi.at(i).z);
         }
         for (unsigned int i = 0; i < m_mesh_mass_jit.size(); i++) {
-            MassProperties += to_string_with_precision(m_mesh_mass_jit.at(i)) + ",";
-            moiX += to_string_with_precision(m_mesh_moi_jit.at(i).x) + ",";
-            moiY += to_string_with_precision(m_mesh_moi_jit.at(i).y) + ",";
-            moiZ += to_string_with_precision(m_mesh_moi_jit.at(i).z) + ",";
+            m_mass_props_jit_values.push_back(m_mesh_mass_jit.at(i));
+            m_moi_x_jit_values.push_back(m_mesh_moi_jit.at(i).x);
+            m_moi_y_jit_values.push_back(m_mesh_moi_jit.at(i).y);
+            m_moi_z_jit_values.push_back(m_mesh_moi_jit.at(i).z);
         }
-        if (nDistinctMassProperties == 0) {
-            MassProperties += "0";
-            moiX += "0";
-            moiY += "0";
-            moiZ += "0";
+        if (m_mass_props_jit_values.empty()) {
+            // Keep constant arrays valid even when the system has no owners.
+            m_mass_props_jit_values.push_back(0.f);
+            m_moi_x_jit_values.push_back(0.f);
+            m_moi_y_jit_values.push_back(0.f);
+            m_moi_z_jit_values.push_back(0.f);
         }
-        std::unordered_map<std::string, std::string> array_content;
-        array_content["_MassProperties_"] = MassProperties;
-        array_content["_moiX_"] = moiX;
-        array_content["_moiY_"] = moiY;
-        array_content["_moiZ_"] = moiZ;
 
-        massDefs = MASS_DEFINITIONS_JITIFIED();
-        moiDefs = MOI_DEFINITIONS_JITIFIED();
-
-        massDefs = replace_patterns(massDefs, array_content);
-        moiDefs = replace_patterns(moiDefs, array_content);
+        massDefs = "extern \"C\" __device__ __constant__ __attribute__((used)) float MassProperties[" +
+                   std::to_string(kMassConstCapacity) + "];\n";
+        moiDefs = "extern \"C\" __device__ __constant__ __attribute__((used)) float moiX[" +
+                  std::to_string(kMassConstCapacity) + "];\n";
+        moiDefs += "extern \"C\" __device__ __constant__ __attribute__((used)) float moiY[" +
+                   std::to_string(kMassConstCapacity) + "];\n";
+        moiDefs += "extern \"C\" __device__ __constant__ __attribute__((used)) float moiZ[" +
+                   std::to_string(kMassConstCapacity) + "];\n";
 
         massAcqStrat = MASS_ACQUISITION_JITIFIED();
         moiAcqStrat = MOI_ACQUISITION_JITIFIED();
-    } else {
-        // Here, no need to jitify any mass/MOI templates
+    }
+
+    if (!use_jit_mass) {
+        // No jitified mass/MOI templates; use flattened arrays from global memory instead.
         massDefs = " ";
         moiDefs = " ";
+        m_mass_props_jit_values.clear();
+        m_moi_x_jit_values.clear();
+        m_moi_y_jit_values.clear();
+        m_moi_z_jit_values.clear();
 
         massAcqStrat = MASS_ACQUISITION_FLATTENED();
         moiAcqStrat = MOI_ACQUISITION_FLATTENED();
     }
-
-    // Right now we always jitify clump volume info. This is because we don't use volume that often, probably only at
-    // void ratio computation. So let's save some memory...
-    //// TODO: Add support for non-jitified volume properties, and for meshes
-    std::string volumeDefs = "__constant__ __device__ float volumeProperties[] = {";
-    for (unsigned int i = 0; i < m_template_clump_volume.size(); i++) {
-        volumeDefs += to_string_with_precision(m_template_clump_volume.at(i)) + ",";
-    }
-    if (m_template_clump_volume.size() == 0) {
-        volumeDefs += "0";
-    }
-    // if (nDistinctMassProperties == 0) {
-    //     volumeDefs += "0";
-    // }
-    volumeDefs += "};\n";
+    // Volume properties are stored in global arrays; no jitified definition to keep kernel source stable.
+    std::string volumeDefs = " ";
 
     if (ensure_kernel_line_num) {
         massDefs = compact_code(massDefs);
@@ -2032,7 +2569,7 @@ inline void DEMSolver::equipMassMoiVolume(std::unordered_map<std::string, std::s
     DEME_DEBUG_PRINTF("%s", volumeDefs.c_str());
 }
 
-inline void DEMSolver::equipMaterials(std::unordered_map<std::string, std::string>& strMap) {
+void DEMSolver::prepareMaterialProps() {
     // Force model gives us info on what mat props should be pairwise
     const std::set<std::string> mat_prop_that_are_pairwise = m_force_model->m_pairwise_mat_props;
     m_pairwise_material_prop_names.insert(mat_prop_that_are_pairwise.begin(), mat_prop_that_are_pairwise.end());
@@ -2043,18 +2580,62 @@ inline void DEMSolver::equipMaterials(std::unordered_map<std::string, std::strin
     m_material_prop_names.insert(mat_prop_that_must_exist.begin(), mat_prop_that_must_exist.end());
     m_material_prop_names.insert(m_pairwise_material_prop_names.begin(), m_pairwise_material_prop_names.end());
 
-    // Init
-    std::string materialDefs = " ";
+    m_material_props_1d.clear();
+    m_material_props_2d.clear();
+    m_material_props_1d_names.clear();
+    m_material_props_2d_names.clear();
+    m_material_defs = " ";
+    m_use_material_props_jit = false;
+    m_use_material_props_constmem = false;
 
-    if (m_material_prop_names.size() == 0)
+    if (m_material_prop_names.empty()) {
         return;
+    }
     unsigned int num_mats = m_loaded_materials.size();
     // A matrix used to see if all mat props are defined by the user
     const std::vector<std::vector<notStupidBool_t>> flag_mat =
         std::vector<std::vector<notStupidBool_t>>(num_mats, std::vector<notStupidBool_t>(num_mats, 0));
 
-    // Construct material arrays line by line
+    const size_t mat_capacity = DEME_MATERIAL_PROP_CAPACITY;
+    if (num_mats <= mat_capacity) {
+        m_use_material_props_jit = true;
+        m_use_material_props_constmem = true;
+    } else {
+        DEME_WARNING(
+            "Material property jitification is disabled because %u entries exceed the fixed capacity (%zu). "
+            "Kernel sources will include material constants, which may trigger recompilation.",
+            num_mats, mat_capacity);
+    }
+
+    const size_t mat_dim = (num_mats == 0) ? 1 : num_mats;
+    const size_t mat_stride_1d = mat_dim;
+    const size_t mat_stride_2d = mat_dim * mat_dim;
+
+    size_t num_props_1d = 0;
+    size_t num_props_2d = 0;
+    for (const auto& prop_name : m_material_prop_names) {
+        if (check_exist(m_pairwise_material_prop_names, prop_name)) {
+            num_props_2d++;
+        } else {
+            num_props_1d++;
+        }
+    }
+
+    std::string materialDefs = " ";
+    if (m_use_material_props_jit && m_use_material_props_constmem) {
+        if (num_props_1d > 0) {
+            materialDefs += "extern \"C\" __device__ __constant__ __attribute__((used)) float materialProps1D[" +
+                            std::to_string(num_props_1d * mat_stride_1d) + "];\n";
+        }
+        if (num_props_2d > 0) {
+            materialDefs += "extern \"C\" __device__ __constant__ __attribute__((used)) float materialProps2D[" +
+                            std::to_string(num_props_2d * mat_stride_2d) + "];\n";
+        }
+    }
+
     const std::string line_header = "__constant__ __device__ float ";
+    const std::string mat1d_base = m_use_material_props_constmem ? "materialProps1D" : "granData->materialProps1D";
+    const std::string mat2d_base = m_use_material_props_constmem ? "materialProps2D" : "granData->materialProps2D";
     // Looping through all material prop names that need a definition...
     for (const auto& prop_name : m_material_prop_names) {
         std::vector<std::vector<notStupidBool_t>> flags = flag_mat;
@@ -2141,32 +2722,55 @@ inline void DEMSolver::equipMaterials(std::unordered_map<std::string, std::strin
             }
         }
 
-        // Now jitify
-        if (!check_exist(m_pairwise_material_prop_names, prop_name)) {  // Not a pair-wise prop...
-            materialDefs += line_header + prop_name + "[] = {";
-            for (unsigned int i = 0; i < num_mats; i++) {
-                materialDefs += to_string_with_precision(pair_mat[i][i]) + ",";
-            }
-            // If the user makes trouble and loaded 0 material, then we add some junk in it as placeholder
-            if (num_mats == 0) {
-                materialDefs += "0";
-            }
-            // End the line
-            materialDefs += "};\n";
-        } else {  // Is a pair-wise prop...
-            materialDefs += line_header + prop_name + "[][" + std::to_string(num_mats) + "] = {";
-            for (unsigned int i = 0; i < num_mats; i++) {
-                materialDefs += "{";
-                for (unsigned int j = 0; j < num_mats; j++) {
-                    materialDefs += to_string_with_precision(pair_mat[i][j]) + ",";
+        if (m_use_material_props_jit) {
+            if (!check_exist(m_pairwise_material_prop_names, prop_name)) {  // Not a pair-wise prop...
+                const size_t offset = m_material_props_1d.size();
+                m_material_props_1d_names.push_back(prop_name);
+                m_material_props_1d.resize(offset + mat_stride_1d, 0.f);
+                for (unsigned int i = 0; i < num_mats; i++) {
+                    m_material_props_1d[offset + i] = pair_mat[i][i];
                 }
-                materialDefs += "},";
+                materialDefs += "#define " + prop_name + " (" + mat1d_base + " + " + std::to_string(offset) + ")\n";
+            } else {  // Pair-wise prop...
+                const size_t offset = m_material_props_2d.size();
+                m_material_props_2d_names.push_back(prop_name);
+                m_material_props_2d.resize(offset + mat_stride_2d, 0.f);
+                for (unsigned int i = 0; i < num_mats; i++) {
+                    for (unsigned int j = 0; j < num_mats; j++) {
+                        m_material_props_2d[offset + i * mat_dim + j] = pair_mat[i][j];
+                    }
+                }
+                materialDefs += "#define " + prop_name + " ((float (*)[" + std::to_string(mat_dim) + "])(" +
+                                mat2d_base + " + " + std::to_string(offset) + "))\n";
             }
-            // If the user makes trouble and loaded 0 material, then we add some junk in it as placeholder
-            if (num_mats == 0) {
-                materialDefs += "{0}";
+        } else {
+            // Jitify with embedded values (legacy behavior)
+            if (!check_exist(m_pairwise_material_prop_names, prop_name)) {  // Not a pair-wise prop...
+                materialDefs += line_header + prop_name + "[] = {";
+                for (unsigned int i = 0; i < num_mats; i++) {
+                    materialDefs += to_string_with_precision(pair_mat[i][i]) + ",";
+                }
+                // If the user makes trouble and loaded 0 material, then we add some junk in it as placeholder
+                if (num_mats == 0) {
+                    materialDefs += "0";
+                }
+                // End the line
+                materialDefs += "};\n";
+            } else {  // Is a pair-wise prop...
+                materialDefs += line_header + prop_name + "[][" + std::to_string(num_mats) + "] = {";
+                for (unsigned int i = 0; i < num_mats; i++) {
+                    materialDefs += "{";
+                    for (unsigned int j = 0; j < num_mats; j++) {
+                        materialDefs += to_string_with_precision(pair_mat[i][j]) + ",";
+                    }
+                    materialDefs += "},";
+                }
+                // If the user makes trouble and loaded 0 material, then we add some junk in it as placeholder
+                if (num_mats == 0) {
+                    materialDefs += "{0}";
+                }
+                materialDefs += "};\n";
             }
-            materialDefs += "};\n";
         }
     }
     DEME_DEBUG_PRINTF("Material properties in kernel:");
@@ -2177,10 +2781,14 @@ inline void DEMSolver::equipMaterials(std::unordered_map<std::string, std::strin
     // nu   0.33    0.3
     // CoR  0.6     0.4
 
-    if (ensure_kernel_line_num) {
+    if (ensure_kernel_line_num && !m_use_material_props_jit) {
         materialDefs = compact_code(materialDefs);
     }
-    strMap["_materialDefs_;"] = materialDefs;
+    m_material_defs = materialDefs;
+}
+
+inline void DEMSolver::equipMaterials(std::unordered_map<std::string, std::string>& strMap) {
+    strMap["_materialDefs_;"] = m_material_defs;
 }
 
 inline void DEMSolver::equipClumpTemplates(std::unordered_map<std::string, std::string>& strMap) {
@@ -2188,47 +2796,38 @@ inline void DEMSolver::equipClumpTemplates(std::unordered_map<std::string, std::
     // clump component info as floats from global memory.
     std::string clump_template_arrays, componentAcqStrat;
     if (jitify_clump_templates) {
-        // Prepare jitified clump template
+        // Fixed-capacity clump template arrays (values uploaded at runtime).
         clump_template_arrays = CLUMP_COMPONENT_DEFINITIONS_JITIFIED();
-        {
-            std::unordered_map<std::string, std::string> array_content;
-            std::string CDRadii, Radii, CDRelPosX, CDRelPosY, CDRelPosZ;
-            // Loop through all clump templates to jitify them, but without going over the shared memory limit
-            for (unsigned int i = 0; i < nJitifiableClumpTopo; i++) {
-                for (unsigned int j = 0; j < m_template_sp_radii.at(i).size(); j++) {
-                    Radii += to_string_with_precision(m_template_sp_radii.at(i).at(j)) + ",";
-                    CDRadii += to_string_with_precision(m_template_sp_radii.at(i).at(j)) + ",";
-                    CDRelPosX += to_string_with_precision(m_template_sp_relPos.at(i).at(j).x) + ",";
-                    CDRelPosY += to_string_with_precision(m_template_sp_relPos.at(i).at(j).y) + ",";
-                    CDRelPosZ += to_string_with_precision(m_template_sp_relPos.at(i).at(j).z) + ",";
+
+        m_clump_radii_jit.clear();
+        m_clump_relposx_jit.clear();
+        m_clump_relposy_jit.clear();
+        m_clump_relposz_jit.clear();
+        // Loop through all clump templates to jitify them, but without going over the fixed constant capacity.
+        for (unsigned int i = 0; i < nJitifiableClumpTopo; i++) {
+            for (unsigned int j = 0; j < m_template_sp_radii.at(i).size(); j++) {
+                if (m_clump_radii_jit.size() >= DEME_CLUMP_COMPONENT_CONST_CAPACITY) {
+                    break;
                 }
+                m_clump_radii_jit.push_back(m_template_sp_radii.at(i).at(j));
+                m_clump_relposx_jit.push_back(m_template_sp_relPos.at(i).at(j).x);
+                m_clump_relposy_jit.push_back(m_template_sp_relPos.at(i).at(j).y);
+                m_clump_relposz_jit.push_back(m_template_sp_relPos.at(i).at(j).z);
             }
-            if (nJitifiableClumpTopo == 0) {
-                // If the user looks for trouble, jitifies 0 template, then put some junk there to make it compilable:
-                // those kernels won't be executed anyway
-                Radii += "0";
-                CDRadii += "0";
-                CDRelPosX += "0";
-                CDRelPosY += "0";
-                CDRelPosZ += "0";
+            if (m_clump_radii_jit.size() >= DEME_CLUMP_COMPONENT_CONST_CAPACITY) {
+                break;
             }
-            array_content["_Radii_"] = Radii;
-            array_content["_CDRadii_"] = CDRadii;
-            array_content["_CDRelPosX_"] = CDRelPosX;
-            array_content["_CDRelPosY_"] = CDRelPosY;
-            array_content["_CDRelPosZ_"] = CDRelPosZ;
-            clump_template_arrays = replace_patterns(clump_template_arrays, array_content);
+        }
+        if (m_clump_radii_jit.empty()) {
+            // Keep constant arrays valid even when the system has no clumps.
+            m_clump_radii_jit.push_back(0.f);
+            m_clump_relposx_jit.push_back(0.f);
+            m_clump_relposy_jit.push_back(0.f);
+            m_clump_relposz_jit.push_back(0.f);
         }
 
-        // Then prepare the acquisition rules for jitified templates. It's so much trouble.
-        // This part is different depending on whether we have clump templates that are in global memory only
-        if (nJitifiableClumpTopo == nDistinctClumpBodyTopologies) {
-            // In this case, all clump templates can be jitified
-            componentAcqStrat = CLUMP_COMPONENT_ACQUISITION_ALL_JITIFIED();
-        } else if (nJitifiableClumpTopo < nDistinctClumpBodyTopologies) {
-            // In this case, some clump templates are in the global memory
-            componentAcqStrat = CLUMP_COMPONENT_ACQUISITION_PARTIALLY_JITIFIED();
-        }
+        // Use the partial strategy so the same kernel works for all/partial jitified templates.
+        componentAcqStrat = CLUMP_COMPONENT_ACQUISITION_PARTIALLY_JITIFIED();
 
     } else {
         // Compared to the jitified case, non-jitified version is much simpler: just bring them from global memory
@@ -2262,12 +2861,13 @@ inline void DEMSolver::equipIntegrationScheme(std::unordered_map<std::string, st
 }
 
 inline void DEMSolver::equipSimParams(std::unordered_map<std::string, std::string>& strMap) {
-    strMap["_nvXp2_"] = std::to_string(nvXp2);
-    strMap["_nvYp2_"] = std::to_string(nvYp2);
-    strMap["_nvZp2_"] = std::to_string(nvZp2);
+    // Use runtime parameters to avoid kernel source changes across simulations.
+    strMap["_nvXp2_"] = "DEME_SimParamsConst.nvXp2";
+    strMap["_nvYp2_"] = "DEME_SimParamsConst.nvYp2";
+    strMap["_nvZp2_"] = "DEME_SimParamsConst.nvZp2";
 
-    strMap["_l_"] = to_string_with_precision(l);
-    strMap["_voxelSize_"] = to_string_with_precision(m_voxelSize);
+    strMap["_l_"] = "DEME_SimParamsConst.l";
+    strMap["_voxelSize_"] = "DEME_SimParamsConst.voxelSize";
     // strMap["_binSize_"] = to_string_with_precision(m_binSize);
 
     // strMap["_nOwnerBodies_"] = std::to_string(nOwnerBodies);
@@ -2281,7 +2881,8 @@ inline void DEMSolver::equipSimParams(std::unordered_map<std::string, std::strin
     // strMap["_nAnalGM_"] = std::to_string(nAnalGM);
     strMap["_nActiveLoadingThreads_"] = std::to_string(NUM_ACTIVE_TEMPLATE_LOADING_THREADS);
     // nTotalBodyTopologies includes clump topologies and ext obj topologies
-    strMap["_nDistinctMassProperties_"] = std::to_string(nDistinctMassProperties);
+    // Keep kernel source stable across input changes (value unused when mass jitify is off).
+    strMap["_nDistinctMassProperties_"] = std::to_string(kMassConstCapacity);
     strMap["_nJitifiableClumpComponents_"] = std::to_string(nJitifiableClumpComponents);
     strMap["_nMatTuples_"] = std::to_string(nMatTuples);
 }
@@ -2297,10 +2898,284 @@ void DEMSolver::setDefaultSolverParams() {
     m_jitify_options = {"-I" + (JitHelper::KERNEL_INCLUDE_DIR).string(),
                         "-I" + (JitHelper::KERNEL_DIR).string(),
                         "-I" + std::string(DEME_CUDA_TOOLKIT_HEADERS),
+                        "-O3",
                         "-diag-suppress=177",
+                        "-diag-suppress=20044",
                         "-diag-suppress=549",
                         "-diag-suppress=550",
                         "-std=c++17"};
+    m_kernel_cache_dir = (DEMERuntimeDataHelper::data_path / "baked").string();
+    m_kernel_cache_tag.clear();
+    m_require_kernel_cache = false;
+}
+
+void DEMSolver::uploadJitifiedMassProperties(const std::shared_ptr<JitHelper::CachedProgram>& program,
+                                             const std::string& anchor_kernel,
+                                             int device,
+                                             cudaStream_t stream) {
+    if (!jitify_mass_moi || !program) {
+        return;
+    }
+    if (m_mass_props_jit_values.empty()) {
+        return;
+    }
+    if (m_mass_props_jit_values.size() > kMassConstCapacity) {
+        DEME_WARNING(
+            "Skipping mass/MOI upload: %zu entries exceed constant capacity (%zu). Mass jitify should have been "
+            "disabled earlier.",
+            m_mass_props_jit_values.size(), kMassConstCapacity);
+        return;
+    }
+
+    int prev_device = 0;
+    DEME_GPU_CALL(cudaGetDevice(&prev_device));
+    if (prev_device != device) {
+        DEME_GPU_CALL(cudaSetDevice(device));
+    }
+    auto inst = program->kernel(anchor_kernel).instantiate();
+    auto set_array = [&](const char* name, const std::vector<float>& values) {
+        std::vector<float> padded(kMassConstCapacity, 0.f);
+        const size_t copy_len = std::min(padded.size(), values.size());
+        std::copy(values.begin(), values.begin() + copy_len, padded.begin());
+        if (values.size() > padded.size()) {
+            DEME_WARNING(
+                "Truncating mass/MOI upload for %s: %zu entries provided, capacity %zu. "
+                "Consider DisableJitifyMassProperties().",
+                name, values.size(), padded.size());
+        }
+        try {
+            size_t sz = 0;
+            CUdeviceptr ptr = inst.get_global_ptr(name, &sz);
+            if (ptr == 0 || sz == 0) {
+                DEME_WARNING("Global %s not found in jitified program when uploading mass/MOI constants.", name);
+                return;
+            }
+            CUresult res = inst.set_global_array(name, padded.data(), padded.size(), stream);
+            if (res != CUDA_SUCCESS) {
+                DEME_WARNING("Failed to upload jitified constant array %s (CUresult %d).", name, (int)res);
+            }
+        } catch (const std::exception& e) {
+            DEME_WARNING("Failed to upload jitified constant array %s: %s", name, e.what());
+        }
+    };
+    set_array("MassProperties", m_mass_props_jit_values);
+    set_array("moiX", m_moi_x_jit_values);
+    set_array("moiY", m_moi_y_jit_values);
+    set_array("moiZ", m_moi_z_jit_values);
+    if (prev_device != device) {
+        DEME_GPU_CALL(cudaSetDevice(prev_device));
+    }
+}
+
+void DEMSolver::uploadJitifiedMaterialProperties(const std::shared_ptr<JitHelper::CachedProgram>& program,
+                                                 const std::string& anchor_kernel,
+                                                 int device,
+                                                 cudaStream_t stream) {
+    if (!m_use_material_props_constmem || !program) {
+        return;
+    }
+    if (m_material_props_1d.empty() && m_material_props_2d.empty()) {
+        return;
+    }
+
+    int prev_device = 0;
+    DEME_GPU_CALL(cudaGetDevice(&prev_device));
+    if (prev_device != device) {
+        DEME_GPU_CALL(cudaSetDevice(device));
+    }
+    auto inst = program->kernel(anchor_kernel).instantiate();
+    auto set_array = [&](const char* name, const std::vector<float>& values) {
+        if (values.empty()) {
+            return;
+        }
+        try {
+            size_t sz = 0;
+            CUdeviceptr ptr = inst.get_global_ptr(name, &sz);
+            if (ptr == 0 || sz == 0) {
+                DEME_WARNING("Global %s not found in jitified program when uploading material constants.", name);
+                return;
+            }
+            CUresult res = inst.set_global_array(name, values.data(), values.size(), stream);
+            if (res != CUDA_SUCCESS) {
+                DEME_WARNING("Failed to upload jitified material array %s (CUresult %d).", name, (int)res);
+            }
+        } catch (const std::exception& e) {
+            DEME_WARNING("Failed to upload jitified material array %s: %s", name, e.what());
+        }
+    };
+    set_array("materialProps1D", m_material_props_1d);
+    set_array("materialProps2D", m_material_props_2d);
+    if (prev_device != device) {
+        DEME_GPU_CALL(cudaSetDevice(prev_device));
+    }
+}
+
+void DEMSolver::uploadJitifiedClumpTemplates(const std::shared_ptr<JitHelper::CachedProgram>& program,
+                                             const std::string& anchor_kernel,
+                                             int device,
+                                             cudaStream_t stream) {
+    if (!jitify_clump_templates || !program) {
+        return;
+    }
+    if (m_clump_radii_jit.empty()) {
+        return;
+    }
+
+    int prev_device = 0;
+    DEME_GPU_CALL(cudaGetDevice(&prev_device));
+    if (prev_device != device) {
+        DEME_GPU_CALL(cudaSetDevice(device));
+    }
+    auto inst = program->kernel(anchor_kernel).instantiate();
+
+    auto set_array = [&](const char* name, const std::vector<float>& values) {
+        std::vector<float> padded(DEME_CLUMP_COMPONENT_CONST_CAPACITY, 0.f);
+        const size_t copy_len = std::min(padded.size(), values.size());
+        std::copy(values.begin(), values.begin() + copy_len, padded.begin());
+        if (values.size() > padded.size()) {
+            DEME_WARNING(
+                "Truncating clump template upload for %s: %zu entries provided, capacity %zu.",
+                name, values.size(), padded.size());
+        }
+        try {
+            size_t sz = 0;
+            CUdeviceptr ptr = inst.get_global_ptr(name, &sz);
+            if (ptr == 0 || sz == 0) {
+                DEME_WARNING("Global %s not found in jitified program when uploading clump constants.", name);
+                return;
+            }
+            CUresult res = inst.set_global_array(name, padded.data(), padded.size(), stream);
+            if (res != CUDA_SUCCESS) {
+                DEME_WARNING("Failed to upload clump constant array %s (CUresult %d).", name, (int)res);
+            }
+        } catch (const std::exception& e) {
+            DEME_WARNING("Failed to upload clump constant array %s: %s", name, e.what());
+        }
+    };
+
+    set_array("Radii", m_clump_radii_jit);
+    set_array("CDRelPosX", m_clump_relposx_jit);
+    set_array("CDRelPosY", m_clump_relposy_jit);
+    set_array("CDRelPosZ", m_clump_relposz_jit);
+
+    if (prev_device != device) {
+        DEME_GPU_CALL(cudaSetDevice(prev_device));
+    }
+}
+
+void DEMSolver::uploadJitifiedSimParamsConst(const std::shared_ptr<JitHelper::CachedProgram>& program,
+                                             const std::string& anchor_kernel,
+                                             int device,
+                                             cudaStream_t stream) {
+    if (!program) {
+        return;
+    }
+
+    deme::DEMSimParamsConst params;
+    params.nvXp2 = nvXp2;
+    params.nvYp2 = nvYp2;
+    params.nvZp2 = nvZp2;
+    params.nvXp2nvYp2 = static_cast<unsigned char>(nvXp2 + nvYp2);
+    params.voxelMaskX = (static_cast<deme::voxelID_t>(1) << nvXp2) - 1;
+    params.voxelMaskY = (static_cast<deme::voxelID_t>(1) << nvYp2) - 1;
+    params.l = l;
+    params.invL = (l == 0.0) ? 0.0 : 1.0 / l;
+    params.voxelSize = m_voxelSize;
+    params.invVoxelSize = (m_voxelSize == 0.0) ? 0.0 : 1.0 / m_voxelSize;
+    params.LBFX = m_boxLBF.x;
+    params.LBFY = m_boxLBF.y;
+    params.LBFZ = m_boxLBF.z;
+    params.Gx = G.x;
+    params.Gy = G.y;
+    params.Gz = G.z;
+    
+    int prev_device = 0;
+    DEME_GPU_CALL(cudaGetDevice(&prev_device));
+    if (prev_device != device) {
+        DEME_GPU_CALL(cudaSetDevice(device));
+    }
+    auto inst = program->kernel(anchor_kernel).instantiate();
+    try {
+        CUresult res = inst.set_global_value("DEME_SimParamsConst", params, stream);
+        if (res != CUDA_SUCCESS) {
+            DEME_WARNING("Failed to upload sim param constants (CUresult %d).", (int)res);
+        }
+    } catch (const std::exception& e) {
+        DEME_WARNING("Failed to upload sim param constants: %s", e.what());
+    }
+    if (prev_device != device) {
+        DEME_GPU_CALL(cudaSetDevice(prev_device));
+    }
+}
+
+void DEMSolver::uploadJitifiedAnalytical(const std::shared_ptr<JitHelper::CachedProgram>& program,
+                                         const std::string& anchor_kernel,
+                                         int device,
+                                         cudaStream_t stream) {
+    if (!program) {
+        return;
+    }
+    if (m_anal_type_jit.empty()) {
+        return;
+    }
+    if (m_anal_type_jit.size() > kAnalyticConstCapacity) {
+        DEME_WARNING(
+            "Skipping analytical upload: %zu entries exceed constant capacity (%zu). "
+            "Analytical jitify should have been capped earlier.",
+            m_anal_type_jit.size(), kAnalyticConstCapacity);
+        return;
+    }
+
+    int prev_device = 0;
+    DEME_GPU_CALL(cudaGetDevice(&prev_device));
+    if (prev_device != device) {
+        DEME_GPU_CALL(cudaSetDevice(device));
+    }
+    auto inst = program->kernel(anchor_kernel).instantiate();
+
+    auto set_array = [&](const char* name, auto& values) {
+        using ElemT = typename std::decay_t<decltype(values)>::value_type;
+        std::vector<ElemT> padded(kAnalyticConstCapacity, ElemT{});
+        const size_t copy_len = std::min(padded.size(), values.size());
+        std::copy(values.begin(), values.begin() + copy_len, padded.begin());
+        if (values.size() > padded.size()) {
+            DEME_WARNING("Truncating analytical upload for %s: %zu entries provided, capacity %zu.", name,
+                         values.size(), padded.size());
+        }
+        try {
+            size_t sz = 0;
+            CUdeviceptr ptr = inst.get_global_ptr(name, &sz);
+            if (ptr == 0 || sz == 0) {
+                DEME_WARNING("Global %s not found in jitified program when uploading analytical constants.", name);
+                return;
+            }
+            CUresult res = inst.set_global_array(name, padded.data(), padded.size(), stream);
+            if (res != CUDA_SUCCESS) {
+                DEME_WARNING("Failed to upload analytical constant array %s (CUresult %d).", name, (int)res);
+            }
+        } catch (const std::exception& e) {
+            DEME_WARNING("Failed to upload analytical constant array %s: %s", name, e.what());
+        }
+    };
+
+    set_array("objType", m_anal_type_jit);
+    set_array("objOwner", m_anal_owner_jit);
+    set_array("objNormal", m_anal_normal_jit);
+    set_array("objMaterial", m_anal_mat_jit);
+    set_array("objRelPosX", m_anal_relposx_jit);
+    set_array("objRelPosY", m_anal_relposy_jit);
+    set_array("objRelPosZ", m_anal_relposz_jit);
+    set_array("objRotX", m_anal_rotx_jit);
+    set_array("objRotY", m_anal_roty_jit);
+    set_array("objRotZ", m_anal_rotz_jit);
+    set_array("objSize1", m_anal_size1_jit);
+    set_array("objSize2", m_anal_size2_jit);
+    set_array("objSize3", m_anal_size3_jit);
+    set_array("objMass", m_anal_mass_jit);
+
+    if (prev_device != device) {
+        DEME_GPU_CALL(cudaSetDevice(prev_device));
+    }
 }
 
 }  // namespace deme

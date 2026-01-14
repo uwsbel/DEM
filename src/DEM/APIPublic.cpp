@@ -111,6 +111,26 @@ void DEMSolver::SetVerbosity(const std::string& verbose) {
     }
 }
 
+void DEMSolver::UseBakedKernelCache(bool use) {
+    if (use) {
+        m_kernel_cache_dir = (DEMERuntimeDataHelper::data_path / "baked").string();
+    } else {
+        m_kernel_cache_dir.clear();
+    }
+}
+
+void DEMSolver::SetKernelCacheDir(const std::string& dir) {
+    m_kernel_cache_dir = dir;
+}
+
+void DEMSolver::SetKernelCacheTag(const std::string& tag) {
+    m_kernel_cache_tag = tag;
+}
+
+void DEMSolver::RequireKernelCache(bool require) {
+    m_require_kernel_cache = require;
+}
+
 void DEMSolver::SetOutputFormat(const std::string& format) {
     std::string u_format = str_to_upper(format);
     switch (hash_charr(u_format.c_str())) {
@@ -2329,6 +2349,13 @@ void DEMSolver::ReleaseFlattenedArrays() {
     deallocate_array(m_input_mesh_obj_family);
 
     deallocate_array(m_unique_family_prescription);
+    deallocate_array(m_family_presc_lin_vel);
+    deallocate_array(m_family_presc_rot_vel);
+    deallocate_array(m_family_presc_lin_pos);
+    deallocate_array(m_family_presc_acc);
+    deallocate_array(m_family_presc_ang_acc);
+    deallocate_array(m_family_presc_set_mask);
+    deallocate_array(m_family_presc_prescribed_mask);
     deallocate_array(m_input_clump_family);
     deallocate_array(m_anal_owner);
     deallocate_array(m_anal_materials);

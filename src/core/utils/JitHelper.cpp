@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 #include <mutex>
 #include <memory>
@@ -43,11 +44,109 @@ std::string sanitizeFilename(const std::string& name) {
     return sanitized;
 }
 
+void appendCudaIncludeFlags(std::vector<std::string>& flags) {
+    std::vector<std::filesystem::path> include_paths;
+    {
+        std::string dirs = DEME_CUDA_TOOLKIT_INCLUDE_DIRS;  // "dir1;dir2;dir3"
+        std::stringstream ss(dirs);
+        std::string dir;
+        while (std::getline(ss, dir, ';')) {
+            if (!dir.empty()) {
+                include_paths.emplace_back(dir);
+            }
+        }
+    }
+    auto add_inc = [&](const std::filesystem::path& p) {
+        std::string inc_flag = "-I" + p.string();
+        if (std::find(flags.begin(), flags.end(), inc_flag) == flags.end()) {
+            flags.push_back(inc_flag);
+        }
+    };
+    for (auto& p : include_paths) {
+        add_inc(p);
+        auto cccl = p / "cccl";
+        add_inc(cccl);
+    }
+}
+
+std::string applySubstitutions(std::string code,
+                               const std::unordered_map<std::string, std::string>& substitutions) {
+    std::vector<std::pair<std::string, std::string>> ordered_subs(substitutions.begin(), substitutions.end());
+    std::sort(ordered_subs.begin(), ordered_subs.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (auto& subst : ordered_subs) {
+        code = std::regex_replace(code, std::regex(subst.first), subst.second);
+    }
+    return code;
+}
+
+std::mutex g_bake_mutex;
+
+std::string quoteArg(const std::filesystem::path& path) {
+    std::string out = path.string();
+    std::string escaped;
+    escaped.reserve(out.size());
+    for (char c : out) {
+        if (c == '"') {
+            escaped.push_back('\\');
+        }
+        escaped.push_back(c);
+    }
+    return "\"" + escaped + "\"";
+}
+
+int runNvccCompile(const std::filesystem::path& source,
+                   const std::filesystem::path& fatbin,
+                   const std::vector<std::string>& flags,
+                   const std::string& arch_tag,
+                   const std::filesystem::path& log_path) {
+    std::ostringstream cmd;
+    cmd << "nvcc --fatbin -arch=" << arch_tag << " -DDEME_DEFINE_SIM_PARAMS_CONST";
+    for (const auto& flag : flags) {
+        if (flag.rfind("-diag-suppress=", 0) == 0 || flag.rfind("-diag_suppress=", 0) == 0) {
+            continue;
+        }
+        cmd << " " << flag;
+    }
+    cmd << " -o " << quoteArg(fatbin) << " " << quoteArg(source);
+    cmd << " > " << quoteArg(log_path) << " 2>&1";
+    return std::system(cmd.str().c_str());
+}
+
 }  // namespace
 
 const std::filesystem::path JitHelper::KERNEL_DIR = DEMERuntimeDataHelper::data_path / "kernel";
 const std::filesystem::path JitHelper::KERNEL_INCLUDE_DIR = DEMERuntimeDataHelper::include_path;
-const std::filesystem::path JitHelper::CACHE_DIR = JitHelper::resolveCacheDir();
+std::filesystem::path JitHelper::s_cache_dir = JitHelper::resolveCacheDir();
+std::string JitHelper::s_cache_tag;
+bool JitHelper::s_require_cache = false;
+
+void JitHelper::setCacheDir(const std::filesystem::path& dir) {
+    if (dir.empty()) {
+        s_cache_dir = resolveCacheDir();
+    } else {
+        s_cache_dir = dir;
+    }
+}
+
+const std::filesystem::path& JitHelper::getCacheDir() {
+    return s_cache_dir;
+}
+
+void JitHelper::setCacheTag(const std::string& tag) {
+    s_cache_tag = sanitizeFilename(tag);
+}
+
+const std::string& JitHelper::getCacheTag() {
+    return s_cache_tag;
+}
+
+void JitHelper::setRequireCache(bool require) {
+    s_require_cache = require;
+}
+
+bool JitHelper::getRequireCache() {
+    return s_require_cache;
+}
 
 JitHelper::Header::Header(const std::filesystem::path& sourcefile) {
     this->_source = JitHelper::loadSourceFile(sourcefile);
@@ -69,44 +168,14 @@ JitHelper::CachedProgram JitHelper::buildProgram(const std::string& name,
                                                  const std::filesystem::path& source,
                                                  std::unordered_map<std::string, std::string> substitutions,
                                                  std::vector<std::string> flags) {
-    std::string code = name + "\n";
-
-    code.append(JitHelper::loadSourceFile(source));
-    // Apply the substitutions deterministically (unordered_map iteration is non-deterministic)
-    std::vector<std::pair<std::string, std::string>> ordered_subs(substitutions.begin(), substitutions.end());
-    std::sort(ordered_subs.begin(), ordered_subs.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-    for (auto& subst : ordered_subs) {
-        code = std::regex_replace(code, std::regex(subst.first), subst.second);
-    }
+    std::string source_code = JitHelper::loadSourceFile(source);
+    source_code = applySubstitutions(std::move(source_code), substitutions);
+    std::string code = name + "\n" + source_code;
 
     if (std::find(flags.begin(), flags.end(), "-std=c++17") == flags.end()) {
         flags.push_back("-std=c++17");
     }
-    {
-        // Collect CUDA include paths from CMake and common fallbacks
-        std::vector<std::filesystem::path> include_paths;
-        {
-            std::string dirs = DEME_CUDA_TOOLKIT_INCLUDE_DIRS;  // "dir1;dir2;dir3"
-            std::stringstream ss(dirs);
-            std::string dir;
-            while (std::getline(ss, dir, ';')) {
-                if (!dir.empty()) {
-                    include_paths.emplace_back(dir);
-                }
-            }
-        }
-        auto add_inc = [&](const std::filesystem::path& p) {
-            std::string inc_flag = "-I" + p.string();
-            if (std::find(flags.begin(), flags.end(), inc_flag) == flags.end()) {
-                flags.push_back(inc_flag);
-            }
-        };
-        for (auto& p : include_paths) {
-            add_inc(p);
-            auto cccl = p / "cccl";
-            add_inc(cccl);
-        }
-    }
+    appendCudaIncludeFlags(flags);
 
     int device = 0;
     cudaDeviceProp prop{};
@@ -121,25 +190,74 @@ JitHelper::CachedProgram JitHelper::buildProgram(const std::string& name,
 
     std::vector<std::string> flags_sorted = flags;
     std::sort(flags_sorted.begin(), flags_sorted.end());
-    const std::string flags_sig = jitify::reflection::reflect_list(flags_sorted);
+    std::string flags_sig;
+    for (const auto& flag : flags_sorted) {
+        flags_sig += flag;
+        flags_sig += ";";
+    }
     const std::string fingerprint = code + "|flags:" + flags_sig + "|api:" + std::to_string(DEME_API_VERSION) +
                                     "|cuda:" + std::to_string(getCudaVersion()) + "|arch:" + arch_tag;
     std::string program_hash = hashString(fingerprint);
 
-    const auto program_dir = CACHE_DIR / program_hash;
+    std::filesystem::path program_dir = getCacheDir();
+    const std::string& tag = getCacheTag();
+    if (!tag.empty()) {
+        program_dir /= tag;
+    }
+    program_dir /= program_hash;
+    std::error_code ec;
+    std::filesystem::create_directories(program_dir, ec);
+    std::ofstream fp_out(program_dir / "fingerprint.txt", std::ios::trunc);
+    if (fp_out) {
+        fp_out << program_hash << "\n" << fingerprint;
+    }
+
+    const std::string name_sanitized = sanitizeFilename(name);
+    const std::filesystem::path source_out = program_dir / (name_sanitized + ".cu");
+    const std::filesystem::path fatbin_out = program_dir / (name_sanitized + ".fatbin");
+    const std::filesystem::path log_out = program_dir / (name_sanitized + ".log");
+
+    if (!std::filesystem::exists(fatbin_out)) {
+        if (getRequireCache()) {
+            throw std::runtime_error("Baked kernel cache missing for program " + name);
+        }
+        std::lock_guard<std::mutex> lock(g_bake_mutex);
+        if (!std::filesystem::exists(fatbin_out)) {
+            std::ofstream src_out(source_out, std::ios::trunc);
+            if (!src_out) {
+                throw std::runtime_error("Failed to write baked kernel source for " + name);
+            }
+            src_out << source_code;
+            src_out.close();
+
+            std::cout << "bake-compiling for " << name << " ..." << std::endl;
+            int ret = runNvccCompile(source_out, fatbin_out, flags, arch_tag, log_out);
+            if (ret != 0 || !std::filesystem::exists(fatbin_out)) {
+                std::ifstream log_in(log_out);
+                if (log_in) {
+                    std::cerr << log_in.rdbuf();
+                }
+                throw std::runtime_error("Baked kernel compilation failed for " + name);
+            }
+        }
+    }
+
+    CUresult init_res = cuInit(0);
+    if (init_res != CUDA_SUCCESS) {
+        throw std::runtime_error("Failed to initialize CUDA driver API");
+    }
+    CUmodule module = nullptr;
+    CUresult load_res = cuModuleLoad(&module, fatbin_out.string().c_str());
+    if (load_res != CUDA_SUCCESS || module == nullptr) {
+        throw std::runtime_error("Failed to load baked kernel module for " + name);
+    }
+
     auto storage = std::make_shared<CachedProgram::ProgramStorage>(code, flags);
     storage->programHash = program_hash;
     storage->cacheDir = program_dir;
     storage->device = device;
     storage->archTag = arch_tag;
-
-    std::error_code ec;
-    std::filesystem::create_directories(storage->cacheDir, ec);
-    std::ofstream fp_out(storage->cacheDir / "fingerprint.txt", std::ios::trunc);
-    if (fp_out) {
-        fp_out << program_hash << "\n" << fingerprint;
-    }
-
+    storage->module = module;
     return CachedProgram(storage);
 }
 
@@ -159,15 +277,18 @@ std::string JitHelper::toHex(uint64_t value) {
 }
 
 std::filesystem::path JitHelper::resolveCacheDir() {
+    if (const char* env = std::getenv("DEME_KERNEL_CACHE_DIR")) {
+        return std::filesystem::path(env);
+    }
     if (const char* env = std::getenv("DEME_JIT_CACHE_DIR")) {
         return std::filesystem::path(env);
     }
     // Prefer to keep cache alongside other runtime data in the build tree
-    std::filesystem::path default_path = DEMERuntimeDataHelper::data_path / "jit_cache";
+    std::filesystem::path default_path = DEMERuntimeDataHelper::data_path / "baked";
     if (std::filesystem::exists(DEMERuntimeDataHelper::data_path)) {
         return default_path;
     }
-    return std::filesystem::temp_directory_path() / "dem-jit";
+    return std::filesystem::temp_directory_path() / "dem-baked";
 }
 JitHelper::CachedProgram::CachedProgram(std::shared_ptr<ProgramStorage> storage) : m_storage(std::move(storage)) {}
 JitHelper::CachedProgram::Kernel JitHelper::CachedProgram::kernel(const std::string& name,
@@ -176,68 +297,41 @@ JitHelper::CachedProgram::Kernel JitHelper::CachedProgram::kernel(const std::str
 }
 JitHelper::CachedProgram::ProgramStorage::ProgramStorage(std::string code_in, std::vector<std::string> flags_in)
     : code(std::move(code_in)), flags(std::move(flags_in)) {}
+JitHelper::CachedProgram::ProgramStorage::~ProgramStorage() {
+    if (module) {
+        cuModuleUnload(module);
+        module = nullptr;
+    }
+}
 JitHelper::CachedProgram::Kernel::Kernel(std::shared_ptr<ProgramStorage> storage,
                                          std::string name,
                                          std::vector<std::string> options)
     : m_storage(std::move(storage)), m_name(std::move(name)), m_options(std::move(options)) {}
 
-std::shared_ptr<jitify::experimental::KernelInstantiation> JitHelper::CachedProgram::Kernel::getKernelInstantiation(
+JitHelper::CachedProgram::Kernel::KernelInstantiation JitHelper::CachedProgram::Kernel::getKernelInstantiation(
     const std::vector<std::string>& template_args) const {
-    const std::string template_suffix =
-        template_args.empty() ? std::string() : jitify::reflection::reflect_template(template_args);
-
-    std::vector<std::string> options_sorted = m_options;
-    std::sort(options_sorted.begin(), options_sorted.end());
-    const std::string options_sig = jitify::reflection::reflect_list(options_sorted);
-
-    const std::string key_material = m_storage->programHash + "|" + m_name + "|" + template_suffix + "|" + options_sig +
-                                     "|cuda:" + std::to_string(getCudaVersion()) +
-                                     "|api:" + std::to_string(DEME_API_VERSION) + "|" + m_storage->archTag;
-    const std::string key = JitHelper::hashString(key_material);
-    const std::filesystem::path cache_file = m_storage->cacheDir / (sanitizeFilename(m_name) + "_" + key + ".jit");
+    if (!template_args.empty()) {
+        throw std::runtime_error("Template arguments are not supported for baked kernels.");
+    }
     std::lock_guard<std::mutex> storage_lock(m_storage->mutex);
-    if (auto it = m_storage->kernelCache.find(key); it != m_storage->kernelCache.end()) {
-        return it->second;
+    if (auto it = m_storage->bakedKernelCache.find(m_name); it != m_storage->bakedKernelCache.end()) {
+        return KernelInstantiation(m_storage, it->second);
     }
-
-    std::shared_ptr<jitify::experimental::KernelInstantiation> inst;
-    if (std::filesystem::exists(cache_file)) {
-        std::ifstream input(cache_file, std::ios::binary);
-        if (input) {
-            std::stringstream buffer;
-            buffer << input.rdbuf();
-            try {
-                inst = std::make_shared<jitify::experimental::KernelInstantiation>(
-                    jitify::experimental::KernelInstantiation::deserialize(buffer.str()));
-            } catch (const std::exception&) {
-                inst.reset();
-            }
-        }
+    CUfunction func = nullptr;
+    CUresult res = cuModuleGetFunction(&func, m_storage->module, m_name.c_str());
+    if (res != CUDA_SUCCESS || func == nullptr) {
+        throw std::runtime_error("Failed to find baked kernel " + m_name);
     }
-    if (!inst) {  // Compile if changed and not already there and make user aware
-        std::cout << "jit-compiling for " << m_name << " ..." << std::endl;
-        if (!m_storage->program) {
-            m_storage->program = std::make_unique<jitify::experimental::Program>(
-                m_storage->code, std::vector<std::string>(), m_storage->flags);
-        }
-        auto kernel = m_storage->program->kernel(m_name, m_options);
-        inst = std::make_shared<jitify::experimental::KernelInstantiation>(kernel, template_args);
-        std::error_code ec;
-        std::filesystem::create_directories(cache_file.parent_path(), ec);
-        std::ofstream output(cache_file, std::ios::binary | std::ios::trunc);
-        if (output) {
-            output << inst->serialize();
-        }
-    }
-    m_storage->kernelCache[key] = inst;
-    return inst;
+    m_storage->bakedKernelCache.emplace(m_name, func);
+    return KernelInstantiation(m_storage, func);
 }
 
 JitHelper::CachedProgram::Kernel::KernelInstantiation JitHelper::CachedProgram::Kernel::instantiate(
     std::vector<std::string> template_args) const {
-    return KernelInstantiation(getKernelInstantiation(template_args));
+    return getKernelInstantiation(template_args);
 }
 
 JitHelper::CachedProgram::Kernel::KernelInstantiation::KernelInstantiation(
-    std::shared_ptr<jitify::experimental::KernelInstantiation> impl)
-    : m_impl(std::move(impl)) {}
+    std::shared_ptr<ProgramStorage> storage,
+    CUfunction func)
+    : m_storage(std::move(storage)), m_func(func) {}

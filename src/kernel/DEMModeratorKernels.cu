@@ -1,13 +1,14 @@
 // DEM kernels that does things such as modifying the system as per user instruction
 #include <DEMHelperKernels.cuh>
 #include <DEM/Defines.h>
+#include <SimParamsConst.cuh>
 _kernelIncludes_;
 
 // Mass properties are below, if jitified mass properties are in use
 _massDefs_;
 _moiDefs_;
 
-__global__ void applyFamilyChanges(deme::DEMSimParams* simParams, deme::DEMDataDT* granData, size_t nOwnerBodies) {
+extern "C" __global__ void applyFamilyChanges(deme::DEMSimParams* simParams, deme::DEMDataDT* granData, size_t nOwnerBodies) {
     deme::bodyID_t myOwner = blockIdx.x * blockDim.x + threadIdx.x;
     if (myOwner < nOwnerBodies) {
         // The user may make references to owner positions, velocities, accelerations and simulation time
@@ -23,12 +24,12 @@ __global__ void applyFamilyChanges(deme::DEMSimParams* simParams, deme::DEMDataD
             _massAcqStrat_;
             mass = myMass;
         }
-        voxelIDToPosition<double, deme::voxelID_t, deme::subVoxelPos_t>(
+        voxelIDToPositionConst<double, deme::voxelID_t, deme::subVoxelPos_t>(
             pos.x, pos.y, pos.z, granData->voxelID[myOwner], granData->locX[myOwner], granData->locY[myOwner],
-            granData->locZ[myOwner], _nvXp2_, _nvYp2_, _voxelSize_, _l_);
-        pos.x += simParams->LBFX;
-        pos.y += simParams->LBFY;
-        pos.z += simParams->LBFZ;
+            granData->locZ[myOwner]);
+        pos.x += DEME_SimParamsConst.LBFX;
+        pos.y += DEME_SimParamsConst.LBFY;
+        pos.z += DEME_SimParamsConst.LBFZ;
 
         vel.x = granData->vX[myOwner];
         vel.y = granData->vY[myOwner];

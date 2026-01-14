@@ -48,6 +48,8 @@ class DEMTracker;
 /// Main DEM-Engine solver.
 class DEMSolver {
   public:
+    friend class DEMInspector;
+
     DEMSolver(unsigned int nGPUs = 2);
     ~DEMSolver();
 
@@ -127,6 +129,14 @@ class DEMSolver {
     std::vector<std::string> GetJitifyOptions() const { return m_jitify_options; }
     /// Set the jitification options. It is only needed by advanced users.
     void SetJitifyOptions(const std::vector<std::string>& options) { m_jitify_options = options; }
+    /// Use a baked kernel cache directory under the build tree (build/baked).
+    void UseBakedKernelCache(bool use = true);
+    /// Override the kernel cache directory. Empty string resets to default.
+    void SetKernelCacheDir(const std::string& dir);
+    /// Optional tag to group kernel cache entries (keeps auto-hash inside the tag folder).
+    void SetKernelCacheTag(const std::string& tag);
+    /// Require kernel cache to exist; disables runtime compilation when true.
+    void RequireKernelCache(bool require = true);
 
     /// Explicitly instruct the bin size (for contact detection) that the solver should use.
     void SetInitBinSize(double bin_size) {
@@ -1729,6 +1739,14 @@ class DEMSolver {
 
     // The material properties that are pair-wise (example: friction coeff)
     std::set<std::string> m_pairwise_material_prop_names;
+    // Cached material property data for GPU global arrays
+    std::vector<float> m_material_props_1d;
+    std::vector<float> m_material_props_2d;
+    std::vector<std::string> m_material_props_1d_names;
+    std::vector<std::string> m_material_props_2d_names;
+    std::string m_material_defs;
+    bool m_use_material_props_jit = false;
+    bool m_use_material_props_constmem = false;
 
     // Cached tracked objects that can be leveraged by the user to assume explicit control over some simulation objects
     std::vector<std::shared_ptr<DEMTrackedObj>> m_tracked_objs;
@@ -1815,6 +1833,10 @@ class DEMSolver {
     std::unordered_map<std::string, std::string> m_subs;
     // jitify's compilation options
     std::vector<std::string> m_jitify_options;
+    // Optional kernel cache overrides (empty uses defaults)
+    std::string m_kernel_cache_dir;
+    std::string m_kernel_cache_tag;
+    bool m_require_kernel_cache = false;
 
     // A map that records the numbering for user-defined owner wildcards
     std::unordered_map<std::string, unsigned int> m_owner_wc_num;
@@ -1899,6 +1921,15 @@ class DEMSolver {
 
     // Processed unique family prescription info
     std::vector<familyPrescription_t> m_unique_family_prescription;
+    // Runtime family prescriptions (constant-only path; avoids JIT churn)
+    bool m_use_family_prescription_runtime = false;
+    std::vector<float3> m_family_presc_lin_vel;
+    std::vector<float3> m_family_presc_rot_vel;
+    std::vector<float3> m_family_presc_lin_pos;
+    std::vector<float3> m_family_presc_acc;
+    std::vector<float3> m_family_presc_ang_acc;
+    std::vector<uint32_t> m_family_presc_set_mask;
+    std::vector<uint32_t> m_family_presc_prescribed_mask;
 
     // Flattened array of all family numbers the user used. This needs to be prepared each time at initialization time
     // since we need to know the range and amount of unique family numbers the user used, as we did not restrict what
@@ -1957,6 +1988,31 @@ class DEMSolver {
     std::vector<float> m_mesh_mass_jit;
     std::vector<float3> m_mesh_moi_jit;
     std::vector<inertiaOffset_t> m_mesh_mass_offsets;
+    // Cached jitified mass/MOI values (uploaded to constant memory after jit compilation)
+    std::vector<float> m_mass_props_jit_values;
+    std::vector<float> m_moi_x_jit_values;
+    std::vector<float> m_moi_y_jit_values;
+    std::vector<float> m_moi_z_jit_values;
+    // Cached jitified clump component values (uploaded to constant memory after kernel compilation)
+    std::vector<float> m_clump_radii_jit;
+    std::vector<float> m_clump_relposx_jit;
+    std::vector<float> m_clump_relposy_jit;
+    std::vector<float> m_clump_relposz_jit;
+    // Cached jitified analytical geometry values (uploaded to constant memory after jit compilation)
+    std::vector<objType_t> m_anal_type_jit;
+    std::vector<bodyID_t> m_anal_owner_jit;
+    std::vector<float> m_anal_normal_jit;
+    std::vector<materialsOffset_t> m_anal_mat_jit;
+    std::vector<float> m_anal_relposx_jit;
+    std::vector<float> m_anal_relposy_jit;
+    std::vector<float> m_anal_relposz_jit;
+    std::vector<float> m_anal_rotx_jit;
+    std::vector<float> m_anal_roty_jit;
+    std::vector<float> m_anal_rotz_jit;
+    std::vector<float> m_anal_size1_jit;
+    std::vector<float> m_anal_size2_jit;
+    std::vector<float> m_anal_size3_jit;
+    std::vector<float> m_anal_mass_jit;
     /*
     // Dan and Ruochun decided NOT to extract unique input values.
     // Instead, we trust users: we simply store all clump template info users give.
@@ -2053,6 +2109,8 @@ class DEMSolver {
     void reportInitStats() const;
     /// Based on user input, prepare family_mask_matrix (family contact map matrix).
     void figureOutFamilyMasks();
+    /// Prepare runtime-friendly family prescriptions (constant-only path).
+    void prepareFamilyPrescriptions();
     /// Reset kT and dT back to a status like when the simulation system is constructed. I decided to make this a
     /// private method because it can be dangerous, as if it is called when kT is waiting at the outer loop, it will
     /// stall the siumulation. So perhaps the user should not call it without knowing what they are doing. Also note
@@ -2110,6 +2168,7 @@ class DEMSolver {
     inline void equipClumpTemplates(std::unordered_map<std::string, std::string>& strMap);
     inline void equipSimParams(std::unordered_map<std::string, std::string>& strMap);
     inline void equipMassMoiVolume(std::unordered_map<std::string, std::string>& strMap);
+    void prepareMaterialProps();
     inline void equipMaterials(std::unordered_map<std::string, std::string>& strMap);
     inline void equipAnalGeoTemplates(std::unordered_map<std::string, std::string>& strMap);
     // inline void equipFamilyMasks(std::unordered_map<std::string, std::string>& strMap);
@@ -2118,6 +2177,26 @@ class DEMSolver {
     inline void equipForceModel(std::unordered_map<std::string, std::string>& strMap);
     inline void equipIntegrationScheme(std::unordered_map<std::string, std::string>& strMap);
     inline void equipKernelIncludes(std::unordered_map<std::string, std::string>& strMap);
+    void uploadJitifiedMassProperties(const std::shared_ptr<JitHelper::CachedProgram>& program,
+                                      const std::string& anchor_kernel,
+                                      int device,
+                                      cudaStream_t stream = 0);
+    void uploadJitifiedSimParamsConst(const std::shared_ptr<JitHelper::CachedProgram>& program,
+                                      const std::string& anchor_kernel,
+                                      int device,
+                                      cudaStream_t stream = 0);
+    void uploadJitifiedMaterialProperties(const std::shared_ptr<JitHelper::CachedProgram>& program,
+                                          const std::string& anchor_kernel,
+                                          int device,
+                                          cudaStream_t stream = 0);
+    void uploadJitifiedClumpTemplates(const std::shared_ptr<JitHelper::CachedProgram>& program,
+                                      const std::string& anchor_kernel,
+                                      int device,
+                                      cudaStream_t stream = 0);
+    void uploadJitifiedAnalytical(const std::shared_ptr<JitHelper::CachedProgram>& program,
+                                  const std::string& anchor_kernel,
+                                  int device,
+                                  cudaStream_t stream = 0);
 
     // Default solver params at construction time
     void setDefaultSolverParams();

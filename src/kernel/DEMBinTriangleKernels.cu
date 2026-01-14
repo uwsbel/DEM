@@ -1,5 +1,6 @@
 // DEM bin--sphere relations-related custom kernels
 #include <DEM/Defines.h>
+#include <SimParamsConst.cuh>
 #include <DEMCollisionKernels_SphTri_TriTri.cuh>
 #include <DEMTriangleBoxIntersect.cu>
 _kernelIncludes_;
@@ -22,7 +23,7 @@ sandwichVertex(float3 vertex, const float3& incenter, const float3& side, const 
     return vertex;
 }
 
-__global__ void makeTriangleSandwich(deme::DEMSimParams* simParams,
+extern "C" __global__ void makeTriangleSandwich(deme::DEMSimParams* simParams,
                                      deme::DEMDataKT* granData,
                                      float3* sandwichANode1,
                                      float3* sandwichANode2,
@@ -128,9 +129,9 @@ inline __device__ bool figureOutNodeAndBoundingBox(deme::DEMSimParams* simParams
     deme::bodyID_t myOwnerID = granData->ownerTriMesh[triID];
 
     float3 ownerXYZ;
-    voxelIDToPosition<float, deme::voxelID_t, deme::subVoxelPos_t>(
+    voxelIDToPositionConst<float, deme::voxelID_t, deme::subVoxelPos_t>(
         ownerXYZ.x, ownerXYZ.y, ownerXYZ.z, granData->voxelID[myOwnerID], granData->locX[myOwnerID],
-        granData->locY[myOwnerID], granData->locZ[myOwnerID], _nvXp2_, _nvYp2_, _voxelSize_, _l_);
+        granData->locY[myOwnerID], granData->locZ[myOwnerID]);
     const float myOriQw = granData->oriQw[myOwnerID];
     const float myOriQx = granData->oriQx[myOwnerID];
     const float myOriQy = granData->oriQy[myOwnerID];
@@ -145,7 +146,7 @@ inline __device__ bool figureOutNodeAndBoundingBox(deme::DEMSimParams* simParams
     return boundingBoxIntersectBinAxisBounds(L, U, vA, vB, vC, simParams);
 }
 
-__global__ void getNumberOfBinsEachTriangleTouches(deme::DEMSimParams* simParams,
+extern "C" __global__ void getNumberOfBinsEachTriangleTouches(deme::DEMSimParams* simParams,
                                                    deme::DEMDataKT* granData,
                                                    deme::binsTriangleTouches_t* numBinsTriTouches,
                                                    deme::objID_t* numAnalGeoTriTouches,
@@ -287,9 +288,9 @@ __global__ void getNumberOfBinsEachTriangleTouches(deme::DEMSimParams* simParams
                     continue;
                 }
                 float3 ownerXYZ;
-                voxelIDToPosition<float, deme::voxelID_t, deme::subVoxelPos_t>(
+                voxelIDToPositionConst<float, deme::voxelID_t, deme::subVoxelPos_t>(
                     ownerXYZ.x, ownerXYZ.y, ownerXYZ.z, granData->voxelID[objBOwner], granData->locX[objBOwner],
-                    granData->locY[objBOwner], granData->locZ[objBOwner], _nvXp2_, _nvYp2_, _voxelSize_, _l_);
+                    granData->locY[objBOwner], granData->locZ[objBOwner]);
                 const float ownerOriQw = granData->oriQw[objBOwner];
                 const float ownerOriQx = granData->oriQx[objBOwner];
                 const float ownerOriQy = granData->oriQy[objBOwner];
@@ -327,7 +328,7 @@ __global__ void getNumberOfBinsEachTriangleTouches(deme::DEMSimParams* simParams
     }
 }
 
-__global__ void populateBinTriangleTouchingPairs(deme::DEMSimParams* simParams,
+extern "C" __global__ void populateBinTriangleTouchingPairs(deme::DEMSimParams* simParams,
                                                  deme::DEMDataKT* granData,
                                                  deme::binsTriangleTouchPairs_t* numBinsTriTouchesScan,
                                                  deme::binsTriangleTouchPairs_t* numAnalGeoTriTouchesScan,
@@ -478,9 +479,9 @@ __global__ void populateBinTriangleTouchingPairs(deme::DEMSimParams* simParams,
                     continue;
                 }
                 float3 ownerXYZ;
-                voxelIDToPosition<float, deme::voxelID_t, deme::subVoxelPos_t>(
+                voxelIDToPositionConst<float, deme::voxelID_t, deme::subVoxelPos_t>(
                     ownerXYZ.x, ownerXYZ.y, ownerXYZ.z, granData->voxelID[objBOwner], granData->locX[objBOwner],
-                    granData->locY[objBOwner], granData->locZ[objBOwner], _nvXp2_, _nvYp2_, _voxelSize_, _l_);
+                    granData->locY[objBOwner], granData->locZ[objBOwner]);
                 const float ownerOriQw = granData->oriQw[objBOwner];
                 const float ownerOriQx = granData->oriQx[objBOwner];
                 const float ownerOriQy = granData->oriQy[objBOwner];
@@ -526,7 +527,7 @@ __global__ void populateBinTriangleTouchingPairs(deme::DEMSimParams* simParams,
     }
 }
 
-__global__ void mapTriActiveBinsToSphActiveBins(deme::binID_t* activeBinIDsForTri,
+extern "C" __global__ void mapTriActiveBinsToSphActiveBins(deme::binID_t* activeBinIDsForTri,
                                                 deme::binID_t* activeBinIDs,
                                                 deme::binID_t* mapTriActBinToSphActBin,
                                                 size_t numActiveBinsForTri,

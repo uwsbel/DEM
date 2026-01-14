@@ -396,7 +396,7 @@ __device__ __forceinline__ void calculatePrimitiveContactForces_impl(deme::DEMSi
 }
 
 // 5 specialized kernels for different contact types
-__global__ void calculatePrimitiveContactForces_SphSph(deme::DEMSimParams* simParams,
+extern "C" __global__ void calculatePrimitiveContactForces_SphSph(deme::DEMSimParams* simParams,
                                                        deme::DEMDataDT* granData,
                                                        deme::contactPairs_t startOffset,
                                                        deme::contactPairs_t nContactPairs) {
@@ -406,7 +406,7 @@ __global__ void calculatePrimitiveContactForces_SphSph(deme::DEMSimParams* simPa
     }
 }
 
-__global__ void calculatePrimitiveContactForces_SphTri(deme::DEMSimParams* simParams,
+extern "C" __global__ void calculatePrimitiveContactForces_SphTri(deme::DEMSimParams* simParams,
                                                        deme::DEMDataDT* granData,
                                                        deme::contactPairs_t startOffset,
                                                        deme::contactPairs_t nContactPairs) {
@@ -416,7 +416,7 @@ __global__ void calculatePrimitiveContactForces_SphTri(deme::DEMSimParams* simPa
     }
 }
 
-__global__ void calculatePrimitiveContactForces_SphAnal(deme::DEMSimParams* simParams,
+extern "C" __global__ void calculatePrimitiveContactForces_SphAnal(deme::DEMSimParams* simParams,
                                                         deme::DEMDataDT* granData,
                                                         deme::contactPairs_t startOffset,
                                                         deme::contactPairs_t nContactPairs) {
@@ -427,7 +427,7 @@ __global__ void calculatePrimitiveContactForces_SphAnal(deme::DEMSimParams* simP
     }
 }
 
-__global__ void calculatePrimitiveContactForces_TriTri(deme::DEMSimParams* simParams,
+extern "C" __global__ void calculatePrimitiveContactForces_TriTri(deme::DEMSimParams* simParams,
                                                        deme::DEMDataDT* granData,
                                                        deme::contactPairs_t startOffset,
                                                        deme::contactPairs_t nContactPairs) {
@@ -438,7 +438,7 @@ __global__ void calculatePrimitiveContactForces_TriTri(deme::DEMSimParams* simPa
     }
 }
 
-__global__ void calculatePrimitiveContactForces_TriAnal(deme::DEMSimParams* simParams,
+extern "C" __global__ void calculatePrimitiveContactForces_TriAnal(deme::DEMSimParams* simParams,
                                                         deme::DEMDataDT* granData,
                                                         deme::contactPairs_t startOffset,
                                                         deme::contactPairs_t nContactPairs) {

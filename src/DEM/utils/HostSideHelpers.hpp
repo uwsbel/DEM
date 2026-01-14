@@ -260,7 +260,18 @@ inline std::string replace_pattern(const std::string& in, const std::string& fro
 inline std::string replace_patterns(const std::string& in,
                                     const std::unordered_map<std::string, std::string>& mapping) {
     std::string str = in;
+    std::vector<std::pair<std::string, std::string>> ordered;
+    ordered.reserve(mapping.size());
     for (const auto& rep : mapping) {
+        ordered.emplace_back(rep.first, rep.second);
+    }
+    std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
+        if (a.first.size() != b.first.size()) {
+            return a.first.size() > b.first.size();
+        }
+        return a.first < b.first;
+    });
+    for (const auto& rep : ordered) {
         str = std::regex_replace(str, std::regex(rep.first), rep.second);
     }
     return str;

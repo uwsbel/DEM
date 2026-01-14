@@ -1,5 +1,6 @@
 // DEM bin--sphere relations-related custom kernels
 #include <DEM/Defines.h>
+#include <SimParamsConst.cuh>
 #include <DEMCollisionKernels_SphSph.cuh>
 _kernelIncludes_;
 
@@ -8,7 +9,7 @@ _clumpTemplateDefs_;
 // Definitions of analytical entites are below
 _analyticalEntityDefs_;
 
-__global__ void getNumberOfBinsEachSphereTouches(deme::DEMSimParams* simParams,
+extern "C" __global__ void getNumberOfBinsEachSphereTouches(deme::DEMSimParams* simParams,
                                                  deme::DEMDataKT* granData,
                                                  deme::binsSphereTouches_t* numBinsSphereTouches,
                                                  deme::objID_t* numAnalGeoSphereTouches) {
@@ -36,9 +37,9 @@ __global__ void getNumberOfBinsEachSphereTouches(deme::DEMSimParams* simParams,
             }
 
             {
-                voxelIDToPosition<double, deme::voxelID_t, deme::subVoxelPos_t>(
+                voxelIDToPositionConst<double, deme::voxelID_t, deme::subVoxelPos_t>(
                     ownerXYZ.x, ownerXYZ.y, ownerXYZ.z, granData->voxelID[myOwnerID], granData->locX[myOwnerID],
-                    granData->locY[myOwnerID], granData->locZ[myOwnerID], _nvXp2_, _nvYp2_, _voxelSize_, _l_);
+                    granData->locY[myOwnerID], granData->locZ[myOwnerID]);
                 const float myOriQw = granData->oriQw[myOwnerID];
                 const float myOriQx = granData->oriQx[myOwnerID];
                 const float myOriQy = granData->oriQy[myOwnerID];
@@ -97,9 +98,9 @@ __global__ void getNumberOfBinsEachSphereTouches(deme::DEMSimParams* simParams,
                 continue;
             }
             double3 ownerXYZ;
-            voxelIDToPosition<double, deme::voxelID_t, deme::subVoxelPos_t>(
+            voxelIDToPositionConst<double, deme::voxelID_t, deme::subVoxelPos_t>(
                 ownerXYZ.x, ownerXYZ.y, ownerXYZ.z, granData->voxelID[objBOwner], granData->locX[objBOwner],
-                granData->locY[objBOwner], granData->locZ[objBOwner], _nvXp2_, _nvYp2_, _voxelSize_, _l_);
+                granData->locY[objBOwner], granData->locZ[objBOwner]);
             const float ownerOriQw = granData->oriQw[objBOwner];
             const float ownerOriQx = granData->oriQx[objBOwner];
             const float ownerOriQy = granData->oriQy[objBOwner];
@@ -140,7 +141,7 @@ __global__ void getNumberOfBinsEachSphereTouches(deme::DEMSimParams* simParams,
     }
 }
 
-__global__ void populateBinSphereTouchingPairs(deme::DEMSimParams* simParams,
+extern "C" __global__ void populateBinSphereTouchingPairs(deme::DEMSimParams* simParams,
                                                deme::DEMDataKT* granData,
                                                deme::binSphereTouchPairs_t* numBinsSphereTouchesScan,
                                                deme::binSphereTouchPairs_t* numAnalGeoSphereTouchesScan,
@@ -176,9 +177,9 @@ __global__ void populateBinSphereTouchingPairs(deme::DEMSimParams* simParams,
             const deme::binSphereTouchPairs_t myReportOffset_end = numBinsSphereTouchesScan[sphereID + 1];
 
             {
-                voxelIDToPosition<double, deme::voxelID_t, deme::subVoxelPos_t>(
+                voxelIDToPositionConst<double, deme::voxelID_t, deme::subVoxelPos_t>(
                     ownerXYZ.x, ownerXYZ.y, ownerXYZ.z, granData->voxelID[myOwnerID], granData->locX[myOwnerID],
-                    granData->locY[myOwnerID], granData->locZ[myOwnerID], _nvXp2_, _nvYp2_, _voxelSize_, _l_);
+                    granData->locY[myOwnerID], granData->locZ[myOwnerID]);
                 const float myOriQw = granData->oriQw[myOwnerID];
                 const float myOriQx = granData->oriQx[myOwnerID];
                 const float myOriQy = granData->oriQy[myOwnerID];
@@ -250,9 +251,9 @@ __global__ void populateBinSphereTouchingPairs(deme::DEMSimParams* simParams,
                     continue;
                 }
                 double3 ownerXYZ;
-                voxelIDToPosition<double, deme::voxelID_t, deme::subVoxelPos_t>(
+                voxelIDToPositionConst<double, deme::voxelID_t, deme::subVoxelPos_t>(
                     ownerXYZ.x, ownerXYZ.y, ownerXYZ.z, granData->voxelID[objBOwner], granData->locX[objBOwner],
-                    granData->locY[objBOwner], granData->locZ[objBOwner], _nvXp2_, _nvYp2_, _voxelSize_, _l_);
+                    granData->locY[objBOwner], granData->locZ[objBOwner]);
                 const float ownerOriQw = granData->oriQw[objBOwner];
                 const float ownerOriQx = granData->oriQx[objBOwner];
                 const float ownerOriQy = granData->oriQy[objBOwner];
