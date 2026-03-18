@@ -7,6 +7,50 @@
 #include <DEMHelperKernels.cuh>
 
 // ------------------------------------------------------------------
+// Helpers
+// ------------------------------------------------------------------
+__device__ __forceinline__ float3 make_zero3_float()  { return make_float3(0.f, 0.f, 0.f); }
+__device__ __forceinline__ double3 make_zero3_double(){ return make_double3(0.0, 0.0, 0.0); }
+
+template <typename T1>
+__device__ __forceinline__ T1 make_zero3();
+template <>
+__device__ __forceinline__ float3 make_zero3<float3>() { return make_zero3_float(); }
+template <>
+__device__ __forceinline__ double3 make_zero3<double3>() { return make_zero3_double(); }
+
+template <typename T1>
+__device__ __forceinline__ T1 make_one3(int x, int y, int z);
+template <>
+__device__ __forceinline__ float3 make_one3<float3>(int x, int y, int z) {
+    return make_float3((float)x, (float)y, (float)z);
+}
+template <>
+__device__ __forceinline__ double3 make_one3<double3>(int x, int y, int z) {
+    return make_double3((double)x, (double)y, (double)z);
+}
+template <typename T>
+__device__ __forceinline__ T tmin2(T a, T b) { return a < b ? a : b; }
+template <typename T>
+__device__ __forceinline__ T tmax2(T a, T b) { return a > b ? a : b; }
+template <typename T>
+__device__ __forceinline__ T tmin3(T a, T b, T c) { return tmin2(a, tmin2(b, c)); }
+template <typename T>
+__device__ __forceinline__ T tmax3(T a, T b, T c) { return tmax2(a, tmax2(b, c)); }
+
+template <typename S>
+__device__ __forceinline__ S absT(S x) { return x >= (S)0 ? x : -x; }
+
+template <typename S>
+__device__ __forceinline__ S min2(S a, S b) { return a < b ? a : b; }
+
+template <typename S>
+__device__ __forceinline__ S max2(S a, S b) { return a > b ? a : b; }
+
+template <typename S>
+__device__ __forceinline__ void sort2(S& a, S& b) { if (a > b) { const S t = a; a = b; b = t; } }
+
+// ------------------------------------------------------------------
 // Triangle-analytical object collision detection utilities
 // ------------------------------------------------------------------
 
@@ -929,243 +973,6 @@ __device__ __forceinline__ Scalar satSeparationOnAxis(const Vec& axis,
 }
 
 /**
- * @brief Helper function to project one triangle onto another triangle's plane and clip using Sutherland-Hodgman
- *
- * @param incTri The incident triangle vertices to be projected
- * @param refTri The reference triangle vertices (defines the plane and clipping region)
- * @param refNormal The normal of the reference triangle's plane
- * @param depth Output: penetration depth (max distance of submerged vertices)
- * @param area Output: area of the clipping polygon
- * @param centroid Output: centroid of the clipping polygon
- * @return true if there is contact (at least one vertex submerged), false otherwise
- */
-template <typename T1, typename T2>
-__device__ bool projectTriangleOntoTriangle(const T1* incTri,
-                                            const T1* refTri,
-                                            const T1& refNormal,
-                                            T2& depth,
-                                            T2& area,
-                                            T1& centroid) {
-    // Compute signed distances of incident triangle vertices to reference plane
-    area = T2(0.0);
-    T2 incDists[3];
-    T2 maxPenetration = 0.0;
-    int8_t numSubmerged = 0;
-#pragma unroll
-    for (int8_t i = 0; i < 3; ++i) {
-        incDists[i] = dot(incTri[i] - refTri[0], refNormal);
-        if (incDists[i] < 0.0) {
-            numSubmerged++;
-            T2 pen = -incDists[i];
-            if (pen > maxPenetration)
-                maxPenetration = pen;
-        }
-    }
-
-    // If no vertices are submerged, no contact
-    if (numSubmerged == 0) {
-        // depth = T2(0.0);
-        // area = T2(0.0);
-        // centroid.x = T2(0.0);
-        // centroid.y = T2(0.0);
-        // centroid.z = T2(0.0);
-        return false;
-    }
-
-    // Maximum vertices in a triangle-triangle clipping polygon
-    // Sutherland-Hodgman clipping can produce up to (n+m) vertices where n and m are
-    // the number of vertices in the input polygons. For triangle-triangle clipping,
-    // we conservatively use 9 (more than the theoretical max of 6) for safety.
-    const int8_t SH_MAX_CLIPPING_VERTICES = 9;
-
-    // Build polygon from projected submerged vertices and edge-plane intersections
-    T1 projectedPoly[SH_MAX_CLIPPING_VERTICES];
-    int8_t nPoly = 0;
-
-    // Process each edge of the incident triangle
-#pragma unroll
-    for (int8_t i = 0; i < 3; ++i) {
-        int8_t j = (i + 1) % 3;
-        bool in_i = (incDists[i] < 0.0);
-        bool in_j = (incDists[j] < 0.0);
-
-        // Add submerged vertex (projected onto plane)
-        if (in_i) {
-            projectedPoly[nPoly++] = incTri[i] - refNormal * incDists[i];
-        }
-
-        // Add edge-plane intersection if edge crosses the plane
-        if (in_i != in_j) {
-            T2 denom = incDists[i] - incDists[j];
-            if (denom != 0.0) {  // Avoid division by zero
-                T2 t = incDists[i] / denom;
-                T1 inter = incTri[i] + (incTri[j] - incTri[i]) * t;
-                projectedPoly[nPoly++] = inter;
-            }
-        }
-    }
-
-    // If we don't have at least 3 vertices, no valid polygon
-    if (nPoly < 3) {
-        // depth = maxPenetration;
-        // area = T2(0.0);
-        // centroid = (incTri[0] + incTri[1] + incTri[2]) / T2(3.0);
-        return false;
-    }
-
-    // Now compute the intersection polygon of the projected triangle and reference triangle
-    // We need bidirectional clipping: clip projectedPoly against refTri, then add refTri vertices inside projectedPoly
-
-    // Step 1: Clip projected polygon against reference triangle (Sutherland-Hodgman)
-    T1 resultPoly[SH_MAX_CLIPPING_VERTICES];
-    for (int8_t i = 0; i < nPoly; ++i) {
-        resultPoly[i] = projectedPoly[i];
-    }
-    int8_t numInputVerts = nPoly;
-
-    T1 intermediatePoly[SH_MAX_CLIPPING_VERTICES];
-    for (int8_t edge = 0; edge < 3; ++edge) {
-        int8_t numOutputVerts = 0;
-        T1 edgeStart = refTri[edge];
-        T1 edgeEnd = refTri[(edge + 1) % 3];
-        T1 edgeDir = edgeEnd - edgeStart;
-        T1 edgeNormal = cross(refNormal, edgeDir);
-        edgeNormal = normalize(edgeNormal);
-
-        // Clip input polygon against this edge
-        for (int8_t i = 0; i < numInputVerts; ++i) {
-            T1 v1 = resultPoly[i];
-            T1 v2 = resultPoly[(i + 1) % numInputVerts];
-            T2 d1 = dot(v1 - edgeStart, edgeNormal);
-            T2 d2 = dot(v2 - edgeStart, edgeNormal);
-            bool in1 = (d1 >= -DEME_TINY_FLOAT);
-            bool in2 = (d2 >= -DEME_TINY_FLOAT);
-
-            if (in1) {
-                intermediatePoly[numOutputVerts++] = v1;
-            }
-            if (in1 != in2) {
-                T2 denom = d1 - d2;
-                if (denom != 0.0) {  // Avoid division by zero
-                    T2 t = d1 / denom;
-                    T1 inter = v1 + (v2 - v1) * t;
-                    intermediatePoly[numOutputVerts++] = inter;
-                }
-            }
-        }
-
-        // Copy output to input for next iteration
-        for (int8_t i = 0; i < numOutputVerts; ++i) {
-            resultPoly[i] = intermediatePoly[i];
-        }
-        numInputVerts = numOutputVerts;
-
-        if (numInputVerts == 0) {
-            break;  // No intersection
-        }
-    }
-
-    // Step 2: Check if any reference triangle vertices are inside the projected polygon
-    // and add them to the intersection polygon if they are
-    int8_t numFinalVerts = numInputVerts;
-
-    // For each reference triangle vertex, check if it's inside the original projected polygon
-    for (int8_t refIdx = 0; refIdx < 3; ++refIdx) {
-        T1 refVertex = refTri[refIdx];
-
-        // Check if refVertex is inside the projected polygon using winding number
-        bool inside = true;
-        for (int8_t i = 0; i < nPoly; ++i) {
-            T1 edgeStart = projectedPoly[i];
-            T1 edgeEnd = projectedPoly[(i + 1) % nPoly];
-            T1 edgeDir = edgeEnd - edgeStart;
-            T1 edgeNormal = cross(refNormal, edgeDir);
-            T2 dist = dot(refVertex - edgeStart, edgeNormal);
-            if (dist < -DEME_TINY_FLOAT) {
-                inside = false;
-                break;
-            }
-        }
-
-        if (inside) {
-            // Check if this vertex is not already in the polygon (avoid duplicates)
-            bool isDuplicate = false;
-            for (int8_t j = 0; j < numFinalVerts; ++j) {
-                T1 diff = resultPoly[j] - refVertex;
-                if (dot(diff, diff) < DEME_TINY_FLOAT * DEME_TINY_FLOAT) {
-                    isDuplicate = true;
-                    break;
-                }
-            }
-            if (!isDuplicate) {
-                resultPoly[numFinalVerts++] = refVertex;
-            }
-        }
-    }
-
-    // If we added reference vertices, we need to reorder the polygon to maintain proper winding
-    if (numFinalVerts > numInputVerts && numFinalVerts >= 3) {
-        // Compute centroid of all vertices
-        T1 tempCentroid;
-        tempCentroid.x = 0.0;
-        tempCentroid.y = 0.0;
-        tempCentroid.z = 0.0;
-        for (int8_t i = 0; i < numFinalVerts; ++i) {
-            tempCentroid = tempCentroid + resultPoly[i];
-        }
-        tempCentroid = tempCentroid / T2(numFinalVerts);
-
-        // Sort vertices by angle around centroid to ensure proper winding order
-        // Use simple bubble sort for small number of vertices
-        for (int8_t i = 0; i < numFinalVerts - 1; ++i) {
-            for (int8_t j = i + 1; j < numFinalVerts; ++j) {
-                T1 vi = resultPoly[i] - tempCentroid;
-                T1 vj = resultPoly[j] - tempCentroid;
-                // Use reference normal to determine consistent orientation
-                T1 cross_ij = cross(vi, vj);
-                if (dot(cross_ij, refNormal) < 0.0) {
-                    // Swap
-                    T1 temp = resultPoly[i];
-                    resultPoly[i] = resultPoly[j];
-                    resultPoly[j] = temp;
-                }
-            }
-        }
-    }
-
-    numInputVerts = numFinalVerts;
-
-    // Compute centroid and area of the intersection polygon
-    centroid.x = 0.0;
-    centroid.y = 0.0;
-    centroid.z = 0.0;
-
-    depth = maxPenetration;
-    if (numInputVerts >= 3) {
-        for (int8_t i = 0; i < numInputVerts; ++i) {
-            centroid = centroid + resultPoly[i];
-        }
-        centroid = centroid / T2(numInputVerts);
-
-        // Calculate area using fan triangulation from centroid
-        float area_f = 0.0f;
-        const float3 centroid_f = to_float3(centroid);
-        for (int8_t i = 0; i < numInputVerts; ++i) {
-            float3 v1 = to_float3(resultPoly[i]) - centroid_f;
-            float3 v2 = to_float3(resultPoly[(i + 1) % numInputVerts]) - centroid_f;
-            float3 crossProd = cross(v1, v2);
-            area_f += sqrtf(dot(crossProd, crossProd));
-        }
-        area = static_cast<T2>(area_f * 0.5f);
-        return true;
-    } else {
-        // Degenerate intersection polygon
-        // centroid = (incTri[0] + incTri[1] + incTri[2]) / T2(3.0);
-        return false;
-    }
-}
-
-/**
  * @brief Fast SAT contact check between two triangular prisms (triangle sandwiches).
  *
  * Evaluates 24 axes (8 face normals + 16 edge-edge) without normalization. Uses FP32 by
@@ -1331,29 +1138,6 @@ __device__ __forceinline__ bool calc_prism_contact(const T1& prismAFaceANode1,
 /// Returns true if triangles are in physical contact (no separating axis found), false otherwise
 /// This is a simplified version that only performs the SAT test without computing contact details
 
-// ---------- helpers
-template <typename T>
-__device__ __forceinline__ T tmin2(T a, T b) { return a < b ? a : b; }
-
-template <typename T>
-__device__ __forceinline__ T tmax2(T a, T b) { return a > b ? a : b; }
-
-template <typename T>
-__device__ __forceinline__ T tmin3(T a, T b, T c) { return tmin2(a, tmin2(b, c)); }
-
-template <typename T>
-__device__ __forceinline__ T tmax3(T a, T b, T c) { return tmax2(a, tmax2(b, c)); }
-
-__device__ __forceinline__ float3 make_zero3_float()  { return make_float3(0.f, 0.f, 0.f); }
-__device__ __forceinline__ double3 make_zero3_double(){ return make_double3(0.0, 0.0, 0.0); }
-
-template <typename T1>
-__device__ __forceinline__ T1 make_zero3();
-template <>
-__device__ __forceinline__ float3 make_zero3<float3>() { return make_zero3_float(); }
-template <>
-__device__ __forceinline__ double3 make_zero3<double3>() { return make_zero3_double(); }
-
 // axis separation test (no normalization)
 template <typename T1, typename T2>
 __device__ __forceinline__ bool axis_separates_skin(
@@ -1472,11 +1256,641 @@ __device__ __forceinline__ bool checkTriangleTriangleSAT(
 }
 
 
-/// Triangle-triangle contact detection using projection-based approach:
-/// 1. Project triangle A onto triangle B's plane and clip against B's edges
-/// 2. Project triangle B onto triangle A's plane and clip against A's edges
-/// 3. Average the results for final contact info
-/// This approach uses Sutherland-Hodgman algorithm for clipping and does not require SAT
+// ------------------------------------------------------------------
+// Start of the final tri-tri overlap calculation functions
+// ------------------------------------------------------------------
+template <typename V, typename S>
+__device__ __forceinline__ S local_length_scale6(const V& A0, const V& A1, const V& A2,
+                                                 const V& B0, const V& B1, const V& B2) {
+    const S minx = min2((S)A0.x, min2((S)A1.x, min2((S)A2.x, min2((S)B0.x, min2((S)B1.x, (S)B2.x)))));
+    const S miny = min2((S)A0.y, min2((S)A1.y, min2((S)A2.y, min2((S)B0.y, min2((S)B1.y, (S)B2.y)))));
+    const S minz = min2((S)A0.z, min2((S)A1.z, min2((S)A2.z, min2((S)B0.z, min2((S)B1.z, (S)B2.z)))));
+    const S maxx = max2((S)A0.x, max2((S)A1.x, max2((S)A2.x, max2((S)B0.x, max2((S)B1.x, (S)B2.x)))));
+    const S maxy = max2((S)A0.y, max2((S)A1.y, max2((S)A2.y, max2((S)B0.y, max2((S)B1.y, (S)B2.y)))));
+    const S maxz = max2((S)A0.z, max2((S)A1.z, max2((S)A2.z, max2((S)B0.z, max2((S)B1.z, (S)B2.z)))));
+
+    const S span = max2((S)0, max2(maxx - minx, max2(maxy - miny, maxz - minz)));
+
+    const V eA0 = A1 - A0; const V eA1 = A2 - A1; const V eA2 = A0 - A2;
+    const V eB0 = B1 - B0; const V eB1 = B2 - B1; const V eB2 = B0 - B2;
+
+    const S maxEdge2 = max2((S)0,
+        max2((S)dot(eA0, eA0), max2((S)dot(eA1, eA1), max2((S)dot(eA2, eA2),
+        max2((S)dot(eB0, eB0), max2((S)dot(eB1, eB1), (S)dot(eB2, eB2)))))));
+
+    return max2((S)1, max2(span, (S)sqrt(maxEdge2)));
+}
+
+template <typename S>
+__device__ __forceinline__ S rel_len_tol() {
+    return sizeof(S) == sizeof(double) ? (S)1.4210854715202004e-14 : (S)7.62939453125e-6;
+}
+
+template <typename S>
+__device__ __forceinline__ S rel_ang_tol() {
+    return sizeof(S) == sizeof(double) ? (S)1.4210854715202004e-14 : (S)7.62939453125e-6;
+}
+
+template <typename V, typename S>
+__device__ __forceinline__ bool aabb_overlap6(const V& A0, const V& A1, const V& A2,
+                                              const V& B0, const V& B1, const V& B2,
+                                              const S eps) {
+    const S aminx = min2((S)A0.x, min2((S)A1.x, (S)A2.x));
+    const S aminy = min2((S)A0.y, min2((S)A1.y, (S)A2.y));
+    const S aminz = min2((S)A0.z, min2((S)A1.z, (S)A2.z));
+    const S amaxx = max2((S)A0.x, max2((S)A1.x, (S)A2.x));
+    const S amaxy = max2((S)A0.y, max2((S)A1.y, (S)A2.y));
+    const S amaxz = max2((S)A0.z, max2((S)A1.z, (S)A2.z));
+
+    const S bminx = min2((S)B0.x, min2((S)B1.x, (S)B2.x));
+    const S bminy = min2((S)B0.y, min2((S)B1.y, (S)B2.y));
+    const S bminz = min2((S)B0.z, min2((S)B1.z, (S)B2.z));
+    const S bmaxx = max2((S)B0.x, max2((S)B1.x, (S)B2.x));
+    const S bmaxy = max2((S)B0.y, max2((S)B1.y, (S)B2.y));
+    const S bmaxz = max2((S)B0.z, max2((S)B1.z, (S)B2.z));
+
+    if (amaxx < bminx - eps || bmaxx < aminx - eps) return false;
+    if (amaxy < bminy - eps || bmaxy < aminy - eps) return false;
+    if (amaxz < bminz - eps || bmaxz < aminz - eps) return false;
+    return true;
+}
+
+template <typename V, typename S>
+__device__ __forceinline__ int dominant_axis(const V& v) {
+    const S ax = absT((S)v.x), ay = absT((S)v.y), az = absT((S)v.z);
+    if (ax >= ay && ax >= az) return 0;
+    if (ay >= az) return 1;
+    return 2;
+}
+
+template <typename V, typename S>
+__device__ __forceinline__ S coord_axis(const V& p, int axis) {
+    return axis == 0 ? (S)p.x : (axis == 1 ? (S)p.y : (S)p.z);
+}
+
+template <typename S>
+__device__ __forceinline__ S orient2d(S ax, S ay, S bx, S by, S cx, S cy) {
+    return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+}
+
+template <typename S>
+__device__ __forceinline__ bool on_segment_2d(S ax, S ay, S bx, S by, S px, S py,
+                                              S orientTol, S coordTol) {
+    if (absT(orient2d(ax, ay, bx, by, px, py)) > orientTol) return false;
+    const S minx = min2(ax, bx) - coordTol, maxx = max2(ax, bx) + coordTol;
+    const S miny = min2(ay, by) - coordTol, maxy = max2(ay, by) + coordTol;
+    return (px >= minx && px <= maxx && py >= miny && py <= maxy);
+}
+
+template <typename S>
+__device__ __forceinline__ bool seg_seg_2d(S ax, S ay, S bx, S by,
+                                           S cx, S cy, S dx, S dy,
+                                           S orientTol, S coordTol) {
+    const S o1 = orient2d(ax, ay, bx, by, cx, cy);
+    const S o2 = orient2d(ax, ay, bx, by, dx, dy);
+    const S o3 = orient2d(cx, cy, dx, dy, ax, ay);
+    const S o4 = orient2d(cx, cy, dx, dy, bx, by);
+
+    const bool straddle1 = (o1 > orientTol && o2 < -orientTol) || (o1 < -orientTol && o2 > orientTol);
+    const bool straddle2 = (o3 > orientTol && o4 < -orientTol) || (o3 < -orientTol && o4 > orientTol);
+    if (straddle1 && straddle2) return true;
+
+    if (on_segment_2d(ax, ay, bx, by, cx, cy, orientTol, coordTol)) return true;
+    if (on_segment_2d(ax, ay, bx, by, dx, dy, orientTol, coordTol)) return true;
+    if (on_segment_2d(cx, cy, dx, dy, ax, ay, orientTol, coordTol)) return true;
+    if (on_segment_2d(cx, cy, dx, dy, bx, by, orientTol, coordTol)) return true;
+    return false;
+}
+
+template <typename S>
+__device__ __forceinline__ bool point_in_tri_2d(S px, S py,
+                                                S ax, S ay,
+                                                S bx, S by,
+                                                S cx, S cy,
+                                                S orientTol) {
+    const S o0 = orient2d(ax, ay, bx, by, px, py);
+    const S o1 = orient2d(bx, by, cx, cy, px, py);
+    const S o2 = orient2d(cx, cy, ax, ay, px, py);
+    const bool hasNeg = (o0 < -orientTol) || (o1 < -orientTol) || (o2 < -orientTol);
+    const bool hasPos = (o0 > orientTol) || (o1 > orientTol) || (o2 > orientTol);
+    return !(hasNeg && hasPos);
+}
+
+template <typename V, typename S>
+__device__ __forceinline__ bool coplanar_tri_tri(const V& N,
+                                                 const V& A0, const V& A1, const V& A2,
+                                                 const V& B0, const V& B1, const V& B2,
+                                                 S orientTol,
+                                                 S coordTol) {
+    const S nx = absT((S)N.x), ny = absT((S)N.y), nz = absT((S)N.z);
+    int i0, i1;
+    if (nx > ny) {
+        if (nx > nz) { i0 = 1; i1 = 2; }
+        else         { i0 = 0; i1 = 1; }
+    } else {
+        if (ny > nz) { i0 = 0; i1 = 2; }
+        else         { i0 = 0; i1 = 1; }
+    }
+
+    const S a0x = coord_axis<V,S>(A0, i0), a0y = coord_axis<V,S>(A0, i1);
+    const S a1x = coord_axis<V,S>(A1, i0), a1y = coord_axis<V,S>(A1, i1);
+    const S a2x = coord_axis<V,S>(A2, i0), a2y = coord_axis<V,S>(A2, i1);
+    const S b0x = coord_axis<V,S>(B0, i0), b0y = coord_axis<V,S>(B0, i1);
+    const S b1x = coord_axis<V,S>(B1, i0), b1y = coord_axis<V,S>(B1, i1);
+    const S b2x = coord_axis<V,S>(B2, i0), b2y = coord_axis<V,S>(B2, i1);
+
+    if (seg_seg_2d(a0x,a0y,a1x,a1y,b0x,b0y,b1x,b1y,orientTol,coordTol)) return true;
+    if (seg_seg_2d(a0x,a0y,a1x,a1y,b1x,b1y,b2x,b2y,orientTol,coordTol)) return true;
+    if (seg_seg_2d(a0x,a0y,a1x,a1y,b2x,b2y,b0x,b0y,orientTol,coordTol)) return true;
+    if (seg_seg_2d(a1x,a1y,a2x,a2y,b0x,b0y,b1x,b1y,orientTol,coordTol)) return true;
+    if (seg_seg_2d(a1x,a1y,a2x,a2y,b1x,b1y,b2x,b2y,orientTol,coordTol)) return true;
+    if (seg_seg_2d(a1x,a1y,a2x,a2y,b2x,b2y,b0x,b0y,orientTol,coordTol)) return true;
+    if (seg_seg_2d(a2x,a2y,a0x,a0y,b0x,b0y,b1x,b1y,orientTol,coordTol)) return true;
+    if (seg_seg_2d(a2x,a2y,a0x,a0y,b1x,b1y,b2x,b2y,orientTol,coordTol)) return true;
+    if (seg_seg_2d(a2x,a2y,a0x,a0y,b2x,b2y,b0x,b0y,orientTol,coordTol)) return true;
+
+    if (point_in_tri_2d(a0x,a0y,b0x,b0y,b1x,b1y,b2x,b2y,orientTol)) return true;
+    if (point_in_tri_2d(b0x,b0y,a0x,a0y,a1x,a1y,a2x,a2y,orientTol)) return true;
+    return false;
+}
+
+template <typename S>
+__device__ __forceinline__ int interval_from_plane_hits(S p0, S p1, S p2,
+                                                        S d0, S d1, S d2,
+                                                        S hits[6], S tol) {
+    int n = 0;
+    if (absT(d0) <= tol) hits[n++] = p0;
+    if (absT(d1) <= tol) {
+        bool dup = false;
+        for (int i = 0; i < n; ++i) dup = dup || (absT(hits[i] - p1) <= tol);
+        if (!dup) hits[n++] = p1;
+    }
+    if (absT(d2) <= tol) {
+        bool dup = false;
+        for (int i = 0; i < n; ++i) dup = dup || (absT(hits[i] - p2) <= tol);
+        if (!dup) hits[n++] = p2;
+    }
+    if ((d0 > tol && d1 < -tol) || (d0 < -tol && d1 > tol)) hits[n++] = p0 + (p1 - p0) * (d0 / (d0 - d1));
+    if ((d1 > tol && d2 < -tol) || (d1 < -tol && d2 > tol)) hits[n++] = p1 + (p2 - p1) * (d1 / (d1 - d2));
+    if ((d2 > tol && d0 < -tol) || (d2 < -tol && d0 > tol)) hits[n++] = p2 + (p0 - p2) * (d2 / (d2 - d0));
+    return n;
+}
+
+template <typename T1, typename T2>
+__device__ __forceinline__ T1 make_vec3(T2 x, T2 y, T2 z) {
+    T1 out; out.x = x; out.y = y; out.z = z; return out;
+}
+
+template <typename T1, typename T2>
+__device__ __forceinline__ void build_plane_basis_from_normal(const T1& n, T1& u, T1& v) {
+    const T1 a = (absT((T2)n.x) > (T2)0.70710678) ? make_vec3<T1,T2>((T2)0, (T2)1, (T2)0)
+                                                  : make_vec3<T1,T2>((T2)1, (T2)0, (T2)0);
+    u = normalize(cross(a, n));
+    v = cross(n, u);
+}
+
+template <typename T2>
+__device__ __forceinline__ T2 cross2(T2 ax, T2 ay, T2 bx, T2 by) {
+    return ax * by - ay * bx;
+}
+
+template <typename T1, typename T2>
+__device__ __forceinline__ bool same_point3(const T1& a, const T1& b, T2 eps2) {
+    const T1 d = a - b;
+    return dot(d, d) <= eps2;
+}
+
+template <typename T1, typename T2>
+__device__ __forceinline__ int cleanup_poly3d(T1 pts[4], int n, T2 eps) {
+    if (n <= 1) return n;
+    const T2 eps2 = eps * eps;
+    T1 tmp[4];
+    int m = 0;
+    for (int i = 0; i < n; ++i) {
+        if (m == 0 || !same_point3<T1,T2>(pts[i], tmp[m - 1], eps2)) {
+            tmp[m++] = pts[i];
+        }
+    }
+    if (m > 1 && same_point3<T1,T2>(tmp[0], tmp[m - 1], eps2)) --m;
+    for (int i = 0; i < m; ++i) pts[i] = tmp[i];
+    return m;
+}
+
+template <typename T1, typename T2>
+__device__ __forceinline__ T1 interp_plane_hit(const T1& S0, const T1& S1, T2 d0, T2 d1) {
+    const T2 t = d0 / (d0 - d1);
+    return S0 + (S1 - S0) * t;
+}
+
+template <typename T1, typename T2>
+__device__ __forceinline__ int clip_triangle_by_plane_keep_negative(const T1& T0, const T1& T1v, const T1& T2v,
+                                                                    const T1& planeP, const T1& planeN,
+                                                                    T2 eps,
+                                                                    T1 outPoly[4]) {
+    T1 inPoly[4];
+    inPoly[0] = T0; inPoly[1] = T1v; inPoly[2] = T2v;
+    int inCount = 3;
+    int outCount = 0;
+
+    for (int i = 0; i < inCount; ++i) {
+        const T1 S0 = inPoly[(i + inCount - 1) % inCount];
+        const T1 S1 = inPoly[i];
+        const T2 d0 = dot(planeN, S0 - planeP);
+        const T2 d1 = dot(planeN, S1 - planeP);
+        const bool in0 = d0 <= eps;
+        const bool in1 = d1 <= eps;
+
+        if (in0 && in1) {
+            outPoly[outCount++] = S1;
+        } else if (in0 && !in1) {
+            outPoly[outCount++] = interp_plane_hit<T1,T2>(S0, S1, d0, d1);
+        } else if (!in0 && in1) {
+            outPoly[outCount++] = interp_plane_hit<T1,T2>(S0, S1, d0, d1);
+            outPoly[outCount++] = S1;
+        }
+    }
+
+    return cleanup_poly3d<T1,T2>(outPoly, outCount, eps);
+}
+
+template <typename T2>
+__device__ __forceinline__ bool same_point2(T2 ax, T2 ay, T2 bx, T2 by, T2 eps2) {
+    const T2 dx = ax - bx;
+    const T2 dy = ay - by;
+    return dx * dx + dy * dy <= eps2;
+}
+
+template <typename T2>
+__device__ __forceinline__ int cleanup_poly2d(T2 px[8], T2 py[8], int n, T2 eps) {
+    if (n <= 1) return n;
+    const T2 eps2 = eps * eps;
+    T2 qx[8], qy[8];
+    int m = 0;
+    for (int i = 0; i < n; ++i) {
+        if (m == 0 || !same_point2<T2>(px[i], py[i], qx[m - 1], qy[m - 1], eps2)) {
+            qx[m] = px[i];
+            qy[m] = py[i];
+            ++m;
+        }
+    }
+    if (m > 1 && same_point2<T2>(qx[0], qy[0], qx[m - 1], qy[m - 1], eps2)) --m;
+    for (int i = 0; i < m; ++i) {
+        px[i] = qx[i];
+        py[i] = qy[i];
+    }
+    return m;
+}
+
+template <typename T2>
+__device__ __forceinline__ T2 poly_twice_area_2d(const T2 px[8], const T2 py[8], int n) {
+    T2 twiceArea = (T2)0;
+    for (int i = 0; i < n; ++i) {
+        const int j = (i + 1) % n;
+        twiceArea += px[i] * py[j] - py[i] * px[j];
+    }
+    return twiceArea;
+}
+
+template <typename T2>
+__device__ __forceinline__ void reverse_poly2d(T2 px[8], T2 py[8], int n) {
+    for (int i = 0; i < n / 2; ++i) {
+        const int j = n - 1 - i;
+        const T2 tx = px[i], ty = py[i];
+        px[i] = px[j]; py[i] = py[j];
+        px[j] = tx;    py[j] = ty;
+    }
+}
+
+template <typename T2>
+__device__ __forceinline__ bool inside_ccw_edge(T2 px, T2 py, T2 ax, T2 ay, T2 bx, T2 by, T2 eps) {
+    return cross2(bx - ax, by - ay, px - ax, py - ay) >= -eps;
+}
+
+template <typename T2>
+__device__ __forceinline__ void line_intersection_2d(T2 sx, T2 sy, T2 ex, T2 ey,
+                                                     T2 ax, T2 ay, T2 bx, T2 by,
+                                                     T2& ox, T2& oy) {
+    const T2 rx = ex - sx, ry = ey - sy;
+    const T2 qx = bx - ax, qy = by - ay;
+    const T2 den = cross2(rx, ry, qx, qy);
+    if (absT(den) <= (T2)DEME_TINY_FLOAT) { ox = ex; oy = ey; return; }
+    const T2 t   = cross2(ax - sx, ay - sy, qx, qy) / den;
+    ox = sx + t * rx;
+    oy = sy + t * ry;
+}
+
+template <typename T1, typename T2>
+__device__ __forceinline__ int project_poly_3d_to_2d(const T1 inPoly[4], int n,
+                                                     const T1& O, const T1& u, const T1& v,
+                                                     T2 outX[8], T2 outY[8],
+                                                     T2 eps) {
+    for (int i = 0; i < n; ++i) {
+        const T1 P = inPoly[i] - O;
+        outX[i] = dot(P, u);
+        outY[i] = dot(P, v);
+    }
+    n = cleanup_poly2d<T2>(outX, outY, n, eps);
+    if (n >= 3 && poly_twice_area_2d<T2>(outX, outY, n) < (T2)0) {
+        reverse_poly2d<T2>(outX, outY, n);
+    }
+    return n;
+}
+
+template <typename T2>
+__device__ __forceinline__ int clip_convex_poly_2d(const T2 subjX[8], const T2 subjY[8], int nSubj,
+                                                   const T2 clipX[8], const T2 clipY[8], int nClip,
+                                                   T2 outX[8], T2 outY[8], T2 eps) {
+    T2 inX0[8], inY0[8], inX1[8], inY1[8];
+    int inCount = nSubj;
+    for (int i = 0; i < nSubj; ++i) { inX0[i] = subjX[i]; inY0[i] = subjY[i]; }
+
+    for (int e = 0; e < nClip; ++e) {
+        const T2 ax = clipX[e], ay = clipY[e];
+        const T2 bx = clipX[(e + 1) % nClip], by = clipY[(e + 1) % nClip];
+        int outCount = 0;
+        if (inCount == 0) return 0;
+        for (int i = 0; i < inCount; ++i) {
+            const int j = (i + inCount - 1) % inCount;
+            const T2 sx = inX0[j], sy = inY0[j];
+            const T2 ex = inX0[i], ey = inY0[i];
+            const bool sIn = inside_ccw_edge<T2>(sx, sy, ax, ay, bx, by, eps);
+            const bool eIn = inside_ccw_edge<T2>(ex, ey, ax, ay, bx, by, eps);
+
+            if (sIn && eIn) {
+                inX1[outCount] = ex; inY1[outCount] = ey; ++outCount;
+            } else if (sIn && !eIn) {
+                line_intersection_2d<T2>(sx, sy, ex, ey, ax, ay, bx, by, inX1[outCount], inY1[outCount]);
+                ++outCount;
+            } else if (!sIn && eIn) {
+                line_intersection_2d<T2>(sx, sy, ex, ey, ax, ay, bx, by, inX1[outCount], inY1[outCount]);
+                ++outCount;
+                inX1[outCount] = ex; inY1[outCount] = ey; ++outCount;
+            }
+        }
+        inCount = cleanup_poly2d<T2>(inX1, inY1, outCount, eps);
+        for (int i = 0; i < inCount; ++i) { inX0[i] = inX1[i]; inY0[i] = inY1[i]; }
+    }
+
+    for (int i = 0; i < inCount; ++i) { outX[i] = inX0[i]; outY[i] = inY0[i]; }
+    return inCount;
+}
+
+template <typename T2>
+__device__ __forceinline__ bool polygon_area_centroid_2d(const T2 px[8], const T2 py[8], int n,
+                                                         T2& area, T2& cx, T2& cy) {
+    area = (T2)0;
+    cx = (T2)0;
+    cy = (T2)0;
+    if (n < 3) return false;
+
+    T2 twiceArea = (T2)0;
+    T2 mx = (T2)0;
+    T2 my = (T2)0;
+    for (int i = 0; i < n; ++i) {
+        const int j = (i + 1) % n;
+        const T2 cr = px[i] * py[j] - py[i] * px[j];
+        twiceArea += cr;
+        mx += (px[i] + px[j]) * cr;
+        my += (py[i] + py[j]) * cr;
+    }
+    if (absT(twiceArea) <= (T2)DEME_TINY_FLOAT) return false;
+    area = absT(twiceArea) * (T2)0.5;
+    const T2 inv = (T2)1 / ((T2)3 * twiceArea);
+    cx = mx * inv;
+    cy = my * inv;
+    return true;
+}
+
+// ------------------------------------------------------------------
+// Tri-Tri pair contact area and point alongside contact island normal
+// clipped submerged polygon against submerged polygon
+// ------------------------------------------------------------------
+template <typename T1, typename T2>
+__device__ __forceinline__ bool area_cp_along_normal(const T1& A0, const T1& A1, const T1& A2,
+                                                     const T1& B0, const T1& B1, const T1& B2,
+                                                     T1 nCommon,
+                                                     T2& projArea,
+                                                     T1& contactPoint) {
+    projArea = (T2)0;
+    contactPoint = make_zero3<T1>();
+
+    const T2 geomScale = local_length_scale6<T1,T2>(A0,A1,A2,B0,B1,B2);
+    const T2 planeEps = rel_len_tol<T2>() * geomScale;
+    const T2 eps2d = planeEps;
+
+    const T2 nLen2 = dot(nCommon, nCommon);
+    if (nLen2 <= (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT)) return false;
+    nCommon = nCommon * ((T2)1 / sqrt(nLen2));
+
+    const T1 nA = cross(A1 - A0, A2 - A0);
+    const T1 nB = cross(B1 - B0, B2 - B0);
+    const T2 nALen2 = dot(nA, nA);
+    const T2 nBLen2 = dot(nB, nB);
+    if (nALen2 <= (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT) ||
+        nBLen2 <= (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT)) {
+        return false;
+    }
+
+    T1 aPen3[4], bPen3[4];
+    int nAPen = clip_triangle_by_plane_keep_negative<T1,T2>(A0, A1, A2, B0, nB, planeEps, aPen3);
+    int nBPen = clip_triangle_by_plane_keep_negative<T1,T2>(B0, B1, B2, A0, nA, planeEps, bPen3);
+    if (nAPen < 3 || nBPen < 3) return false;
+
+    T1 u, v;
+    build_plane_basis_from_normal<T1,T2>(nCommon, u, v);
+    const T1 O = (A0 + B0) * (T2)0.5;
+
+    T2 aX[8], aY[8], bX[8], bY[8];
+    nAPen = project_poly_3d_to_2d<T1,T2>(aPen3, nAPen, O, u, v, aX, aY, eps2d);
+    nBPen = project_poly_3d_to_2d<T1,T2>(bPen3, nBPen, O, u, v, bX, bY, eps2d);
+    if (nAPen < 3 || nBPen < 3) return false;
+
+    T2 outX[8], outY[8];
+    const int nPoly = clip_convex_poly_2d<T2>(bX, bY, nBPen, aX, aY, nAPen, outX, outY, eps2d);
+    if (nPoly < 3) return false;
+
+    T2 cx, cy;
+    if (!polygon_area_centroid_2d<T2>(outX, outY, nPoly, projArea, cx, cy)) return false;
+
+    const T2 denA = dot(nA, nCommon);
+    const T2 denB = dot(nB, nCommon);
+    if (absT(denA) <= (T2)DEME_TINY_FLOAT || absT(denB) <= (T2)DEME_TINY_FLOAT) return false;
+
+    const T2 cA = dot(nA, A0 - O);
+    const T2 cB = dot(nB, B0 - O);
+    const T2 alphaA = dot(nA, u), betaA = dot(nA, v);
+    const T2 alphaB = dot(nB, u), betaB = dot(nB, v);
+
+    const T2 wA = (cA - alphaA * cx - betaA * cy) / denA;
+    const T2 wB = (cB - alphaB * cx - betaB * cy) / denB;
+
+    contactPoint = O + u * cx + v * cy + nCommon * ((wA + wB) * (T2)0.5);
+    return true;
+}
+
+// ------------------------------------------------------------------
+// Moeller inspired tri-tri penetration test
+// ------------------------------------------------------------------
+template <typename T1, typename T2>
+__device__ __forceinline__ bool checkTriangleTriangleOverlap(
+    const T1& A0,
+    const T1& A1,
+    const T1& A2,
+    const T1& B0,
+    const T1& B1,
+    const T1& B2,
+    T2& depth) {
+
+    const T2 geomScale    = local_length_scale6<T1,T2>(A0,A1,A2,B0,B1,B2);
+    const T2 lenTol       = rel_len_tol<T2>() * geomScale;
+    const T2 aabbEps      = lenTol;
+    const T2 planeTol     = lenTol;
+    const T2 lineTol      = lenTol;
+    const T2 copOrientTol = lenTol * lenTol;
+    const T2 copCoordTol  = lenTol;
+    const T2 angTol       = rel_ang_tol<T2>();
+
+    if (!aabb_overlap6<T1,T2>(A0,A1,A2,B0,B1,B2,aabbEps)) {
+        const T2 minAx = tmin3((T2)A0.x, (T2)A1.x, (T2)A2.x), maxAx = tmax3((T2)A0.x, (T2)A1.x, (T2)A2.x);
+        const T2 minAy = tmin3((T2)A0.y, (T2)A1.y, (T2)A2.y), maxAy = tmax3((T2)A0.y, (T2)A1.y, (T2)A2.y);
+        const T2 minAz = tmin3((T2)A0.z, (T2)A1.z, (T2)A2.z), maxAz = tmax3((T2)A0.z, (T2)A1.z, (T2)A2.z);
+        const T2 minBx = tmin3((T2)B0.x, (T2)B1.x, (T2)B2.x), maxBx = tmax3((T2)B0.x, (T2)B1.x, (T2)B2.x);
+        const T2 minBy = tmin3((T2)B0.y, (T2)B1.y, (T2)B2.y), maxBy = tmax3((T2)B0.y, (T2)B1.y, (T2)B2.y);
+        const T2 minBz = tmin3((T2)B0.z, (T2)B1.z, (T2)B2.z), maxBz = tmax3((T2)B0.z, (T2)B1.z, (T2)B2.z);
+        const T2 sepX = max2((T2)0, max2(minBx - maxAx, minAx - maxBx));
+        const T2 sepY = max2((T2)0, max2(minBy - maxAy, minAy - maxBy));
+        const T2 sepZ = max2((T2)0, max2(minBz - maxAz, minAz - maxBz));
+        depth = -max2(sepX, max2(sepY, sepZ));
+        return false;
+    }
+
+    const T1 E1 = A1 - A0;
+    const T1 E2 = A2 - A0;
+    const T1 F1 = B1 - B0;
+    const T1 F2 = B2 - B0;
+    const T1 N1 = cross(E1, E2);
+    const T1 N2 = cross(F1, F2);
+
+    const T2 n1Len2 = dot(N1, N1);
+    const T2 n2Len2 = dot(N2, N2);
+    if (n1Len2 <= (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT) ||
+        n2Len2 <= (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT)) {
+        return false;
+    }
+    const T2 invN1 = (T2)1 / sqrt(n1Len2);
+    const T2 invN2 = (T2)1 / sqrt(n2Len2);
+
+    const T2 du0 = (T2)dot(N1, B0 - A0) * invN1;
+    const T2 du1 = (T2)dot(N1, B1 - A0) * invN1;
+    const T2 du2 = (T2)dot(N1, B2 - A0) * invN1;
+    const bool sideRejectN1 =
+        ((du0 > planeTol && du1 > planeTol && du2 > planeTol) ||
+         (du0 < -planeTol && du1 < -planeTol && du2 < -planeTol));
+
+    const T2 dv0 = (T2)dot(N2, A0 - B0) * invN2;
+    const T2 dv1 = (T2)dot(N2, A1 - B0) * invN2;
+    const T2 dv2 = (T2)dot(N2, A2 - B0) * invN2;
+    const bool sideRejectN2 =
+        ((dv0 > planeTol && dv1 > planeTol && dv2 > planeTol) ||
+         (dv0 < -planeTol && dv1 < -planeTol && dv2 < -planeTol));
+
+    if (sideRejectN1 || sideRejectN2) {
+        T2 sep = (T2)0;
+        if (sideRejectN1) {
+            if (du0 > planeTol && du1 > planeTol && du2 > planeTol) {
+                sep = max2(sep, tmin3(du0, du1, du2));
+            } else if (du0 < -planeTol && du1 < -planeTol && du2 < -planeTol) {
+                sep = max2(sep, tmin3(-du0, -du1, -du2));
+            }
+        }
+        if (sideRejectN2) {
+            if (dv0 > planeTol && dv1 > planeTol && dv2 > planeTol) {
+                sep = max2(sep, tmin3(dv0, dv1, dv2));
+            } else if (dv0 < -planeTol && dv1 < -planeTol && dv2 < -planeTol) {
+                sep = max2(sep, tmin3(-dv0, -dv1, -dv2));
+            }
+        }
+        depth = -sep;
+        return false;
+    }
+
+    const T2 penA = max2((T2)0, max2(-du0, max2(-du1, -du2)));
+    const T2 penB = max2((T2)0, max2(-dv0, max2(-dv1, -dv2)));
+    const T1 n1u = N1 * invN1;
+    const T1 n2u = N2 * invN2;
+
+    const T1 D = cross(n1u, n2u);
+    if (dot(D, D) <= (T2)(angTol * angTol)) {
+        const bool hit = coplanar_tri_tri<T1,T2>(N1, A0,A1,A2, B0,B1,B2, copOrientTol, copCoordTol);
+        if (hit) {
+            depth = min2(penA, penB);
+            if (depth > lineTol) {
+                return true;
+            }
+        }
+        if (depth > (T2)0) {
+            depth = -depth;
+        }
+        return false;
+    }
+
+    const int axis = dominant_axis<T1,T2>(D);
+    const T2 ap0 = coord_axis<T1,T2>(A0, axis);
+    const T2 ap1 = coord_axis<T1,T2>(A1, axis);
+    const T2 ap2 = coord_axis<T1,T2>(A2, axis);
+    const T2 bp0 = coord_axis<T1,T2>(B0, axis);
+    const T2 bp1 = coord_axis<T1,T2>(B1, axis);
+    const T2 bp2 = coord_axis<T1,T2>(B2, axis);
+
+    T2 ia[6], ib[6];
+    const int na = interval_from_plane_hits<T2>(ap0, ap1, ap2, dv0, dv1, dv2, ia, lineTol);
+    const int nb = interval_from_plane_hits<T2>(bp0, bp1, bp2, du0, du1, du2, ib, lineTol);
+
+    if (na == 0 || nb == 0) {
+        const bool hit = coplanar_tri_tri<T1,T2>(N1, A0,A1,A2, B0,B1,B2, copOrientTol, copCoordTol);
+        if (hit) {
+            depth = min2(penA, penB);
+            if (depth > lineTol) {
+                return true;
+            }
+        }
+        if (depth > (T2)0) {
+            depth = -depth;
+        }
+        return false;
+    }
+
+    T2 a0 = ia[0], a1 = ia[0];
+    for (int i = 1; i < na; ++i) {
+        a0 = min2(a0, ia[i]);
+        a1 = max2(a1, ia[i]);
+    }
+    T2 b0 = ib[0], b1 = ib[0];
+    for (int i = 1; i < nb; ++i) {
+        b0 = min2(b0, ib[i]);
+        b1 = max2(b1, ib[i]);
+    }
+    sort2(a0, a1);
+    sort2(b0, b1);
+    if (a1 < b0 - lineTol || b1 < a0 - lineTol) {
+        const T2 sep = max2(b0 - a1, a0 - b1);
+        depth = -sep;
+        return false;
+    }
+    depth = min2(penA, penB);
+    if (depth > lineTol) {
+        return true;
+    }
+    if (depth > (T2)0) {
+        depth = -depth;
+    }
+    return false;
+}
+
+/// Triangle-triangle contact detection with split pipeline:
+/// 1. overlap + depth via replacement checkTriangleTriangleOverlap(..., depth)
+/// 2. normal selection/orientation (B->A)
+/// 3. separate area/contact-point reconstruction via area_cp_along_normal
 template <typename T1, typename T2>
 __device__ bool checkTriangleTriangleOverlap(
     const T1& A1,
@@ -1485,99 +1899,76 @@ __device__ bool checkTriangleTriangleOverlap(
     const T1& A2,
     const T1& B2,
     const T1& C2,
-    T1& normal,         ///< contact normal (B2A direction)
-    T2& depth,          ///< penetration (positive if in contact)
-    T2& projectedArea,  ///< projected area of clipping polygon (optional output)
-    T1& point) {        ///< contact point
-    // Triangle A vertices (tri1)
-    const T1 triA[3] = {A1, B1, C1};
-    // Triangle B vertices (tri2)
-    const T1 triB[3] = {A2, B2, C2};
+    T1& normal,
+    T2& depth,
+    T2& projectedArea,
+    T1& point) {
 
-    // Compute face normal for triangle A first; triangle B normal is only needed if B->A projection hits.
-    T1 nA = normalize(cross(B1 - A1, C1 - A1));
 
-    //// TODO: And degenerated triangles?
 
-    // ========================================================================
-    // Projection-based approach: project each triangle onto the other's plane
-    // and clip using Sutherland-Hodgman algorithm
-    // ========================================================================
+    projectedArea = (T2)0;
+    point = make_zero3<T1>();
+    normal = make_zero3<T1>();
+    depth = (T2)0;
 
-    // Project triangle B onto triangle A's plane and clip against A
-    T2 depthBA, areaBA;
-    T1 centroidBA;
-    const bool contactBA = projectTriangleOntoTriangle<T1, T2>(triB, triA, nA, depthBA, areaBA, centroidBA);
+    const bool hit = checkTriangleTriangleOverlap<T1, T2>(A1, B1, C1, A2, B2, C2, depth);
 
-    if (!contactBA) {
-        // No contact detected, Provide separation info
-        T1 centA = (triA[0] + triA[1] + triA[2]) / 3.0;
-        T1 centB = (triB[0] + triB[1] + triB[2]) / 3.0;
-        T1 sep = centA - centB;
-        T2 sepLen2 = dot(sep, sep);
+    if (!hit) {
+        const T1 centA = (A1 + B1 + C1) / (T2)3;
+        const T1 centB = (A2 + B2 + C2) / (T2)3;
+        const T1 sep = centA - centB;
+        const T2 sepLen2 = dot(sep, sep);
 
-        if (sepLen2 > (DEME_TINY_FLOAT * DEME_TINY_FLOAT)) {
-            T2 sepLen = sqrt(sepLen2);
+        if (sepLen2 > (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT)) {
+            const T2 sepLen = sqrt(sepLen2);
             normal = sep / sepLen;
-            depth = -sepLen;  // Negative for separation
-            point = (centA + centB) * 0.5;
+            point = (centA + centB) * (T2)0.5;
+            if (!(depth < (T2)0))
+                depth = -sepLen;
         } else {
-            normal = nA;
-            depth = -DEME_TINY_FLOAT;
+            const T1 nAraw = cross(B1 - A1, C1 - A1);
+            const T2 nArawLen2 = dot(nAraw, nAraw);
+            if (nArawLen2 > (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT)) {
+                normal = nAraw * ((T2)1 / sqrt(nArawLen2));
+            }
             point = centA;
+            if (!(depth < (T2)0))
+                depth = -(T2)DEME_TINY_FLOAT;
         }
-        projectedArea = 0.0;
+        projectedArea = (T2)0;
         return false;
     }
 
-    // Project triangle A onto triangle B's plane and clip against B
-    T1 nB = normalize(cross(B2 - A2, C2 - A2));
-    T2 depthAB, areaAB;
-    T1 centroidAB;
-    const bool contactAB = projectTriangleOntoTriangle<T1, T2>(triA, triB, nB, depthAB, areaAB, centroidAB);
-
-    if (!contactAB) {
-        // No contact detected, Provide separation info
-        T1 centA = (triA[0] + triA[1] + triA[2]) / 3.0;
-        T1 centB = (triB[0] + triB[1] + triB[2]) / 3.0;
-        T1 sep = centA - centB;
-        T2 sepLen2 = dot(sep, sep);
-
-        if (sepLen2 > (DEME_TINY_FLOAT * DEME_TINY_FLOAT)) {
-            T2 sepLen = sqrt(sepLen2);
-            normal = sep / sepLen;
-            depth = -sepLen;  // Negative for separation
-            point = (centA + centB) * 0.5;
-        } else {
-            normal = nA;
-            depth = -DEME_TINY_FLOAT;
-            point = centA;
-        }
-        projectedArea = 0.0;
+    const T1 nAraw = cross(B1 - A1, C1 - A1);
+    const T1 nBraw = cross(B2 - A2, C2 - A2);
+    const T2 nALen2 = dot(nAraw, nAraw);
+    const T2 nBLen2 = dot(nBraw, nBraw);
+    if (nALen2 <= (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT) ||
+        nBLen2 <= (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT)) {
         return false;
     }
 
-    // If both projection yields results, we select the one with less projection distance.
-    // This is important. For example, consider a small surface intersecting with a large surface nearly vertically. The
-    // smaller one projected onto the larger one: nearly 0 area (depending on numerical stability, may actually be 0);
-    // Larger one projected onto the smaller one: almost covers the entire smaller surface. We always want them both
-    // have non-0 projection area, and then select the shorter projection distance one. This is good for stability.
-    if (depthBA < depthAB) {
-        // Use B->A projection results
-        depth = depthBA;
-        projectedArea = areaBA;
-        normal = -1.0 * nA;  // Pay attention to direction
+    const T1 nA = nAraw * ((T2)1 / sqrt(nALen2));
+    const T1 nB = nBraw * ((T2)1 / sqrt(nBLen2));
+    const T2 penA = max2((T2)0, max2(-(T2)dot(nA, A2 - A1), max2(-(T2)dot(nA, B2 - A1), -(T2)dot(nA, C2 - A1))));
+    const T2 penB = max2((T2)0, max2(-(T2)dot(nB, A1 - A2), max2(-(T2)dot(nB, B1 - A2), -(T2)dot(nB, C1 - A2))));
 
-        // Contact point: centroid on A's plane, moved back by half depth
-        point = centroidBA - nA * (depth * 0.5);
-    } else {
-        // Use A->B projection results
-        depth = depthAB;
-        projectedArea = areaAB;
-        normal = nB;
+    normal = (penA <= penB) ? ((T2)-1 * nA) : nB;
 
-        // Contact point: centroid on B's plane, moved back by half depth
-        point = centroidAB - nB * (depth * 0.5);
+    depth = min2(penA, penB);
+
+    const bool area_ok = area_cp_along_normal<T1, T2>(A1, B1, C1, A2, B2, C2, normal, projectedArea, point);
+    if (!area_ok) {
+        projectedArea = (T2)0;
+        T1 closestA, closestB;
+        const T2 sep_dist = closestPtTriTriDistance<T1, T2>(A1, B1, C1, A2, B2, C2, closestA, closestB);
+        if (sep_dist >= (T2)0 && sep_dist < (T2)DEME_HUGE_FLOAT) {
+            point = (closestA + closestB) * (T2)0.5;
+        } else {
+            const T1 centA = (A1 + B1 + C1) / (T2)3;
+            const T1 centB = (A2 + B2 + C2) / (T2)3;
+            point = (centA + centB) * (T2)0.5;
+        }
     }
 
     return true;
