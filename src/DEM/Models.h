@@ -41,6 +41,15 @@ inline std::string HERTZIAN_FORCE_MODEL_FRICTIONLESS() {
     return read_file_to_string(sourcefile);
 }
 
+inline std::string HERTZIAN_FORCE_MODEL_ADHESION() {
+    std::filesystem::path sourcefile = DEMERuntimeDataHelper::data_path / "kernel" / "DEMCustomizablePolicies" /
+                                       "FullHertzianForceAdhesionModel.cu";
+    if (!std::filesystem::exists(sourcefile)) {
+        DEME_ERROR("The force model file %s is not found.", sourcefile.string().c_str());
+    }
+    return read_file_to_string(sourcefile);
+}
+
 inline std::string FORCE_REDUCTION_RIGHT_AFTER_CALC_STRAT() {
     std::filesystem::path sourcefile =
         DEMERuntimeDataHelper::data_path / "kernel" / "DEMCustomizablePolicies" / "ForceInKernelReductionStrat.cu";

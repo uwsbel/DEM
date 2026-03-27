@@ -993,6 +993,9 @@ void DEMSolver::reportInitStats() const {
         case (FORCE_MODEL::HERTZIAN_FRICTIONLESS):
             DEME_INFO(std::string("Frictionless Hertzian contact model is in use."));
             break;
+        case (FORCE_MODEL::HERTZIAN_ADHESION):
+            DEME_INFO(std::string("Hertzian adhesion contact model is in use."));
+            break;
         case (FORCE_MODEL::CUSTOM):
             DEME_INFO(std::string("A user-custom force model is in use."));
             break;
@@ -2625,11 +2628,18 @@ inline void DEMSolver::equipMaterials(std::unordered_map<std::string, std::strin
             for (unsigned int i = 0; i < num_mats; i++) {
                 for (unsigned int j = 0; j < num_mats; j++) {
                     if (i != j) {
-                        // Default to average of the 2 materials
-                        pair_mat[i][j] = (pair_mat[i][i] + pair_mat[j][j]) / 2.;
-                        // If they are the same, we don't have to remind the user that it is not set, in the case that
-                        // the user does not set it, since well, the average does not change anything.
-                        if (pair_mat[i][i] == pair_mat[j][j]) {
+                        // Most pair-wise material properties default to the average of the 2 materials.
+                        // Adhesion properties are different: averaging would make a particle-wall pair
+                        // artificially adhesive whenever only the particle self-pair is configured.
+                        // Therefore unlike-material adhesion defaults to 0 unless explicitly provided.
+                        const bool adhesion_prop = (prop_name == "AdhesionDryPullOff") ||
+                                                   (prop_name == "AdhesionDryDistance") ||
+                                                   (prop_name == "AdhesionWetCap") ||
+                                                   (prop_name == "AdhesionWetRupture");
+                        pair_mat[i][j] = adhesion_prop ? 0.f : (pair_mat[i][i] + pair_mat[j][j]) / 2.;
+                        // If the average would not change anything, or if this is an adhesion property
+                        // that intentionally defaults to 0 on unlike pairs, we don't need to warn.
+                        if ((adhesion_prop) || (pair_mat[i][i] == pair_mat[j][j])) {
                             flags[i][j] = 1;
                         }
                     }

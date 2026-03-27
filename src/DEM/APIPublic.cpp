@@ -1580,6 +1580,11 @@ std::shared_ptr<DEMForceModel> DEMSolver::UseFrictionlessHertzianModel() {
     return m_force_model;
 }
 
+std::shared_ptr<DEMForceModel> DEMSolver::UseHertzianAdhesionModel() {
+    m_force_model->SetForceModelType(FORCE_MODEL::HERTZIAN_ADHESION);
+    return m_force_model;
+}
+
 void DEMSolver::ChangeFamilyWhen(unsigned int ID_from, unsigned int ID_to, const std::string& condition) {
     assertSysNotInit("ChangeFamilyWhen");
     if (ID_from > std::numeric_limits<family_t>::max() || ID_to > std::numeric_limits<family_t>::max()) {

@@ -812,6 +812,7 @@ void DEMForceModel::SetForceModelType(FORCE_MODEL model_type) {
             m_force_model = HERTZIAN_FORCE_MODEL();
             // History-based model uses these history-related arrays
             m_contact_wildcards = {"delta_time", "delta_tan_x", "delta_tan_y", "delta_tan_z"};
+            m_owner_wildcards.clear();
             break;
         case (FORCE_MODEL::HERTZIAN_FRICTIONLESS):
             m_must_have_mat_props = {"E", "nu", "CoR"};
@@ -819,10 +820,22 @@ void DEMForceModel::SetForceModelType(FORCE_MODEL model_type) {
             m_force_model = HERTZIAN_FORCE_MODEL_FRICTIONLESS();
             // No contact history needed for frictionless
             m_contact_wildcards.clear();
+            m_owner_wildcards.clear();
+            break;
+        case (FORCE_MODEL::HERTZIAN_ADHESION):
+            m_must_have_mat_props = {"E", "nu", "CoR", "mu", "Crr", "AdhesionDryPullOff", "AdhesionDryDistance",
+                                     "AdhesionWetCap", "AdhesionWetRupture"};
+            m_pairwise_mat_props = {"CoR", "mu", "Crr", "AdhesionDryPullOff", "AdhesionDryDistance",
+                                    "AdhesionWetCap", "AdhesionWetRupture"};
+            m_force_model = HERTZIAN_FORCE_MODEL_ADHESION();
+            m_contact_wildcards = {"delta_time", "delta_tan_x", "delta_tan_y", "delta_tan_z", "delta_max",
+                                   "bridge_on"};
+            m_owner_wildcards = {"AdhesionWeight"};
             break;
         case (FORCE_MODEL::CUSTOM):
             m_must_have_mat_props.clear();
             m_pairwise_mat_props.clear();
+            m_owner_wildcards.clear();
     }
 }
 

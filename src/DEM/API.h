@@ -176,6 +176,8 @@ class DEMSolver {
     std::shared_ptr<DEMForceModel> UseFrictionalHertzianModel();
     /// Instruct the solver to use frictonless Hertzian contact force model.
     std::shared_ptr<DEMForceModel> UseFrictionlessHertzianModel();
+    /// Instruct the solver to use Hertzian contact with dry/wet adhesion add-ons.
+    std::shared_ptr<DEMForceModel> UseHertzianAdhesionModel();
     /// Define a custom contact force model by a string. Returns a shared_ptr to the force model in use.
     std::shared_ptr<DEMForceModel> DefineContactForceModel(const std::string& model);
     /// Read user custom contact force model from a file (which by default should reside in kernel/DEMUserScripts).
@@ -1966,7 +1968,7 @@ class DEMSolver {
     std::unordered_map<std::string, std::string> m_subs;
     // jitify's compilation options
     std::vector<std::string> m_jitify_options;
-
+    
     // A map that records the numbering for user-defined owner wildcards
     std::unordered_map<std::string, unsigned int> m_owner_wc_num;
     // A map that records the numbering for user-defined geometry wildcards
