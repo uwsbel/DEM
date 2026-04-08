@@ -656,6 +656,7 @@ void DEMSolver::addAnalCompTemplate(const objType_t type,
 }
 
 void DEMSolver::jitifyKernels() {
+    JitHelper::setTryDisableRuntimeCompiler(m_try_disable_runtime_compiler);
     equipClumpTemplates(m_subs);
     equipSimParams(m_subs);
     equipMassMoiVolume(m_subs);

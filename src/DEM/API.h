@@ -147,7 +147,10 @@ class DEMSolver {
     std::vector<std::string> GetJitifyOptions() const { return m_jitify_options; }
     /// Set the jitification options. It is only needed by advanced users.
     void SetJitifyOptions(const std::vector<std::string>& options) { m_jitify_options = options; }
-
+    /// If true, DEME first tries the standard GPU compiler during initialization instead of the runtime
+    /// compiler. Compilation still happens at runtime, but faster (pro) and less optimized (con).
+    /// If this compiler is unavailable or fails, DEME falls back to the default runtime compilation.
+    void TryDisableRuntimeCompiler(bool disable = true) { m_try_disable_runtime_compiler = disable; }
     /// Explicitly instruct the bin size (for contact detection) that the solver should use.
     void SetInitBinSize(double bin_size) {
         use_user_defined_bin_size = INIT_BIN_SIZE_TYPE::EXPLICIT;
@@ -1823,6 +1826,8 @@ class DEMSolver {
 
     // If we should ensure that when kernel jitification fails, the line number reported reflexes where error happens
     bool ensure_kernel_line_num = false;
+    // If true, try the standard compiler before falling back to the proper runtime compiler.
+    bool m_try_disable_runtime_compiler = false;
 
     // If the solver sees there are more spheres in a bin than a this `maximum', it errors out
     unsigned int threshold_too_many_spheres_in_bin = 32768;
