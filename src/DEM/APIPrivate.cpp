@@ -2829,16 +2829,29 @@ inline void DEMSolver::equipKernelIncludes(std::unordered_map<std::string, std::
 }
 
 // Jitify options include suppressing variable-not-used warnings. We could use CUDA lib functions too.
-// It's put here as ApiVersion.h.in (which sets DEME_CUDA_TOOLKIT_HEADERS) is a CMake-in configuration file, we don't
+// It's put here as ApiVersion.h.in (which sets DEME_GPU_TOOLKIT_HEADERS) is a CMake-in configuration file, we don't
 // want to include it anywhere in the h headers in case DEM-Engine is included by some parent project.
 void DEMSolver::setDefaultSolverParams() {
     m_jitify_options = {"-I" + (JitHelper::KERNEL_INCLUDE_DIR).string(),
                         "-I" + (JitHelper::KERNEL_DIR).string(),
-                        "-I" + std::string(DEME_CUDA_TOOLKIT_HEADERS),
                         "-diag-suppress=177",
                         "-diag-suppress=549",
                         "-diag-suppress=550",
                         "-std=c++17"};
+
+    {
+        std::stringstream toolkit_dirs(std::string(DEME_GPU_TOOLKIT_HEADERS));
+        std::string dir;
+        while (std::getline(toolkit_dirs, dir, ';')) {
+            if (!dir.empty()) {
+                m_jitify_options.push_back("-I" + dir);
+            }
+        }
+    }
+#ifdef DEME_USE_HIP
+    m_jitify_options.push_back("-DDEME_USE_HIP");
+    m_jitify_options.push_back("-D__HIP_PLATFORM_AMD__");
+#endif
 }
 
 }  // namespace deme

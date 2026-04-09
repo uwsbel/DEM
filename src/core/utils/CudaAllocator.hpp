@@ -7,8 +7,9 @@
 #define DEME_CUDALLOC_HPP
 
 #include <core/ApiVersion.h>
+#include "GpuRuntime.hpp"
+#include "Logger.hpp"
 
-#include <cuda_runtime_api.h>
 #include <climits>
 #include <iostream>
 #include <memory>
@@ -106,11 +107,11 @@ struct ManagedAllocator {
 
 #if CXX_OLDER(STD_CXX20)
     void deallocate(T* p, std::size_t n) {
-        cudaFree(p);
+        DEME_GPU_CALL_NOTHROW(cudaFree(p));
     }
 #else  // CXX_EQ_NEWER(STD_CXX20)
     constexpr void deallocate(T* p, std::size_t n) {
-        cudaFree(p);
+        DEME_GPU_CALL_NOTHROW(cudaFree(p));
     }
 #endif
 
@@ -231,11 +232,11 @@ struct PinnedAllocator {
 
 #if CXX_OLDER(STD_CXX20)
     void deallocate(T* p, std::size_t n) {
-        cudaFreeHost(p);
+        DEME_GPU_CALL_NOTHROW(cudaFreeHost(p));
     }
 #else  // CXX_EQ_NEWER(STD_CXX20)
     constexpr void deallocate(T* p, std::size_t n) {
-        cudaFreeHost(p);
+        DEME_GPU_CALL_NOTHROW(cudaFreeHost(p));
     }
 #endif
 

@@ -11,6 +11,7 @@
 #include <utility>
 #include <unordered_map>
 
+#include "GpuRuntime.hpp"
 #include "Logger.hpp"
 #include "BaseClasses.hpp"
 #include "CudaAllocator.hpp"
@@ -53,7 +54,7 @@ inline void DevicePtrDealloc(T*& ptr) {
     cudaPointerAttributes attrib;
     DEME_GPU_CALL(cudaPointerGetAttributes(&attrib, ptr));
 
-    if (attrib.type != cudaMemoryType::cudaMemoryTypeUnregistered)
+    if (gpuPointerKind(attrib) != GpuPointerKind::Unregistered)
         DEME_GPU_CALL(cudaFree(ptr));
 }
 
@@ -70,7 +71,7 @@ inline void HostPtrDealloc(T*& ptr) {
     cudaPointerAttributes attrib;
     DEME_GPU_CALL(cudaPointerGetAttributes(&attrib, ptr));
 
-    if (attrib.type != cudaMemoryType::cudaMemoryTypeUnregistered)
+    if (gpuPointerKind(attrib) != GpuPointerKind::Unregistered)
         DEME_GPU_CALL(cudaFreeHost(ptr));
 }
 template <typename T>
@@ -1065,13 +1066,13 @@ struct HostBounce {
     size_t cap = 0;
     ~HostBounce() {
         if (ptr)
-            cudaFreeHost(ptr);
+            DEME_GPU_CALL_NOTHROW(cudaFreeHost(ptr));
     }
     inline void ensure(size_t need) {
         if (cap >= need)
             return;
         if (ptr)
-            cudaFreeHost(ptr);
+            DEME_GPU_CALL_NOTHROW(cudaFreeHost(ptr));
         DEME_GPU_CALL(cudaMallocHost(&ptr, need));  // pinned
         cap = need;
     }
@@ -1101,7 +1102,7 @@ inline XferMode plan_mode(int dstDev, int srcDev) {
                 DEME_GPU_CALL(cudaSetDevice(dstDev));
             cudaError_t st = cudaDeviceEnablePeerAccess(srcDev, 0);
             if (st == cudaErrorPeerAccessAlreadyEnabled)
-                (void)cudaGetLastError();
+                DEME_GPU_DISCARD(cudaGetLastError());
             else if (st != cudaSuccess)
                 can = 0;
             if (cur != dstDev)

@@ -610,22 +610,22 @@ class DEMDynamicThread {
         startThread();
         th.join();
         timers.DestroyGpuEvents();
-        cudaStreamDestroy(streamInfo.stream);
+        DEME_GPU_CALL_NOTHROW(cudaStreamDestroy(streamInfo.stream));
         if (streamSyncEvent) {
-            cudaEventDestroy(streamSyncEvent);
+            DEME_GPU_CALL_NOTHROW(cudaEventDestroy(streamSyncEvent));
             streamSyncEvent = nullptr;
         }
         if (dT_to_kT_BufferReadyEvent) {
-            cudaEventDestroy(dT_to_kT_BufferReadyEvent);
+            DEME_GPU_CALL_NOTHROW(cudaEventDestroy(dT_to_kT_BufferReadyEvent));
             dT_to_kT_BufferReadyEvent = nullptr;
         }
         if (kT_numContactsReadyEvent) {
-            cudaEventDestroy(kT_numContactsReadyEvent);
+            DEME_GPU_CALL_NOTHROW(cudaEventDestroy(kT_numContactsReadyEvent));
             kT_numContactsReadyEvent = nullptr;
         }
         for (auto& evt : progressEvents) {
             if (evt) {
-                cudaEventDestroy(evt);
+                DEME_GPU_CALL_NOTHROW(cudaEventDestroy(evt));
                 evt = nullptr;
             }
         }

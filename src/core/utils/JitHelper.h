@@ -16,11 +16,30 @@
 #include <utility>
 #include <cctype>
 #include <fstream>
+#include <sstream>
+#include <type_traits>
 #include <stdexcept>
 
-#include <jitify/jitify.hpp>
-#include <cuda.h>
-#include <cuda_runtime_api.h>
+#ifdef DEME_USE_HIP
+    #include "GpuRuntime.hpp"
+    #if defined(__clang__)
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Wattributes"
+    #endif
+    #include <hip/hiprtc.h>
+    #if defined(__clang__)
+        #pragma clang diagnostic pop
+    #endif
+
+    using CUresult = hipError_t;
+    using CUdeviceptr = hipDeviceptr_t;
+    using CUstream = hipStream_t;
+    using CUoccupancyB2DSize = size_t (*)(int);
+#else
+    #include <jitify/jitify.hpp>
+    #include <cuda.h>
+    #include <cuda_runtime_api.h>
+#endif
 
 #if defined(_WIN32) || defined(_WIN64)
     #undef max
@@ -48,27 +67,41 @@ class JitHelper {
         std::unordered_map<std::string, std::string> substitutions = std::unordered_map<std::string, std::string>(),
         std::vector<std::string> flags = std::vector<std::string>());
 
+    static void setTryDisableRuntimeCompiler(bool disable) { s_tryDisableRuntimeCompiler = disable; }
+    static bool getTryDisableRuntimeCompiler() { return s_tryDisableRuntimeCompiler; }
+
     static const std::filesystem::path KERNEL_DIR;
     static const std::filesystem::path KERNEL_INCLUDE_DIR;
     static const std::filesystem::path CACHE_DIR;
-    static void setTryDisableRuntimeCompiler(bool disable);
-    static bool getTryDisableRuntimeCompiler();
 
   private:
+    inline static bool s_tryDisableRuntimeCompiler = false;
+
     static std::string hashString(const std::string& in);
     static std::string toHex(uint64_t value);
     static std::filesystem::path resolveCacheDir();
 
-    static bool s_try_disable_runtime_compiler;
+    template <typename T>
+    inline static std::string stringifyTemplateArg(const T& value) {
+        using Decayed = std::decay_t<T>;
+        if constexpr (std::is_same_v<Decayed, std::string>) {
+            return value;
+        } else if constexpr (std::is_same_v<Decayed, const char*> || std::is_same_v<Decayed, char*>) {
+            return value ? std::string(value) : std::string();
+        } else {
+            std::ostringstream out;
+            out << value;
+            return out.str();
+        }
+    }
 
     inline static std::string loadSourceFile(const std::filesystem::path& sourcefile) {
-        std::string code;
-        // If the file exists, read in the entire thing.
-        if (std::filesystem::exists(sourcefile)) {
-            std::ifstream input(sourcefile);
-            std::getline(input, code, std::string::traits_type::to_char_type(std::string::traits_type::eof()));
+        if (!std::filesystem::exists(sourcefile)) {
+            return {};
         }
-        return code;
+
+        std::ifstream input(sourcefile, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     };
 };
 
@@ -81,9 +114,32 @@ class JitHelper::CachedProgram {
     const std::string& key() const { return m_storage->programHash; }
 
   private:
+#ifdef DEME_USE_HIP
+    struct LoadedKernelData {
+        ~LoadedKernelData();
+
+        hipModule_t module = nullptr;
+        hipFunction_t function = nullptr;
+        std::string loweredName;
+        std::string codeObject;
+        std::vector<std::string> linkFiles;
+        std::vector<std::string> linkPaths;
+    };
+#endif
+
     struct ProgramStorage {
         ProgramStorage(std::string code_in, std::vector<std::string> flags_in);
-        ~ProgramStorage();
+
+#ifdef DEME_USE_HIP
+        std::string code;
+        std::vector<std::string> flags;
+        std::string programHash;
+        std::filesystem::path cacheDir;
+        int device = 0;
+        std::string archTag;
+        std::unordered_map<std::string, std::shared_ptr<LoadedKernelData>> kernelCache;
+        std::mutex mutex;
+#else
         std::unique_ptr<jitify::experimental::Program> program;
         std::string code;
         std::vector<std::string> flags;
@@ -91,10 +147,9 @@ class JitHelper::CachedProgram {
         std::filesystem::path cacheDir;
         int device = 0;
         std::string archTag;
-        CUmodule module = nullptr;
         std::unordered_map<std::string, std::shared_ptr<jitify::experimental::KernelInstantiation>> kernelCache;
-        std::unordered_map<std::string, CUfunction> kernelFunctionCache;
         std::mutex mutex;
+#endif
     };
 
     std::shared_ptr<ProgramStorage> m_storage;
@@ -119,7 +174,12 @@ class JitHelper::CachedProgram::Kernel {
 
     Kernel(std::shared_ptr<ProgramStorage> storage, std::string name, std::vector<std::string> options);
 
-    KernelInstantiation getKernelInstantiation(const std::vector<std::string>& template_args) const;
+#ifdef DEME_USE_HIP
+    std::shared_ptr<LoadedKernelData> getLoadedKernel(const std::vector<std::string>& template_args) const;
+#else
+    std::shared_ptr<jitify::experimental::KernelInstantiation> getKernelInstantiation(
+        const std::vector<std::string>& template_args) const;
+#endif
 
     friend class CachedProgram;
 };
@@ -128,46 +188,21 @@ class JitHelper::CachedProgram::Kernel::KernelInstantiation {
   public:
     class KernelLauncher;
 
-    KernelLauncher configure(dim3 grid, dim3 block, unsigned int smem = 0, cudaStream_t stream = 0) const;
+#ifdef DEME_USE_HIP
+    KernelLauncher configure(dim3 grid, dim3 block, unsigned int smem = 0, hipStream_t stream = nullptr) const;
+#else
+    KernelLauncher configure(dim3 grid, dim3 block, unsigned int smem = 0, cudaStream_t stream = nullptr) const;
+#endif
     KernelLauncher configure_1d_max_occupancy(int max_block_size = 0,
                                               unsigned int smem = 0,
                                               CUoccupancyB2DSize smem_callback = 0,
-                                              cudaStream_t stream = 0,
+                                              CUstream stream = 0,
                                               unsigned int flags = 0) const;
 
-    CUdeviceptr get_global_ptr(const char* name, size_t* size = nullptr) const {
-        if (m_impl) {
-            return m_impl->get_global_ptr(name, size);
-        }
-        size_t bytes = 0;
-        CUdeviceptr ptr = 0;
-        CUresult res = cuModuleGetGlobal(&ptr, &bytes, m_storage->module, name);
-        if (size) {
-            *size = bytes;
-        }
-        if (res != CUDA_SUCCESS) {
-            return 0;
-        }
-        return ptr;
-    }
+    CUdeviceptr get_global_ptr(const char* name, size_t* size = nullptr) const;
 
     template <typename T>
-    CUresult get_global_array(const char* name, T* data, size_t count, CUstream stream = 0) const {
-        if (m_impl) {
-            return m_impl->get_global_array(name, data, count, stream);
-        }
-        size_t bytes = 0;
-        CUdeviceptr ptr = 0;
-        CUresult res = cuModuleGetGlobal(&ptr, &bytes, m_storage->module, name);
-        if (res != CUDA_SUCCESS) {
-            return res;
-        }
-        const size_t copy_bytes = sizeof(T) * count;
-        if (copy_bytes > bytes) {
-            return CUDA_ERROR_INVALID_VALUE;
-        }
-        return cuMemcpyDtoHAsync(data, ptr, copy_bytes, stream);
-    }
+    CUresult get_global_array(const char* name, T* data, size_t count, CUstream stream = 0) const;
 
     template <typename T>
     CUresult get_global_value(const char* name, T* value, CUstream stream = 0) const {
@@ -175,119 +210,98 @@ class JitHelper::CachedProgram::Kernel::KernelInstantiation {
     }
 
     template <typename T>
-    CUresult set_global_array(const char* name, const T* data, size_t count, CUstream stream = 0) const {
-        if (m_impl) {
-            return m_impl->set_global_array(name, data, count, stream);
-        }
-        size_t bytes = 0;
-        CUdeviceptr ptr = 0;
-        CUresult res = cuModuleGetGlobal(&ptr, &bytes, m_storage->module, name);
-        if (res != CUDA_SUCCESS) {
-            return res;
-        }
-        const size_t copy_bytes = sizeof(T) * count;
-        if (copy_bytes > bytes) {
-            return CUDA_ERROR_INVALID_VALUE;
-        }
-        return cuMemcpyHtoDAsync(ptr, data, copy_bytes, stream);
-    }
+    CUresult set_global_array(const char* name, const T* data, size_t count, CUstream stream = 0) const;
 
     template <typename T>
     CUresult set_global_value(const char* name, const T& value, CUstream stream = 0) const {
         return set_global_array(name, &value, 1, stream);
     }
 
-    const std::string& mangled_name() const {
-        static const std::string empty;
-        return m_impl ? m_impl->mangled_name() : empty;
-    }
-    const std::string& ptx() const {
-        static const std::string empty;
-        return m_impl ? m_impl->ptx() : empty;
-    }
-
-    const std::vector<std::string>& link_files() const {
-        static const std::vector<std::string> empty;
-        return m_impl ? m_impl->link_files() : empty;
-    }
-    const std::vector<std::string>& link_paths() const {
-        static const std::vector<std::string> empty;
-        return m_impl ? m_impl->link_paths() : empty;
-    }
+    const std::string& mangled_name() const;
+    const std::string& ptx() const;
+    const std::vector<std::string>& link_files() const;
+    const std::vector<std::string>& link_paths() const;
 
   private:
-    std::shared_ptr<jitify::experimental::KernelInstantiation> m_impl;
+#ifdef DEME_USE_HIP
     std::shared_ptr<ProgramStorage> m_storage;
-    CUfunction m_func = nullptr;
+    std::string m_kernelName;
+    std::vector<std::string> m_templateArgs;
+    std::vector<std::string> m_options;
+    mutable std::shared_ptr<LoadedKernelData> m_loadedKernel;
+
+    KernelInstantiation(std::shared_ptr<ProgramStorage> storage,
+                        std::string kernelName,
+                        std::vector<std::string> templateArgs,
+                        std::vector<std::string> options);
+    std::shared_ptr<LoadedKernelData> getLoadedKernel() const;
+#else
+    std::shared_ptr<jitify::experimental::KernelInstantiation> m_impl;
 
     KernelInstantiation(std::shared_ptr<jitify::experimental::KernelInstantiation> impl);
-    KernelInstantiation(std::shared_ptr<ProgramStorage> storage, CUfunction func);
+#endif
 
     friend class Kernel;
 };
 
 class JitHelper::CachedProgram::Kernel::KernelInstantiation::KernelLauncher {
   public:
-    KernelLauncher(std::shared_ptr<jitify::experimental::KernelInstantiation> inst,
-                   jitify::experimental::KernelLauncher launcher)
-        : m_inst(std::move(inst)),
-          m_launcher(std::make_unique<jitify::experimental::KernelLauncher>(std::move(launcher))) {}
+#ifdef DEME_USE_HIP
     KernelLauncher(std::shared_ptr<ProgramStorage> storage,
-                   CUfunction func,
+                   std::string kernelName,
+                   std::vector<std::string> templateArgs,
+                   std::vector<std::string> options,
                    dim3 grid,
                    dim3 block,
                    unsigned int smem,
-                   cudaStream_t stream)
-        : m_storage(std::move(storage)),
-          m_func(func),
-          m_grid(grid),
-          m_block(block),
-          m_smem(smem),
-          m_stream(stream) {}
+                   hipStream_t stream);
+#else
+    KernelLauncher(std::shared_ptr<jitify::experimental::KernelInstantiation> inst,
+                   jitify::experimental::KernelLauncher launcher)
+        : m_inst(std::move(inst)), m_launcher(std::move(launcher)) {}
+#endif
 
-    CUresult launch(std::vector<void*> arg_ptrs = {}, std::vector<std::string> arg_types = {}) const {
-        if (m_inst) {
-            return m_launcher->launch(std::move(arg_ptrs), std::move(arg_types));
-        }
-        (void)arg_types;
-        return cuLaunchKernel(m_func, m_grid.x, m_grid.y, m_grid.z, m_block.x, m_block.y, m_block.z, m_smem,
-                              m_stream, arg_ptrs.data(), nullptr);
-    }
+    CUresult launch(std::vector<void*> arg_ptrs = {}, std::vector<std::string> arg_types = {}) const;
 
     template <typename... ArgTypes>
-    CUresult launch(const ArgTypes&... args) const {
-        return launch(std::vector<void*>({(void*)&args...}), {jitify::reflection::reflect<ArgTypes>()...});
-    }
+    CUresult launch(const ArgTypes&... args) const;
 
-    void safe_launch(std::vector<void*> arg_ptrs = {}, std::vector<std::string> arg_types = {}) const {
-        if (m_inst) {
-            m_launcher->safe_launch(std::move(arg_ptrs), std::move(arg_types));
-            return;
-        }
-        CUresult res = launch(std::move(arg_ptrs), std::move(arg_types));
-        if (res != CUDA_SUCCESS) {
-            const char* err = nullptr;
-            cuGetErrorString(res, &err);
-            throw std::runtime_error(err ? err : "Failed to launch kernel");
-        }
-    }
+    void safe_launch(std::vector<void*> arg_ptrs = {}, std::vector<std::string> arg_types = {}) const;
 
     template <typename... ArgTypes>
-    void safe_launch(const ArgTypes&... args) const {
-        safe_launch(std::vector<void*>({(void*)&args...}), {jitify::reflection::reflect<ArgTypes>()...});
-    }
+    void safe_launch(const ArgTypes&... args) const;
 
   private:
-    std::shared_ptr<jitify::experimental::KernelInstantiation> m_inst;
-    std::unique_ptr<jitify::experimental::KernelLauncher> m_launcher;
+#ifdef DEME_USE_HIP
     std::shared_ptr<ProgramStorage> m_storage;
-    CUfunction m_func = nullptr;
-    dim3 m_grid = dim3(0);
-    dim3 m_block = dim3(0);
-    unsigned int m_smem = 0;
-    cudaStream_t m_stream = 0;
+    std::string m_kernelName;
+    std::vector<std::string> m_templateArgs;
+    std::vector<std::string> m_options;
+    dim3 m_grid;
+    dim3 m_block;
+    unsigned int m_smem;
+    hipStream_t m_stream;
+#else
+    std::shared_ptr<jitify::experimental::KernelInstantiation> m_inst;
+    jitify::experimental::KernelLauncher m_launcher;
+#endif
 };
 
+#ifdef DEME_USE_HIP
+template <typename... TemplateArgs>
+inline JitHelper::CachedProgram::Kernel::KernelInstantiation JitHelper::CachedProgram::Kernel::instantiate(
+    TemplateArgs... targs) const {
+    return instantiate(std::vector<std::string>({JitHelper::stringifyTemplateArg(targs)...}));
+}
+
+inline JitHelper::CachedProgram::Kernel::KernelInstantiation::KernelLauncher
+JitHelper::CachedProgram::Kernel::KernelInstantiation::configure(dim3 grid,
+                                                                 dim3 block,
+                                                                 unsigned int smem,
+                                                                 hipStream_t stream) const {
+    return KernelLauncher(m_storage, m_kernelName, m_templateArgs, m_options, grid, block, smem, stream);
+}
+#else
 template <typename... TemplateArgs>
 inline JitHelper::CachedProgram::Kernel::KernelInstantiation JitHelper::CachedProgram::Kernel::instantiate(
     TemplateArgs... targs) const {
@@ -299,34 +313,70 @@ JitHelper::CachedProgram::Kernel::KernelInstantiation::configure(dim3 grid,
                                                                  dim3 block,
                                                                  unsigned int smem,
                                                                  cudaStream_t stream) const {
-    if (m_impl) {
-        return KernelLauncher(m_impl, m_impl->configure(grid, block, smem, stream));
+    return KernelLauncher(m_impl, m_impl->configure(grid, block, smem, stream));
+}
+#endif
+
+template <typename T>
+inline CUresult JitHelper::CachedProgram::Kernel::KernelInstantiation::get_global_array(const char* name,
+                                                                                         T* data,
+                                                                                         size_t count,
+                                                                                         CUstream stream) const {
+#ifdef DEME_USE_HIP
+    size_t bytes = 0;
+    const auto ptr = get_global_ptr(name, &bytes);
+    if (ptr == 0) {
+        return hipErrorNotFound;
     }
-    return KernelLauncher(m_storage, m_func, grid, block, smem, stream);
+    const size_t requested = sizeof(T) * count;
+    if (requested > bytes) {
+        return hipErrorInvalidValue;
+    }
+    return stream ? hipMemcpyDtoHAsync(data, ptr, requested, stream) : hipMemcpyDtoH(data, ptr, requested);
+#else
+    return m_impl->get_global_array(name, data, count, stream);
+#endif
 }
 
-inline JitHelper::CachedProgram::Kernel::KernelInstantiation::KernelLauncher
-JitHelper::CachedProgram::Kernel::KernelInstantiation::configure_1d_max_occupancy(int max_block_size,
-                                                                                  unsigned int smem,
-                                                                                  CUoccupancyB2DSize smem_callback,
-                                                                                  cudaStream_t stream,
-                                                                                  unsigned int flags) const {
-    if (m_impl) {
-        return KernelLauncher(m_impl,
-                              m_impl->configure_1d_max_occupancy(max_block_size, smem, smem_callback, stream, flags));
+template <typename T>
+inline CUresult JitHelper::CachedProgram::Kernel::KernelInstantiation::set_global_array(const char* name,
+                                                                                         const T* data,
+                                                                                         size_t count,
+                                                                                         CUstream stream) const {
+#ifdef DEME_USE_HIP
+    size_t bytes = 0;
+    const auto ptr = get_global_ptr(name, &bytes);
+    if (ptr == 0) {
+        return hipErrorNotFound;
     }
-    int min_grid = 1;
-    int block = max_block_size;
-    if (block <= 0) {
-        (void)smem_callback;
-        (void)flags;
-        CUresult res = cuOccupancyMaxPotentialBlockSize(&min_grid, &block, m_func, nullptr, smem, 0);
-        if (res != CUDA_SUCCESS) {
-            block = 128;
-            min_grid = 1;
-        }
+    const size_t requested = sizeof(T) * count;
+    if (requested > bytes) {
+        return hipErrorInvalidValue;
     }
-    return KernelLauncher(m_storage, m_func, dim3(min_grid), dim3(block), smem, stream);
+    return stream ? hipMemcpyHtoDAsync(ptr, data, requested, stream)
+                  : hipMemcpyHtoD(ptr, data, requested);
+#else
+    return m_impl->set_global_array(name, data, count, stream);
+#endif
+}
+
+template <typename... ArgTypes>
+inline CUresult JitHelper::CachedProgram::Kernel::KernelInstantiation::KernelLauncher::launch(const ArgTypes&... args) const {
+#ifdef DEME_USE_HIP
+    return launch(std::vector<void*>({const_cast<void*>(static_cast<const void*>(&args))...}), {});
+#else
+    return launch(std::vector<void*>({(void*)&args...}), {jitify::reflection::reflect<ArgTypes>()...});
+#endif
+}
+
+template <typename... ArgTypes>
+inline void JitHelper::CachedProgram::Kernel::KernelInstantiation::KernelLauncher::safe_launch(
+    const ArgTypes&... args) const {
+#ifdef DEME_USE_HIP
+    safe_launch(std::vector<void*>({const_cast<void*>(static_cast<const void*>(&args))...}), {});
+#else
+    safe_launch(std::vector<void*>({(void*)&args...}), {jitify::reflection::reflect<ArgTypes>()...});
+#endif
 }
 
 #endif

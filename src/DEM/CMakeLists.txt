@@ -9,25 +9,49 @@ add_library(DEM OBJECT)
 
 target_include_directories(
 	DEM
-	PUBLIC ${ProjectIncludeSource}
-	PUBLIC ${ProjectIncludeGenerated}
+	PUBLIC $<BUILD_INTERFACE:${ProjectIncludeSource}> $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+	PUBLIC $<BUILD_INTERFACE:${ProjectIncludeGenerated}> $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
+
+# Define DEME_USE_HIP for HIP builds to enable HIP code paths
+if(USE_HIP)
+    target_compile_definitions(DEM PUBLIC DEME_USE_HIP)
+    target_compile_options(DEM PRIVATE -Wno-attributes)
+endif()
+
+# For HIP builds, add ROCm include paths
+if(USE_HIP)
+    if(ROCM_PATH)
+        target_include_directories(DEM PUBLIC ${ROCM_PATH}/include)
+    endif()
+endif()
 
 if(DEME_ENABLE_NVTX)
 	target_compile_definitions(DEM PUBLIC DEME_ENABLE_NVTX)
 endif()
 
-if(USE_CHPF)
-	target_link_libraries(
-		DEM
-		PUBLIC CUB::CUB
-		PUBLIC ${ChPF_IMPORTED_NAME}
-	)
+if(USE_HIP)
+    # hipCUB is header-only in this target; only ChPF contributes a link dependency.
+    if(USE_CHPF)
+        target_link_libraries(
+            DEM
+            PUBLIC ${ChPF_IMPORTED_NAME}
+        )
+    endif()
 else()
-	target_link_libraries(
-		DEM
-		PUBLIC CUB::CUB
-	)
+    # CUDA mode
+    if(USE_CHPF)
+        target_link_libraries(
+            DEM
+            PUBLIC CUB::CUB
+            PUBLIC ${ChPF_IMPORTED_NAME}
+        )
+    else()
+        target_link_libraries(
+            DEM
+            PUBLIC CUB::CUB
+        )
+    endif()
 endif()
 
 # if(WIN32)

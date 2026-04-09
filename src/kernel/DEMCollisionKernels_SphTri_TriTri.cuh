@@ -12,6 +12,19 @@
 __device__ __forceinline__ float3 make_zero3_float()  { return make_float3(0.f, 0.f, 0.f); }
 __device__ __forceinline__ double3 make_zero3_double(){ return make_double3(0.0, 0.0, 0.0); }
 
+// CUDA fast math functions with round-up mode - HIP has different names
+#ifdef DEME_USE_HIP
+    // HIP currently exposes only round-to-nearest double intrinsics here.
+    // This is NOT equivalent to CUDA *_ru and may change numerical behavior.
+    #define DEME_DRCP_RU(x) __drcp_rn(x)
+    // HIP multiply with round-to-nearest (closest available to round-up)
+    #define DEME_DMUL_RU(a, b) __dmul_rn(a, b)
+#else
+    // CUDA versions
+    #define DEME_DRCP_RU(x) __drcp_ru(x)
+    #define DEME_DMUL_RU(a, b) __dmul_ru(a, b)
+#endif
+
 template <typename T1>
 __device__ __forceinline__ T1 make_zero3();
 template <>
@@ -443,9 +456,9 @@ __device__ bool snap_to_face(const T1& A, const T1& B, const T1& C, const T1& P,
 
     // P inside face region. Return projection of P onto face
     // barycentric coordinates (u,v,w)
-    T2 denom = __drcp_ru(va + vb + vc);
-    T2 v = __dmul_ru(vb, denom);
-    T2 w = __dmul_ru(vc, denom);
+    T2 denom = DEME_DRCP_RU(va + vb + vc);
+    T2 v = DEME_DMUL_RU(vb, denom);
+    T2 w = DEME_DMUL_RU(vc, denom);
     res = A + v * AB + w * AC;  // = u*A + v*B + w*C  where  (u = 1 - v - w)
     return false;
 }

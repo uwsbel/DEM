@@ -29,10 +29,10 @@ inline void __migrate_impl(T* data, std::size_t size, int device, cudaStream_t s
     // CUDA 13.0+: cudaMemPrefetchAsync(const void*, size_t, cudaMemLocation, unsigned int flags, cudaStream_t)
     auto loc = make_device_location(device);
     unsigned int flags = 0;
-    cudaMemPrefetchAsync(static_cast<void*>(data), size * sizeof(T), loc, flags, stream);
+    DEME_GPU_DISCARD(cudaMemPrefetchAsync(static_cast<void*>(data), size * sizeof(T), loc, flags, stream));
 #else
     // CUDA <= 12.x: cudaMemPrefetchAsync(const void*, size_t, int dstDevice, cudaStream_t)
-    cudaMemPrefetchAsync(static_cast<void*>(data), size * sizeof(T), device, stream);
+    DEME_GPU_DISCARD(cudaMemPrefetchAsync(static_cast<void*>(data), size * sizeof(T), device, stream));
 #endif
 }
 
@@ -90,10 +90,10 @@ void __advise_impl(const T* data, std::size_t size, ManagedAdvice advice, int de
     loc.type = cudaMemLocationTypeDevice;
     loc.id = device;
     // CUDA 13.0+: cudaMemAdvise(const void*, size_t, cudaMemoryAdvise, cudaMemLocation)
-    cudaMemAdvise(static_cast<const void*>(data), size * sizeof(T), static_cast<cudaMemoryAdvise>(advice), loc);
+    DEME_GPU_DISCARD(cudaMemAdvise(static_cast<const void*>(data), size * sizeof(T), static_cast<cudaMemoryAdvise>(advice), loc));
 #else
     // Older toolkits: cudaMemAdvise(const void*, size_t, cudaMemoryAdvise, int)
-    cudaMemAdvise(static_cast<const void*>(data), size * sizeof(T), static_cast<cudaMemoryAdvise>(advice), device);
+    DEME_GPU_DISCARD(cudaMemAdvise(static_cast<const void*>(data), size * sizeof(T), static_cast<cudaMemoryAdvise>(advice), device));
 #endif
 }
 

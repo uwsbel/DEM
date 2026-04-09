@@ -15,7 +15,7 @@
 #include <memory>
 #include <unordered_map>
 
-#include <cuda_runtime_api.h>
+#include "GpuRuntime.hpp"
 #include "BaseClasses.hpp"
 // #include "../../DEM/Defines.h"
 
@@ -243,11 +243,45 @@ class Logger : private NonCopyable, public Singleton<Logger> {
 
 #define DEME_INFO(...) Logger::GetInstance().Logf(MessageType::Info, __func__, __FILE__, __LINE__, __VA_ARGS__)
 
+#ifndef DEME_GPU_DISCARD
+#define DEME_GPU_DISCARD(code)                 \
+    do {                                       \
+        [[maybe_unused]] auto _deme_gpu_res = (code); \
+    } while (0)
+#endif
+
 #define DEME_STATUS(identifier, ...) \
     Logger::GetInstance().LogStatusf(identifier, __func__, __FILE__, __LINE__, __VA_ARGS__)
 
+#ifdef DEME_USE_HIP
 #define DEME_GPU_CALL(code)                                                                                           \
-    {                                                                                                                 \
+    do {                                                                                                              \
+        hipError_t res = (code);                                                                                     \
+        if (res != hipSuccess) {                                                                                     \
+            DEME_ERROR(                                                                                               \
+                "GPU Error: %s\nYou can check out the troubleshoot section of DEME to see if it helps.\nIf nothing "  \
+                "works, you can discuss this on forum https://groups.google.com/g/projectchrono, and please include " \
+                "a visual rendering of the simulation before crash in the post.\n",                                   \
+                hipGetErrorString(res));                                                                             \
+        }                                                                                                             \
+    } while (0)
+
+#define DEME_GPU_CALL_NOTHROW(code)                                       \
+    do {                                                                  \
+        hipError_t res = (code);                                          \
+        if (res != hipSuccess) {                                          \
+            DEME_ERROR_NOTHROW("GPU Error: %s", hipGetErrorString(res));  \
+        }                                                                 \
+    } while (0)
+
+#undef DEME_GPU_DISCARD
+#define DEME_GPU_DISCARD(code)                        \
+    do {                                                \
+        [[maybe_unused]] hipError_t _deme_gpu_res = (code); \
+    } while (0)
+#else
+#define DEME_GPU_CALL(code)                                                                                           \
+    do {                                                                                                              \
         cudaError_t res = (code);                                                                                     \
         if (res != cudaSuccess) {                                                                                     \
             DEME_ERROR(                                                                                               \
@@ -256,15 +290,22 @@ class Logger : private NonCopyable, public Singleton<Logger> {
                 "a visual rendering of the simulation before crash in the post.\n",                                   \
                 cudaGetErrorString(res));                                                                             \
         }                                                                                                             \
-    }
+    } while (0)
 
 #define DEME_GPU_CALL_NOTHROW(code)                                       \
-    {                                                                     \
+    do {                                                                  \
         cudaError_t res = (code);                                         \
         if (res != cudaSuccess) {                                         \
             DEME_ERROR_NOTHROW("GPU Error: %s", cudaGetErrorString(res)); \
         }                                                                 \
-    }
+    } while (0)
+
+#undef DEME_GPU_DISCARD
+#define DEME_GPU_DISCARD(code)                         \
+    do {                                              \
+        [[maybe_unused]] cudaError_t _deme_gpu_res = (code); \
+    } while (0)
+#endif
 
 #define DEME_GPU_CALL_WATCH_BETA(res) \
     { gpu_assert_watch_beta((res), __FILE__, __LINE__, *(stateParams.maxVel), *(stateParams.maxAngVel), true); }

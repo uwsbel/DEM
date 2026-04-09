@@ -3,86 +3,47 @@
 //
 //	SPDX-License-Identifier: BSD-3-Clause
 
-#include <cub/cub.cuh>
+#include "DEMCubCompact.hpp"
 #include <DEM/Defines.h>
 #include <DEM/Structs.h>
 
-#if CUDART_VERSION >= 13000
-    #define CUB_SUM_OP(T) \
-        cuda::std::plus<T> {}
+#if defined(DEME_USE_HIP) || !defined(CUDART_VERSION) || CUDART_VERSION < 13000
+    #define CUB_SUM_OP(T) demecub::Sum {}
 #else
-    #define CUB_SUM_OP(T) \
-        cub::Sum {}
-#endif
-
-#if CUDART_VERSION >= 13000
-    #define CUB_SUM_OP(T) \
-        cuda::std::plus<T> {}
-#else
-    #define CUB_SUM_OP(T) \
-        cub::Sum {}
+    #define CUB_SUM_OP(T) cuda::std::plus<T> {}
 #endif
 
 namespace deme {
 
-// Functor type for selecting values less than some criteria
+// Functor type for selecting values equal to some criterion.
 template <typename T>
 struct CubEqualTo {
     T compare;
-    CUB_RUNTIME_FUNCTION __forceinline__ CubEqualTo(T compare) : compare(compare) {}
-    CUB_RUNTIME_FUNCTION __forceinline__ bool operator()(const T& a) const { return (a == (T)compare); }
+    DEME_CUB_HDINLINE explicit CubEqualTo(T compare) : compare(compare) {}
+    DEME_CUB_HDINLINE bool operator()(const T& a) const { return (a == compare); }
 };
 
 struct CubFloat3Add {
-    CUB_RUNTIME_FUNCTION __forceinline__ __device__ __host__ float3 operator()(const float3& a, const float3& b) const {
+    DEME_CUB_HDINLINE float3 operator()(const float3& a, const float3& b) const {
         return ::make_float3(a.x + b.x, a.y + b.y, a.z + b.z);
-    }
-};
-
-template <typename T>
-struct CubOpAdd {
-    CUB_RUNTIME_FUNCTION __forceinline__ __device__ __host__ T operator()(const T& a, const T& b) const {
-        return a + b;
-    }
-};
-
-// Custom min and max functor
-template <typename T>
-struct CubOpMin {
-    CUB_RUNTIME_FUNCTION __forceinline__ __device__ __host__ T operator()(const T& a, const T& b) const {
-        return (b < a) ? b : a;
-    }
-};
-
-template <typename T>
-struct CubOpMax {
-    CUB_RUNTIME_FUNCTION __forceinline__ __device__ __host__ T operator()(const T& a, const T& b) const {
-        return (b > a) ? b : a;
     }
 };
 
 // Custom functor for finding the "max negative" value:
 // - Among negative values, find the one closest to zero (largest negative = smallest absolute value)
-// - Positive values are treated as having a huge negative value (very far from zero)
-// This is useful for finding the least-penetrating contact when all penetrations should be negative
+// - Positive values are treated as worse candidates than negative values
 template <typename T>
 struct CubOpMaxNegative {
-    CUB_RUNTIME_FUNCTION __forceinline__ __device__ __host__ T operator()(const T& a, const T& b) const {
-        // If both are negative, return the one closest to zero (max of the two negatives)
+    DEME_CUB_HDINLINE T operator()(const T& a, const T& b) const {
         if (a < 0 && b < 0) {
             return (b > a) ? b : a;
         }
-        // If only a is negative, prefer a
         if (a < 0) {
             return a;
         }
-        // If only b is negative, prefer b
         if (b < 0) {
             return b;
         }
-        // If both are positive (or zero), return the smaller one to penalize it
-        // But actually we want to return a very negative value to indicate invalid state
-        // Return the more negative of the two positive values (the smaller positive)
         return (a < b) ? a : b;
     }
 };
@@ -95,10 +56,13 @@ inline void cubDEMSelectFlagged(T1* d_in,
                                 size_t n,
                                 cudaStream_t& this_stream,
                                 DEMSolverScratchData& scratchPad) {
+    const int num_items = cubCount(n);
     size_t cub_scratch_bytes = 0;
-    cub::DeviceSelect::Flagged(NULL, cub_scratch_bytes, d_in, d_flags, d_out, d_num_out, n, this_stream);
+    DEME_GPU_CALL(demecub::DeviceSelect::Flagged(nullptr, cub_scratch_bytes, d_in, d_flags, d_out, d_num_out,
+                                                 num_items, this_stream));
     void* d_scratch_space = (void*)scratchPad.allocateScratchSpace(cub_scratch_bytes);
-    cub::DeviceSelect::Flagged(d_scratch_space, cub_scratch_bytes, d_in, d_flags, d_out, d_num_out, n, this_stream);
+    DEME_GPU_CALL(demecub::DeviceSelect::Flagged(d_scratch_space, cub_scratch_bytes, d_in, d_flags, d_out,
+                                                 d_num_out, num_items, this_stream));
 }
 
 template <typename T1, typename T2>
@@ -107,17 +71,13 @@ inline void cubDEMPrefixScan(T1* d_in,
                              size_t n,
                              cudaStream_t& this_stream,
                              DEMSolverScratchData& scratchPad) {
-    // NOTE!!! Why did I not use ExclusiveSum? I found that when for a cub scan operation, if the d_in and d_out are of
-    // different types, then cub defaults to use d_in type to store the scan result, but will switch to d_out type if
-    // there are too many items to scan. There is however, a region where cub does not choose to switch to d_out type,
-    // but d_in type is not big enough to store the scan result. This causes overflow and cub certainly does not care to
-    // let you know when it happens. I made a trick: use ExclusiveScan and (T2)0 as the initial value, and this forces
-    // cub to store results as T2 type.
+    const int num_items = cubCount(n);
     size_t cub_scratch_bytes = 0;
-    cub::DeviceScan::ExclusiveScan(NULL, cub_scratch_bytes, d_in, d_out, CUB_SUM_OP(T2), (T2)0, n, this_stream);
+    DEME_GPU_CALL(demecub::DeviceScan::ExclusiveScan(nullptr, cub_scratch_bytes, d_in, d_out, CUB_SUM_OP(T2),
+                                                     (T2)0, num_items, this_stream));
     void* d_scratch_space = (void*)scratchPad.allocateScratchSpace(cub_scratch_bytes);
-    cub::DeviceScan::ExclusiveScan(d_scratch_space, cub_scratch_bytes, d_in, d_out, CUB_SUM_OP(T2), (T2)0, n,
-                                   this_stream);
+    DEME_GPU_CALL(demecub::DeviceScan::ExclusiveScan(d_scratch_space, cub_scratch_bytes, d_in, d_out,
+                                                     CUB_SUM_OP(T2), (T2)0, num_items, this_stream));
 }
 
 template <typename T1, typename T2>
@@ -126,10 +86,13 @@ inline void cubDEMInclusiveScan(T1* d_in,
                                 size_t n,
                                 cudaStream_t& this_stream,
                                 DEMSolverScratchData& scratchPad) {
+    const int num_items = cubCount(n);
     size_t cub_scratch_bytes = 0;
-    cub::DeviceScan::InclusiveScan(NULL, cub_scratch_bytes, d_in, d_out, CUB_SUM_OP(T2), n, this_stream);
+    DEME_GPU_CALL(demecub::DeviceScan::InclusiveScan(nullptr, cub_scratch_bytes, d_in, d_out, CUB_SUM_OP(T2),
+                                                     num_items, this_stream));
     void* d_scratch_space = (void*)scratchPad.allocateScratchSpace(cub_scratch_bytes);
-    cub::DeviceScan::InclusiveScan(d_scratch_space, cub_scratch_bytes, d_in, d_out, CUB_SUM_OP(T2), n, this_stream);
+    DEME_GPU_CALL(demecub::DeviceScan::InclusiveScan(d_scratch_space, cub_scratch_bytes, d_in, d_out,
+                                                     CUB_SUM_OP(T2), num_items, this_stream));
 }
 
 template <typename T1>
@@ -138,12 +101,17 @@ inline void cubDEMSortKeys(T1* d_keys_in,
                            size_t n,
                            cudaStream_t& this_stream,
                            DEMSolverScratchData& scratchPad) {
+    const int num_items = cubCount(n);
     size_t cub_scratch_bytes = 0;
-    cub::DeviceRadixSort::SortKeys(NULL, cub_scratch_bytes, d_keys_in, d_keys_out, n, 0,
-                                   sizeof(T1) * DEME_BITS_PER_BYTE, this_stream);
+    DEME_GPU_CALL(demecub::DeviceRadixSort::SortKeys(nullptr, cub_scratch_bytes, d_keys_in, d_keys_out,
+                                                     num_items, 0,
+                                                     static_cast<int>(sizeof(T1) * DEME_BITS_PER_BYTE),
+                                                     this_stream));
     void* d_scratch_space = (void*)scratchPad.allocateScratchSpace(cub_scratch_bytes);
-    cub::DeviceRadixSort::SortKeys(d_scratch_space, cub_scratch_bytes, d_keys_in, d_keys_out, n, 0,
-                                   sizeof(T1) * DEME_BITS_PER_BYTE, this_stream);
+    DEME_GPU_CALL(demecub::DeviceRadixSort::SortKeys(d_scratch_space, cub_scratch_bytes, d_keys_in, d_keys_out,
+                                                     num_items, 0,
+                                                     static_cast<int>(sizeof(T1) * DEME_BITS_PER_BYTE),
+                                                     this_stream));
 }
 
 template <typename T1, typename T2>
@@ -154,12 +122,17 @@ inline void cubDEMSortByKeys(T1* d_keys_in,
                              size_t n,
                              cudaStream_t& this_stream,
                              DEMSolverScratchData& scratchPad) {
+    const int num_items = cubCount(n);
     size_t cub_scratch_bytes = 0;
-    cub::DeviceRadixSort::SortPairs(NULL, cub_scratch_bytes, d_keys_in, d_keys_out, d_vals_in, d_vals_out, n, 0,
-                                    sizeof(T1) * DEME_BITS_PER_BYTE, this_stream);
+    DEME_GPU_CALL(demecub::DeviceRadixSort::SortPairs(nullptr, cub_scratch_bytes, d_keys_in, d_keys_out,
+                                                      d_vals_in, d_vals_out, num_items, 0,
+                                                      static_cast<int>(sizeof(T1) * DEME_BITS_PER_BYTE),
+                                                      this_stream));
     void* d_scratch_space = (void*)scratchPad.allocateScratchSpace(cub_scratch_bytes);
-    cub::DeviceRadixSort::SortPairs(d_scratch_space, cub_scratch_bytes, d_keys_in, d_keys_out, d_vals_in, d_vals_out, n,
-                                    0, sizeof(T1) * DEME_BITS_PER_BYTE, this_stream);
+    DEME_GPU_CALL(demecub::DeviceRadixSort::SortPairs(d_scratch_space, cub_scratch_bytes, d_keys_in, d_keys_out,
+                                                      d_vals_in, d_vals_out, num_items, 0,
+                                                      static_cast<int>(sizeof(T1) * DEME_BITS_PER_BYTE),
+                                                      this_stream));
 }
 
 template <typename T1>
@@ -169,10 +142,13 @@ inline void cubDEMUnique(T1* d_in,
                          size_t n,
                          cudaStream_t& this_stream,
                          DEMSolverScratchData& scratchPad) {
+    const int num_items = cubCount(n);
     size_t cub_scratch_bytes = 0;
-    cub::DeviceSelect::Unique(NULL, cub_scratch_bytes, d_in, d_out, d_num_out, n, this_stream);
+    DEME_GPU_CALL(demecub::DeviceSelect::Unique(nullptr, cub_scratch_bytes, d_in, d_out, d_num_out, num_items,
+                                                this_stream));
     void* d_scratch_space = (void*)scratchPad.allocateScratchSpace(cub_scratch_bytes);
-    cub::DeviceSelect::Unique(d_scratch_space, cub_scratch_bytes, d_in, d_out, d_num_out, n, this_stream);
+    DEME_GPU_CALL(demecub::DeviceSelect::Unique(d_scratch_space, cub_scratch_bytes, d_in, d_out, d_num_out,
+                                                num_items, this_stream));
 }
 
 template <typename T1, typename T2>
@@ -183,12 +159,14 @@ inline void cubDEMRunLengthEncode(T1* d_in,
                                   size_t n,
                                   cudaStream_t& this_stream,
                                   DEMSolverScratchData& scratchPad) {
+    const int num_items = cubCount(n);
     size_t cub_scratch_bytes = 0;
-    cub::DeviceRunLengthEncode::Encode(NULL, cub_scratch_bytes, d_in, d_unique_out, d_counts_out, d_num_out, n,
-                                       this_stream);
+    DEME_GPU_CALL(demecub::DeviceRunLengthEncode::Encode(nullptr, cub_scratch_bytes, d_in, d_unique_out,
+                                                         d_counts_out, d_num_out, num_items, this_stream));
     void* d_scratch_space = (void*)scratchPad.allocateScratchSpace(cub_scratch_bytes);
-    cub::DeviceRunLengthEncode::Encode(d_scratch_space, cub_scratch_bytes, d_in, d_unique_out, d_counts_out, d_num_out,
-                                       n, this_stream);
+    DEME_GPU_CALL(demecub::DeviceRunLengthEncode::Encode(d_scratch_space, cub_scratch_bytes, d_in,
+                                                         d_unique_out, d_counts_out, d_num_out, num_items,
+                                                         this_stream));
 }
 
 template <typename T1, typename T2, typename T3>
@@ -201,36 +179,46 @@ inline void cubDEMReduceByKeys(T1* d_keys_in,
                                size_t n,
                                cudaStream_t& this_stream,
                                DEMSolverScratchData& scratchPad) {
+    const int num_items = cubCount(n);
     size_t cub_scratch_bytes = 0;
-    cub::DeviceReduce::ReduceByKey(NULL, cub_scratch_bytes, d_keys_in, d_unique_out, d_vals_in, d_aggregates_out,
-                                   d_num_out, reduce_op, n, this_stream);
+    DEME_GPU_CALL(demecub::DeviceReduce::ReduceByKey(nullptr, cub_scratch_bytes, d_keys_in, d_unique_out,
+                                                     d_vals_in, d_aggregates_out, d_num_out, reduce_op,
+                                                     num_items, this_stream));
     void* d_scratch_space = (void*)scratchPad.allocateScratchSpace(cub_scratch_bytes);
-    cub::DeviceReduce::ReduceByKey(d_scratch_space, cub_scratch_bytes, d_keys_in, d_unique_out, d_vals_in,
-                                   d_aggregates_out, d_num_out, reduce_op, n, this_stream);
+    DEME_GPU_CALL(demecub::DeviceReduce::ReduceByKey(d_scratch_space, cub_scratch_bytes, d_keys_in,
+                                                     d_unique_out, d_vals_in, d_aggregates_out, d_num_out,
+                                                     reduce_op, num_items, this_stream));
 }
 
 template <typename T1, typename T2>
 void cubDEMSum(T1* d_in, T2* d_out, size_t n, cudaStream_t& this_stream, DEMSolverScratchData& scratchPad) {
+    const int num_items = cubCount(n);
     size_t cub_scratch_bytes = 0;
-    cub::DeviceReduce::Reduce(NULL, cub_scratch_bytes, d_in, d_out, n, CUB_SUM_OP(T2), (T2)0, this_stream);
+    DEME_GPU_CALL(demecub::DeviceReduce::Reduce(nullptr, cub_scratch_bytes, d_in, d_out, num_items,
+                                                CUB_SUM_OP(T2), (T2)0, this_stream));
     void* d_scratch_space = (void*)scratchPad.allocateScratchSpace(cub_scratch_bytes);
-    cub::DeviceReduce::Reduce(d_scratch_space, cub_scratch_bytes, d_in, d_out, n, CUB_SUM_OP(T2), (T2)0, this_stream);
+    DEME_GPU_CALL(demecub::DeviceReduce::Reduce(d_scratch_space, cub_scratch_bytes, d_in, d_out, num_items,
+                                                CUB_SUM_OP(T2), (T2)0, this_stream));
 }
 
 template <typename T1>
 void cubDEMMax(T1* d_in, T1* d_out, size_t n, cudaStream_t& this_stream, DEMSolverScratchData& scratchPad) {
+    const int num_items = cubCount(n);
     size_t cub_scratch_bytes = 0;
-    cub::DeviceReduce::Max(NULL, cub_scratch_bytes, d_in, d_out, n, this_stream);
+    DEME_GPU_CALL(demecub::DeviceReduce::Max(nullptr, cub_scratch_bytes, d_in, d_out, num_items, this_stream));
     void* d_scratch_space = (void*)scratchPad.allocateScratchSpace(cub_scratch_bytes);
-    cub::DeviceReduce::Max(d_scratch_space, cub_scratch_bytes, d_in, d_out, n, this_stream);
+    DEME_GPU_CALL(demecub::DeviceReduce::Max(d_scratch_space, cub_scratch_bytes, d_in, d_out, num_items,
+                                             this_stream));
 }
 
 template <typename T1>
 void cubDEMMin(T1* d_in, T1* d_out, size_t n, cudaStream_t& this_stream, DEMSolverScratchData& scratchPad) {
+    const int num_items = cubCount(n);
     size_t cub_scratch_bytes = 0;
-    cub::DeviceReduce::Min(NULL, cub_scratch_bytes, d_in, d_out, n, this_stream);
+    DEME_GPU_CALL(demecub::DeviceReduce::Min(nullptr, cub_scratch_bytes, d_in, d_out, num_items, this_stream));
     void* d_scratch_space = (void*)scratchPad.allocateScratchSpace(cub_scratch_bytes);
-    cub::DeviceReduce::Min(d_scratch_space, cub_scratch_bytes, d_in, d_out, n, this_stream);
+    DEME_GPU_CALL(demecub::DeviceReduce::Min(d_scratch_space, cub_scratch_bytes, d_in, d_out, num_items,
+                                             this_stream));
 }
 
 }  // namespace deme

@@ -756,7 +756,7 @@ inline size_t find_array_offset(T1* arr, T1 elem, size_t n) {
 constexpr unsigned int hash_charr(const char* s, int off = 0) {
     return !s[off] ? 7001 : (hash_charr(s, off + 1) * 33) ^ s[off];
 }
-constexpr inline unsigned int operator"" _(const char* s, size_t) {
+constexpr inline unsigned int operator""_(const char* s, size_t) {
     return hash_charr(s);
 }
 

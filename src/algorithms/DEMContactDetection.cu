@@ -3,7 +3,7 @@
 //
 //	SPDX-License-Identifier: BSD-3-Clause
 
-#include <cub/cub.cuh>
+#include <core/utils/GpuRuntime.hpp>
 #include <kernel/DEMHelperKernels.cuh>
 
 #include <algorithms/DEMStaticDeviceSubroutines.h>
@@ -381,7 +381,7 @@ void contactDetection(std::shared_ptr<JitHelper::CachedProgram>& bin_sphere_kern
             bin_sphere_kernels->kernel("getNumberOfBinsEachSphereTouches")
                 .instantiate()
                 .configure(dim3(blocks_needed_for_bodies), dim3(DEME_NUM_BODIES_PER_BLOCK), 0, this_stream)
-                .launch(&simParams, &granData, numBinsSphereTouches, numAnalGeoSphereTouches);
+                .safe_launch(&simParams, &granData, numBinsSphereTouches, numAnalGeoSphereTouches);
 
             // 2nd step: prefix scan sphere--bin touching pairs
             // The last element of this scanned array is useful: it can be used to check if the 2 sweeps reach the same
@@ -443,7 +443,7 @@ void contactDetection(std::shared_ptr<JitHelper::CachedProgram>& bin_sphere_kern
             bin_sphere_kernels->kernel("populateBinSphereTouchingPairs")
                 .instantiate()
                 .configure(dim3(blocks_needed_for_bodies), dim3(DEME_NUM_BODIES_PER_BLOCK), 0, this_stream)
-                .launch(&simParams, &granData, numBinsSphereTouchesScan, numAnalGeoSphereTouchesScan,
+                .safe_launch(&simParams, &granData, numBinsSphereTouchesScan, numAnalGeoSphereTouchesScan,
                         binIDsEachSphereTouches, sphereIDsEachBinTouches, granData->idPrimitiveA,
                         granData->idPrimitiveB, granData->contactTypePrimitive);
             // std::cout << "Unsorted bin IDs: ";
@@ -564,7 +564,7 @@ void contactDetection(std::shared_ptr<JitHelper::CachedProgram>& bin_sphere_kern
             bin_triangle_kernels->kernel("makeTriangleSandwich")
                 .instantiate()
                 .configure(dim3(blocks_needed_for_tri), dim3(DEME_NUM_TRIANGLE_PER_BLOCK), 0, this_stream)
-                .launch(&simParams, &granData, sandwichANode1, sandwichANode2, sandwichANode3, sandwichBNode1);
+                .safe_launch(&simParams, &granData, sandwichANode1, sandwichANode2, sandwichANode3, sandwichBNode1);
 
             // 1st step: register the number of triangle--bin touching pairs for each triangle for further processing.
             // We also use the opportunity to find how many analytical objects each triangle touches.
@@ -609,13 +609,13 @@ if (simParams->nTriMeshes > 0) {
     bin_triangle_kernels->kernel("precomputeMeshOwnerPose")
         .instantiate()
         .configure(dim3(blocks_needed_for_mesh_owner), dim3(DEME_NUM_TRIANGLE_PER_BLOCK), 0, this_stream)
-        .launch(&simParams, &granData, meshOwnerPos, meshR1, meshR2, meshR3);
+        .safe_launch(&simParams, &granData, meshOwnerPos, meshR1, meshR2, meshR3);
 }
 
 bin_triangle_kernels->kernel("precomputeTriangleSandwichData")
     .instantiate()
     .configure(dim3(blocks_needed_for_tri), dim3(DEME_NUM_TRIANGLE_PER_BLOCK), 0, this_stream)
-    .launch(&simParams, &granData,
+    .safe_launch(&simParams, &granData,
             tri_vA1, tri_vB1, tri_vC1,
             tri_shift, tri_L1, tri_U1, tri_L2, tri_U2, tri_ok1, tri_ok2,
             meshOwnerPos, meshR1, meshR2, meshR3,
@@ -641,14 +641,14 @@ if (meshOwnerPos) {
                 bin_triangle_kernels->kernel("markCylPeriodicOwnerGhosts")
                     .instantiate()
                     .configure(dim3(blocks_needed_for_tri), dim3(DEME_NUM_TRIANGLE_PER_BLOCK), 0, this_stream)
-                    .launch(&simParams, &granData, tri_vA1, tri_vB1, tri_vC1, tri_shift,
+                    .safe_launch(&simParams, &granData, tri_vA1, tri_vB1, tri_vC1, tri_shift,
                             ownerGhostFlags);
             }
 
             bin_triangle_kernels->kernel("getNumberOfBinsEachTriangleTouches")
                 .instantiate()
                 .configure(dim3(blocks_needed_for_tri), dim3(DEME_NUM_TRIANGLE_PER_BLOCK), 0, this_stream)
-                .launch(&simParams, &granData, numBinsTriTouches, numAnalGeoTriTouches,
+                .safe_launch(&simParams, &granData, numBinsTriTouches, numAnalGeoTriTouches,
                         tri_vA1, tri_vB1, tri_vC1,
                         tri_shift, tri_L1, tri_U1, tri_L2, tri_U2, tri_ok1, tri_ok2, ownerGhostFlags,
                         solverFlags.meshUniversalContact);
@@ -724,7 +724,7 @@ if (meshOwnerPos) {
             bin_triangle_kernels->kernel("populateBinTriangleTouchingPairs")
                 .instantiate()
                 .configure(dim3(blocks_needed_for_tri), dim3(DEME_NUM_TRIANGLE_PER_BLOCK), 0, this_stream)
-                .launch(&simParams, &granData, numBinsTriTouchesScan, numAnalGeoTriTouchesScan,
+                .safe_launch(&simParams, &granData, numBinsTriTouchesScan, numAnalGeoTriTouchesScan,
                         binIDsEachTriTouches, triIDsEachBinTouches,
                         tri_vA1, tri_vB1, tri_vC1,
                         tri_shift, tri_L1, tri_U1, tri_L2, tri_U2, tri_ok1, tri_ok2, ownerGhostFlags,
@@ -889,7 +889,7 @@ if (meshOwnerPos) {
                 sphere_contact_kernels->kernel("getNumberOfSphereContactsEachBin")
                     .instantiate()
                     .configure(dim3(blocks_needed_for_bins_sph), dim3(DEME_KT_CD_NTHREADS_PER_BLOCK), 0, this_stream)
-                    .launch(&simParams, &granData, sphereIDsEachBinTouches_sorted, activeBinIDs, numSpheresBinTouches,
+                    .safe_launch(&simParams, &granData, sphereIDsEachBinTouches_sorted, activeBinIDs, numSpheresBinTouches,
                             sphereIDsLookUpTable, numSphContactsInEachBin, *pNumActiveBins);
             }
 
@@ -898,7 +898,7 @@ if (meshOwnerPos) {
                 sphTri_contact_kernels->kernel("getNumberOfTriangleContactsEachBin")
                     .instantiate()
                     .configure(dim3(blocks_needed_for_bins_tri), dim3(DEME_KT_CD_NTHREADS_PER_BLOCK), 0, this_stream)
-                    .launch(&simParams, &granData, sphereIDsEachBinTouches_sorted, activeBinIDs, numSpheresBinTouches,
+                    .safe_launch(&simParams, &granData, sphereIDsEachBinTouches_sorted, activeBinIDs, numSpheresBinTouches,
                             sphereIDsLookUpTable, mapTriActBinToSphActBin, triIDsEachBinTouches_sorted,
                             activeBinIDsForTri, numTrianglesBinTouches, triIDsLookUpTable, numTriSphContactsInEachBin,
                             numTriTriContactsInEachBin, tri_vA1, tri_vB1, tri_vC1, tri_shift,
@@ -1008,7 +1008,7 @@ if (meshOwnerPos) {
                 sphere_contact_kernels->kernel("populateSphereContactPairsEachBin")
                     .instantiate()
                     .configure(dim3(blocks_needed_for_bins_sph), dim3(DEME_KT_CD_NTHREADS_PER_BLOCK), 0, this_stream)
-                    .launch(&simParams, &granData, sphereIDsEachBinTouches_sorted, activeBinIDs, numSpheresBinTouches,
+                    .safe_launch(&simParams, &granData, sphereIDsEachBinTouches_sorted, activeBinIDs, numSpheresBinTouches,
                             sphereIDsLookUpTable, sphSphContactReportOffsets, idSphA, idSphB, dType, *pNumActiveBins);
             }
 
@@ -1033,7 +1033,7 @@ if (meshOwnerPos) {
                 sphTri_contact_kernels->kernel("populateTriangleContactsEachBin")
                     .instantiate()
                     .configure(dim3(blocks_needed_for_bins_tri), dim3(DEME_KT_CD_NTHREADS_PER_BLOCK), 0, this_stream)
-                    .launch(&simParams, &granData, sphereIDsEachBinTouches_sorted, activeBinIDs, numSpheresBinTouches,
+                    .safe_launch(&simParams, &granData, sphereIDsEachBinTouches_sorted, activeBinIDs, numSpheresBinTouches,
                             sphereIDsLookUpTable, mapTriActBinToSphActBin, triIDsEachBinTouches_sorted,
                             activeBinIDsForTri, numTrianglesBinTouches, triIDsLookUpTable, triSphContactReportOffsets,
                             triTriContactReportOffsets, idSphA_sm, idTriB_sm, dType_sm, idTriA_mm, idTriB_mm, dType_mm,

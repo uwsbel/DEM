@@ -12,9 +12,9 @@
 #include <cmath>
 
 #include "VariableTypes.h"
-#include "cuda_runtime.h"
+#include "core/utils/GpuRuntime.hpp"
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
     #define DEME_KERNEL extern "C" __global__
 #else
     #define DEME_KERNEL

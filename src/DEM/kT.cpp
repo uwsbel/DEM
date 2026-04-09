@@ -45,7 +45,8 @@ struct DynamicProduceReadyPayload {
     ThreadManager* sched = nullptr;
 };
 
-void CUDART_CB NotifyDynamicProduceReady(void* userData) {
+// Callback function for host function launch - works for both CUDA and HIP
+void NotifyDynamicProduceReady(void* userData) {
     auto* payload = static_cast<DynamicProduceReadyPayload*>(userData);
     if (payload && payload->sched) {
         payload->sched->dynamicOwned_Prod2ConsBuffer_isFresh.store(true, std::memory_order_release);
@@ -172,7 +173,7 @@ inline void DEMKinematicThread::computeMarginFromAbsv(float* absVel_owner, float
         misc_kernels->kernel("computeMarginFromAbsv_implSph")
             .instantiate()
             .configure(dim3(blocks_needed), dim3(DEME_MAX_THREADS_PER_BLOCK), 0, streamInfo.stream)
-            .launch(&simParams, &granData, absVel_owner, absAngVel_owner, &(stateParams.ts), &(stateParams.maxDrift),
+            .safe_launch(&simParams, &granData, absVel_owner, absAngVel_owner, &(stateParams.ts), &(stateParams.maxDrift),
                     (size_t)simParams->nSpheresGM);
     }
     blocks_needed = (simParams->nTriGM + DEME_MAX_THREADS_PER_BLOCK - 1) / DEME_MAX_THREADS_PER_BLOCK;
@@ -180,7 +181,7 @@ inline void DEMKinematicThread::computeMarginFromAbsv(float* absVel_owner, float
         misc_kernels->kernel("computeMarginFromAbsv_implTri")
             .instantiate()
             .configure(dim3(blocks_needed), dim3(DEME_MAX_THREADS_PER_BLOCK), 0, streamInfo.stream)
-            .launch(&simParams, &granData, absVel_owner, absAngVel_owner, &(stateParams.ts), &(stateParams.maxDrift),
+            .safe_launch(&simParams, &granData, absVel_owner, absAngVel_owner, &(stateParams.ts), &(stateParams.maxDrift),
                     &(stateParams.maxTriTriPenetration), solverFlags.meshUniversalContact, (size_t)simParams->nTriGM);
     }
     blocks_needed = (simParams->nAnalGM + DEME_MAX_THREADS_PER_BLOCK - 1) / DEME_MAX_THREADS_PER_BLOCK;
@@ -188,7 +189,7 @@ inline void DEMKinematicThread::computeMarginFromAbsv(float* absVel_owner, float
         misc_kernels->kernel("computeMarginFromAbsv_implAnal")
             .instantiate()
             .configure(dim3(blocks_needed), dim3(DEME_MAX_THREADS_PER_BLOCK), 0, streamInfo.stream)
-            .launch(&simParams, &granData, absVel_owner, absAngVel_owner, &(stateParams.ts), &(stateParams.maxDrift),
+            .safe_launch(&simParams, &granData, absVel_owner, absAngVel_owner, &(stateParams.ts), &(stateParams.maxDrift),
                     (size_t)simParams->nAnalGM);
     }
 }
@@ -671,7 +672,7 @@ void DEMKinematicThread::changeFamily(unsigned int ID_from, unsigned int ID_to) 
 
 void DEMKinematicThread::changeOwnerSizes(const std::vector<bodyID_t>& IDs, const std::vector<float>& factors) {
     // Set the gpu for this thread
-    cudaSetDevice(streamInfo.device);
+    DEME_GPU_CALL(cudaSetDevice(streamInfo.device));
     // cudaStream_t new_stream;
     // cudaStreamCreate(&new_stream);
 

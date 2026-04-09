@@ -1796,7 +1796,10 @@ class DEMSolver {
     int m_updateFreq = 20;
 
     // The extra libs that the kernels need to include.
-    std::string kernel_includes = "#include <curand_kernel.h>\n";
+    // Note: curand_kernel.h was previously included but is not actually used by any kernels.
+    // For HIP, we don't need any special includes here since HIPRTC handles standard types.
+    // For CUDA, if curand is needed in kernels, it should be included in the kernel files directly.
+    std::string kernel_includes = "";
 
     // If and how we should add boundaries to the simulation world upon initialization. Choose between none, all and
     // top_open.

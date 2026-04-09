@@ -147,7 +147,7 @@
 //
 // The function supports bounds gating via testA/testB: if one is false it is skipped.
 
-#include <cuda_runtime.h>
+#include "../core/utils/GpuRuntime.hpp"
 
 __device__ __forceinline__ bool _deme_sep_axis_fp32(float mn, float mx, float rad, float eps) {
     // Separating axis exists if interval [mn,mx] is entirely outside [-rad,rad]

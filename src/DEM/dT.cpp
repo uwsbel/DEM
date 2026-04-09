@@ -594,7 +594,7 @@ void DEMDynamicThread::setSimParams(unsigned char nvXp2,
 
 void DEMDynamicThread::changeOwnerSizes(const std::vector<bodyID_t>& IDs, const std::vector<float>& factors) {
     // Set the gpu for this thread
-    cudaSetDevice(streamInfo.device);
+    DEME_GPU_CALL(cudaSetDevice(streamInfo.device));
     // cudaStream_t new_stream;
     // cudaStreamCreate(&new_stream);
 
@@ -3075,7 +3075,7 @@ inline void DEMDynamicThread::dispatchPrimitiveForceKernels(
                 progName->kernel(kernelName)
                     .instantiate()
                     .configure(dim3(blocks), dim3(DT_FORCE_CALC_NTHREADS_PER_BLOCK), 0, streamInfo.stream)
-                    .launch(&simParams, &granData, startOffset, count);
+                    .safe_launch(&simParams, &granData, startOffset, count);
             }
         }
     }
@@ -3254,7 +3254,7 @@ inline void DEMDynamicThread::dispatchPatchBasedForceCorrections(
                             progName->kernel(kernelName)
                                 .instantiate()
                                 .configure(dim3(blocks), dim3(DT_FORCE_CALC_NTHREADS_PER_BLOCK), 0, streamInfo.stream)
-                                .launch(&simParams, &granData, finalAreas, finalNormals, finalPenetrations.data(),
+                                .safe_launch(&simParams, &granData, finalAreas, finalNormals, finalPenetrations.data(),
                                         finalContactPoints, startOffsetPatch, countPatch);
                         }
                     }
@@ -3362,7 +3362,7 @@ void DEMDynamicThread::calculateForces() {
             collect_force_kernels->kernel("forceToAcc")
                 .instantiate()
                 .configure(dim3(blocks_needed_for_contacts), dim3(DEME_MAX_THREADS_PER_BLOCK), 0, streamInfo.stream)
-                .launch(&simParams, &granData, nContactPairs);
+                .safe_launch(&simParams, &granData, nContactPairs);
             // displayDeviceArray<float>(granData->aZ, simParams->nOwnerBodies);
             // displayDeviceFloat3(granData->contactForces, nContactPairs);
             // std::cout << nContactPairs << std::endl;
@@ -3381,7 +3381,7 @@ inline void DEMDynamicThread::integrateOwnerMotions() {
     integrator_kernels->kernel("integrateOwners")
         .instantiate()
         .configure(dim3(blocks_needed_for_clumps), dim3(DEME_NUM_BODIES_PER_BLOCK), 0, streamInfo.stream)
-        .launch(&simParams, &granData, (double)simParams->dyn.timeElapsed);
+        .safe_launch(&simParams, &granData, (double)simParams->dyn.timeElapsed);
 
     // Cylindrical-periodic wildcard rotation is intentionally disabled here.
     // Contact-history vectors are already transformed in the force kernels (base <-> active image).
@@ -3402,7 +3402,7 @@ inline void DEMDynamicThread::routineChecks() {
         mod_kernels->kernel("applyFamilyChanges")
             .instantiate()
             .configure(dim3(blocks_needed_for_clumps), dim3(DEME_NUM_MODERATORS_PER_BLOCK), 0, streamInfo.stream)
-            .launch(&simParams, &granData, simParams->nOwnerBodies);
+            .safe_launch(&simParams, &granData, simParams->nOwnerBodies);
     }
 }
 
@@ -4140,7 +4140,7 @@ float* DEMDynamicThread::inspectCall(const std::shared_ptr<JitHelper::CachedProg
     inspection_kernel->kernel(kernel_name)
         .instantiate()
         .configure(dim3(blocks_needed), dim3(DEME_MAX_THREADS_PER_BLOCK), 0, streamInfo.stream)
-        .launch(&granData, &simParams, resArr, boolArrExclude, n, owner_type);
+        .safe_launch(&granData, &simParams, resArr, boolArrExclude, n, owner_type);
 
     if (all_domain) {
         switch (reduce_flavor) {

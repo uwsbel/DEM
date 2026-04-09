@@ -3,7 +3,7 @@
 //
 //	SPDX-License-Identifier: BSD-3-Clause
 
-#include <cub/cub.cuh>
+#include <core/utils/GpuRuntime.hpp>
 #include <algorithms/DEMStaticDeviceSubroutines.h>
 
 #include <algorithms/DEMCubWrappers.cu>
@@ -49,7 +49,7 @@ void cubSumReduceByKey(T1* d_keys_in,
                        size_t n,
                        cudaStream_t& this_stream,
                        DEMSolverScratchData& scratchPad) {
-    // I'm not sure how to pass cuda cub::Sum() as a template argument here, so I used a custom add...
+    // I'm not sure how to pass demecub::Sum() as a template argument here, so I used a custom add...
     CubOpAdd<T2> add_op;
     cubDEMReduceByKeys<T1, T2, CubOpAdd<T2>>(d_keys_in, d_unique_out, d_vals_in, d_aggregates_out, d_num_out, add_op, n,
                                              this_stream, scratchPad);
@@ -140,7 +140,7 @@ void cubMaxReduceByKey(T1* d_keys_in,
                        size_t n,
                        cudaStream_t& this_stream,
                        DEMSolverScratchData& scratchPad) {
-    // I'm not sure how to pass cuda cub::Max() as a template argument here, so I used a custom max...
+    // I'm not sure how to pass demecub::Max() as a template argument here, so I used a custom max...
     CubOpMax<T2> max_op;
     cubDEMReduceByKeys<T1, T2, CubOpMax<T2>>(d_keys_in, d_unique_out, d_vals_in, d_aggregates_out, d_num_out, max_op, n,
                                              this_stream, scratchPad);
@@ -226,7 +226,7 @@ void cubMinReduceByKey(T1* d_keys_in,
                        size_t n,
                        cudaStream_t& this_stream,
                        DEMSolverScratchData& scratchPad) {
-    // I'm not sure how to pass cuda cub::Min() as a template argument here, so I used a custom min...
+    // I'm not sure how to pass demecub::Min() as a template argument here, so I used a custom min...
     CubOpMin<T2> min_op;
     cubDEMReduceByKeys<T1, T2, CubOpMin<T2>>(d_keys_in, d_unique_out, d_vals_in, d_aggregates_out, d_num_out, min_op, n,
                                              this_stream, scratchPad);

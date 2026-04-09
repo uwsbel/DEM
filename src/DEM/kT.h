@@ -297,14 +297,14 @@ class DEMKinematicThread {
 
         timers.DestroyGpuEvents();
         if (streamSyncEvent) {
-            cudaEventDestroy(streamSyncEvent);
+            DEME_GPU_CALL_NOTHROW(cudaEventDestroy(streamSyncEvent));
             streamSyncEvent = nullptr;
         }
         if (kT_to_dT_BufferReadyEvent) {
-            cudaEventDestroy(kT_to_dT_BufferReadyEvent);
+            DEME_GPU_CALL_NOTHROW(cudaEventDestroy(kT_to_dT_BufferReadyEvent));
             kT_to_dT_BufferReadyEvent = nullptr;
         }
-        cudaStreamDestroy(streamInfo.stream);
+        DEME_GPU_CALL_NOTHROW(cudaStreamDestroy(streamInfo.stream));
 
         // deallocateEverything();
     }

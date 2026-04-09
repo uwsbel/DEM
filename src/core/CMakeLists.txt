@@ -6,23 +6,9 @@
 message(STATUS "==== Configuring Core Components ====")
 
 set (core_message "[core]")
-message(STATUS "${core_message} Generating API version header...")
-configure_file(
-	ApiVersion.h.in ApiVersion.h
-	#	USE_SOURCE_PERMISSIONS ## This doesn't work in CMake <3.20
-	@ONLY
-)
 
-message(STATUS "${core_message} Extracting NVIDIA Jitify header...") 
-configure_file(
-	${NVIDIAJitifyPath}/jitify.hpp
-	${CMAKE_BINARY_DIR}/src/jitify/jitify.hpp
-	COPYONLY
-)
-
-add_library(core OBJECT)
-
-# Capture CUDA include dirs from whichever variable is populated
+# Capture CUDA/HIP include dirs before generating ApiVersion.h so the runtime JIT path
+# can reuse the same include search list on both backends.
 set(_DEME_CUDA_INC_DIRS "${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}")
 if(NOT _DEME_CUDA_INC_DIRS AND DEFINED CUDAToolkit_INCLUDE_DIRS)
     set(_DEME_CUDA_INC_DIRS "${CUDAToolkit_INCLUDE_DIRS}")
@@ -31,29 +17,133 @@ if(NOT _DEME_CUDA_INC_DIRS AND DEFINED CUDA_INCLUDE_DIRS)
     set(_DEME_CUDA_INC_DIRS "${CUDA_INCLUDE_DIRS}")
 endif()
 
-target_compile_definitions(core PRIVATE
-    DEME_CUDA_TOOLKIT_INCLUDE_DIRS="$<JOIN:${_DEME_CUDA_INC_DIRS},;>"
+set(_DEME_HIP_INC_DIRS "")
+if(USE_HIP)
+    if(NOT ROCM_PATH)
+        foreach(_de_candidate "$ENV{ROCM_PATH}" "$ENV{ROCM_HOME}" "${CMAKE_HIP_COMPILER_ROCM_ROOT}" "/opt/rocm" "/usr/lib/rocm")
+            if(_de_candidate AND EXISTS "${_de_candidate}")
+                set(ROCM_PATH "${_de_candidate}")
+                break()
+            endif()
+        endforeach()
+    endif()
+
+    if(ROCM_PATH AND EXISTS "${ROCM_PATH}/include")
+        list(APPEND _DEME_HIP_INC_DIRS "${ROCM_PATH}/include")
+    endif()
+
+    set(_DEME_HIP_RESOURCE_DIR "")
+    if(CMAKE_HIP_COMPILER)
+        execute_process(
+            COMMAND "${CMAKE_HIP_COMPILER}" --print-resource-dir
+            OUTPUT_VARIABLE _DEME_HIP_RESOURCE_DIR
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+    endif()
+    if(NOT _DEME_HIP_RESOURCE_DIR)
+        find_program(_DEME_CLANG_FOR_HIP NAMES amdclang++ clang++ clang HINTS "${ROCM_PATH}/llvm/bin" "${ROCM_PATH}/bin")
+        if(_DEME_CLANG_FOR_HIP)
+            execute_process(
+                COMMAND "${_DEME_CLANG_FOR_HIP}" --print-resource-dir
+                OUTPUT_VARIABLE _DEME_HIP_RESOURCE_DIR
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET
+            )
+        endif()
+    endif()
+    if(_DEME_HIP_RESOURCE_DIR AND EXISTS "${_DEME_HIP_RESOURCE_DIR}/include")
+        list(APPEND _DEME_HIP_INC_DIRS "${_DEME_HIP_RESOURCE_DIR}/include")
+    endif()
+
+    if(UNIX AND EXISTS "/usr/include")
+        list(APPEND _DEME_HIP_INC_DIRS "/usr/include")
+    endif()
+endif()
+
+set(_DEME_GPU_JIT_INC_DIRS ${_DEME_CUDA_INC_DIRS} ${_DEME_HIP_INC_DIRS})
+list(REMOVE_DUPLICATES _DEME_GPU_JIT_INC_DIRS)
+
+# Only expose host-compiler include paths that are actually needed to compile DEME sources.
+# In HIP mode, the Clang resource directory is for hipRTC/JIT, not for regular C++ files compiled by g++.
+# Feeding that directory to host compilation breaks stddef/wchar processing on GCC.
+set(_DEME_GPU_HOST_INC_DIRS ${_DEME_CUDA_INC_DIRS})
+if(USE_HIP)
+    if(ROCM_PATH AND EXISTS "${ROCM_PATH}/include")
+        list(APPEND _DEME_GPU_HOST_INC_DIRS "${ROCM_PATH}/include")
+    endif()
+endif()
+list(REMOVE_DUPLICATES _DEME_GPU_HOST_INC_DIRS)
+
+set(DEME_GPU_TOOLKIT_HEADERS "")
+foreach(_de_inc_dir IN LISTS _DEME_GPU_JIT_INC_DIRS)
+    if(_de_inc_dir)
+        if(DEME_GPU_TOOLKIT_HEADERS)
+            string(APPEND DEME_GPU_TOOLKIT_HEADERS ";")
+        endif()
+        string(APPEND DEME_GPU_TOOLKIT_HEADERS "${_de_inc_dir}")
+    endif()
+endforeach()
+set(DEME_PROJECT_SOURCE_DIR "${CMAKE_SOURCE_DIR}")
+
+message(STATUS "${core_message} Generating API version header...")
+configure_file(
+	ApiVersion.h.in ApiVersion.h
+	#	USE_SOURCE_PERMISSIONS ## This doesn't work in CMake <3.20
+	@ONLY
 )
 
+if(USE_HIP)
+    message(STATUS "${core_message} HIP mode: Skipping Jitify (will use hipRTC)")
+    # Create empty jitify directory for HIP mode
+    file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/src/jitify)
+else()
+    message(STATUS "${core_message} Extracting NVIDIA Jitify header...") 
+    configure_file(
+        ${NVIDIAJitifyPath}/jitify.hpp
+        ${CMAKE_BINARY_DIR}/src/jitify/jitify.hpp
+        COPYONLY
+    )
+endif()
+
+add_library(core OBJECT)
 
 target_include_directories(
 	core
 	PUBLIC $<BUILD_INTERFACE:${ProjectIncludeSource}> $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 	PUBLIC $<BUILD_INTERFACE:${ProjectIncludeGenerated}> $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+	PUBLIC $<BUILD_INTERFACE:${_DEME_GPU_HOST_INC_DIRS}>
 )
 
+# Define DEME_USE_HIP for HIP builds to enable HIP code paths
+if(USE_HIP)
+    target_compile_definitions(core PUBLIC DEME_USE_HIP)
+    target_compile_options(core PRIVATE -Wno-attributes)
+endif()
 
-if(USE_CHPF)
-	target_link_libraries(
-		core
-		PUBLIC CUB::CUB
-		INTERFACE ${ChPF_IMPORTED_NAME}
-	)
+
+if(USE_HIP)
+    # hipCUB is header-only in our usage path; only ChPF needs an actual link dependency here.
+    if(USE_CHPF)
+        target_link_libraries(
+            core
+            INTERFACE ${ChPF_IMPORTED_NAME}
+        )
+    endif()
 else()
-	target_link_libraries(
-		core
-		PUBLIC CUB::CUB
-	)
+    # CUDA mode
+    if(USE_CHPF)
+        target_link_libraries(
+            core
+            PUBLIC CUB::CUB
+            INTERFACE ${ChPF_IMPORTED_NAME}
+        )
+    else()
+        target_link_libraries(
+            core
+            PUBLIC CUB::CUB
+        )
+    endif()
 endif()
 
 
@@ -71,6 +161,7 @@ set(core_headers
 	${CMAKE_CURRENT_SOURCE_DIR}/utils/Timer.hpp
 	${CMAKE_CURRENT_SOURCE_DIR}/utils/DataMigrationHelper.hpp
 	${CMAKE_CURRENT_SOURCE_DIR}/utils/DEMEPaths.h
+	${CMAKE_CURRENT_SOURCE_DIR}/utils/GpuRuntime.hpp
 	${CMAKE_CURRENT_SOURCE_DIR}/utils/RuntimeData.h
 )
 
@@ -112,12 +203,14 @@ install(
 )
 
 # Install Third-party Headers 
-install(
-	FILES 
-		"${NVIDIAJitifyPath}/jitify.hpp"
-	DESTINATION 
-		${CMAKE_INSTALL_INCLUDEDIR}/jitify
-)
+if(NOT USE_HIP AND EXISTS "${NVIDIAJitifyPath}/jitify.hpp")
+    install(
+    	FILES 
+    		"${NVIDIAJitifyPath}/jitify.hpp"
+    	DESTINATION 
+    		${CMAKE_INSTALL_INCLUDEDIR}/jitify
+    )
+endif()
 
 # --------------------------------------------------------- #
 # Runtime data path helper library 

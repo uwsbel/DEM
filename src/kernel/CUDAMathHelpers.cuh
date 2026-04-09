@@ -45,7 +45,7 @@
     #undef strtok_r
 #endif
 
-#include "cuda_runtime.h"
+#include "../core/utils/GpuRuntime.hpp"
 
 #ifndef EXIT_WAIVED
     #define EXIT_WAIVED 2
@@ -54,7 +54,7 @@
 using uint = unsigned int;
 using ushort = unsigned short;
 
-#ifndef __CUDACC__
+#if !defined(__CUDACC__) && !defined(__HIPCC__)
     ////////////////////////////////////////////////////////////////////////////////
     // override implementations of CUDA functions
     ////////////////////////////////////////////////////////////////////////////////
@@ -220,6 +220,8 @@ inline __host__ __device__ uint4 make_uint4(int4 a) {
 // negate
 ////////////////////////////////////////////////////////////////////////////////
 
+#ifndef DEME_USE_HIP
+// HIP already provides these operators, only define for CUDA
 inline __host__ __device__ float2 operator-(float2& a) {
     return make_float2(-a.x, -a.y);
 }
@@ -852,6 +854,7 @@ inline __host__ __device__ void operator/=(float4& a, float b) {
 inline __host__ __device__ float4 operator/(float b, float4 a) {
     return make_float4(b / a.x, b / a.y, b / a.z, b / a.w);
 }
+#endif // DEME_USE_HIP
 
 ////////////////////////////////////////////////////////////////////////////////
 // min
@@ -1194,6 +1197,37 @@ inline __device__ __host__ float smoothstep(float a, float b, float x) {
     float y = clamp((x - a) / (b - a), 0.0f, 1.0f);
     return (y * y * (3.0f - (2.0f * y)));
 }
+#ifdef DEME_USE_HIP
+// HIP already provides vector operators, use component-wise access
+inline __device__ __host__ float2 smoothstep(float2 a, float2 b, float2 x) {
+    float2 y;
+    y.x = clamp((x.x - a.x) / (b.x - a.x), 0.0f, 1.0f);
+    y.y = clamp((x.y - a.y) / (b.y - a.y), 0.0f, 1.0f);
+    return make_float2(y.x * y.x * (3.0f - (2.0f * y.x)), 
+                       y.y * y.y * (3.0f - (2.0f * y.y)));
+}
+inline __device__ __host__ float3 smoothstep(float3 a, float3 b, float3 x) {
+    float3 y;
+    y.x = clamp((x.x - a.x) / (b.x - a.x), 0.0f, 1.0f);
+    y.y = clamp((x.y - a.y) / (b.y - a.y), 0.0f, 1.0f);
+    y.z = clamp((x.z - a.z) / (b.z - a.z), 0.0f, 1.0f);
+    return make_float3(y.x * y.x * (3.0f - (2.0f * y.x)),
+                       y.y * y.y * (3.0f - (2.0f * y.y)),
+                       y.z * y.z * (3.0f - (2.0f * y.z)));
+}
+inline __device__ __host__ float4 smoothstep(float4 a, float4 b, float4 x) {
+    float4 y;
+    y.x = clamp((x.x - a.x) / (b.x - a.x), 0.0f, 1.0f);
+    y.y = clamp((x.y - a.y) / (b.y - a.y), 0.0f, 1.0f);
+    y.z = clamp((x.z - a.z) / (b.z - a.z), 0.0f, 1.0f);
+    y.w = clamp((x.w - a.w) / (b.w - a.w), 0.0f, 1.0f);
+    return make_float4(y.x * y.x * (3.0f - (2.0f * y.x)),
+                       y.y * y.y * (3.0f - (2.0f * y.y)),
+                       y.z * y.z * (3.0f - (2.0f * y.z)),
+                       y.w * y.w * (3.0f - (2.0f * y.w)));
+}
+#else
+// CUDA version with vector operators
 inline __device__ __host__ float2 smoothstep(float2 a, float2 b, float2 x) {
     float2 y = clamp((x - a) / (b - a), 0.0f, 1.0f);
     return (y * y * (make_float2(3.0f) - (make_float2(2.0f) * y)));
@@ -1206,6 +1240,7 @@ inline __device__ __host__ float4 smoothstep(float4 a, float4 b, float4 x) {
     float4 y = clamp((x - a) / (b - a), 0.0f, 1.0f);
     return (y * y * (make_float4(3.0f) - (make_float4(2.0f) * y)));
 }
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////
 // A few float3 and double3 operators are not in the cuda toolkit are added by Ruochun
@@ -1453,7 +1488,14 @@ inline __host__ __device__ T2 to_real3(const T1& a) {
 }
 
 // Cause an error inside a kernel
-#if defined(__CUDA_ARCH__) || defined(__CUDACC__)
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_DEVICE_COMPILE__) || defined(__HIPCC__)
+    #define DEME_ABORT_KERNEL(...) \
+        {                          \
+            printf(__VA_ARGS__);   \
+            __threadfence();       \
+            __builtin_trap();      \
+        }
+#elif defined(__CUDA_ARCH__) || defined(__CUDACC__)
     #define DEME_ABORT_KERNEL(...) \
         {                          \
             printf(__VA_ARGS__);   \

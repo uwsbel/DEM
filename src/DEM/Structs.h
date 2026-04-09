@@ -209,11 +209,11 @@ struct StreamEventTimerSpan {
     void destroy() {
         for (auto& slot : slots) {
             if (slot.start) {
-                cudaEventDestroy(slot.start);
+                DEME_GPU_CALL_NOTHROW(cudaEventDestroy(slot.start));
                 slot.start = nullptr;
             }
             if (slot.stop) {
-                cudaEventDestroy(slot.stop);
+                DEME_GPU_CALL_NOTHROW(cudaEventDestroy(slot.stop));
                 slot.stop = nullptr;
             }
             slot.started = false;
@@ -283,11 +283,11 @@ struct StreamEventTimerSpan {
         cudaError_t q = cudaEventQuery(slot.stop);
         if (q == cudaErrorNotReady) {
             if (!allow_sync) {
-                (void)cudaGetLastError();
+                DEME_GPU_DISCARD(cudaGetLastError());
                 return false;
             }
             // Clear the sticky error and wait only for the timed span.
-            (void)cudaGetLastError();
+            DEME_GPU_DISCARD(cudaGetLastError());
             DEME_GPU_CALL(cudaEventSynchronize(slot.stop));
         } else {
             DEME_GPU_CALL(q);

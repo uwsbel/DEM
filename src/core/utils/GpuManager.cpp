@@ -5,6 +5,7 @@
 #include <core/ApiVersion.h>
 #include "GpuManager.h"
 #include "Logger.hpp"
+#include "GpuRuntime.hpp"
 
 namespace deme {
 
@@ -43,7 +44,7 @@ GpuManager::~GpuManager() {
     }
 }
 
-// TODO: add CUDA error checking
+// TODO: add GPU error checking
 int GpuManager::scanNumDevices() {
     int ndevices = 0;
     DEME_GPU_CALL(cudaGetDeviceCount(&ndevices));
