@@ -296,6 +296,12 @@ struct DEMSimParams {
     bodyID_t nOwnerClumps;
     objID_t nExtObj;
     bodyID_t nTriMeshes;
+    // Owner-level specialization for very large rigid mesh owners in kT.
+    bodyID_t nBigMeshOwners = 0;
+    bodyID_t bigMeshOwnerTriThreshold = 15000;
+    bodyID_t maxBigMeshOwnerTriCount = 0;
+    bodyID_t nBigMeshBVHLeaves = 0;
+    bodyID_t bigMeshBVHLeafTriCap = 128;
 
     // Number of the templates (or say the ``types'') of clumps and spheres
     unsigned int nDistinctClumpBodyTopologies;
@@ -550,6 +556,21 @@ struct DEMDataKT {
     clumpComponentOffset_t* clumpComponentOffset;
     clumpComponentOffsetExt_t* clumpComponentOffsetExt;
     bodyID_t* ownerTriMesh;
+    bodyID_t* ownerTriStart;
+    bodyID_t* ownerTriCount;
+    notStupidBool_t* ownerIsBigMesh;
+    bodyID_t* bigMeshOwners;
+    bodyID_t* ownerBigMeshLeafStart;
+    bodyID_t* ownerBigMeshLeafCount;
+    bodyID_t* bigMeshLeafOwner;
+    bodyID_t* bigMeshLeafTriStart;
+    bodyID_t* bigMeshLeafTriCount;
+    bodyID_t* bigMeshLeafTriIDs;
+    float3* bigMeshLeafLocalMin;
+    float3* bigMeshLeafLocalMax;
+    float* bigMeshLeafMaxCentroidRadius;
+    float* bigMeshLeafMaxExpandCoeff;
+    float* bigMeshLeafMargin;
     bodyID_t* ownerAnalBody;
     notStupidBool_t* ownerMeshConvex;
     notStupidBool_t* ownerMeshNeverWinner;

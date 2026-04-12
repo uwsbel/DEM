@@ -41,9 +41,16 @@ DEME_KERNEL void makeTriangleSandwich(deme::DEMSimParams* simParams,
                                      float3* sandwichANode1,
                                      float3* sandwichANode2,
                                      float3* sandwichANode3,
-                                     float3* sandwichBNode1) {
+                                     float3* sandwichBNode1,
+                                     bool skipBigMeshOwners) {
     deme::bodyID_t triID = blockIdx.x * blockDim.x + threadIdx.x;
     if (triID < simParams->nTriGM) {
+        if (skipBigMeshOwners && granData->ownerIsBigMesh) {
+            const deme::bodyID_t ownerID = granData->ownerTriMesh[triID];
+            if (granData->ownerIsBigMesh[ownerID]) {
+                return;
+            }
+        }
         // Get my component offset info from global array
         const float3 p1 = granData->relPosNode1[triID];
         const float3 p2 = granData->relPosNode2[triID];
@@ -116,6 +123,53 @@ DEME_KERNEL void precomputeMeshOwnerPose(deme::DEMSimParams* simParams,
 
 inline __device__ float3 applyRotRows(const float3& v, const float3& r1, const float3& r2, const float3& r3) {
     return make_float3(dot(r1, v), dot(r2, v), dot(r3, v));
+}
+
+inline __device__ void loadOwnerPoseRows(deme::DEMSimParams* simParams,
+                                         deme::DEMDataKT* granData,
+                                         const deme::bodyID_t ownerID,
+                                         const float3* meshOwnerPos,
+                                         const float3* meshR1,
+                                         const float3* meshR2,
+                                         const float3* meshR3,
+                                         float3& ownerXYZ,
+                                         float3& r1,
+                                         float3& r2,
+                                         float3& r3) {
+    const deme::bodyID_t mesh_owner_start = simParams->nOwnerBodies - simParams->nTriMeshes;
+
+    if (simParams->nTriMeshes > 0 && meshOwnerPos && ownerID >= mesh_owner_start &&
+        ownerID < (mesh_owner_start + (deme::bodyID_t)simParams->nTriMeshes)) {
+        const deme::bodyID_t mi = ownerID - mesh_owner_start;
+        ownerXYZ = meshOwnerPos[mi];
+        r1 = meshR1[mi];
+        r2 = meshR2[mi];
+        r3 = meshR3[mi];
+        return;
+    }
+
+    voxelIDToPosition<float, deme::voxelID_t, deme::subVoxelPos_t>(
+        ownerXYZ.x, ownerXYZ.y, ownerXYZ.z, granData->voxelID[ownerID], granData->locX[ownerID],
+        granData->locY[ownerID], granData->locZ[ownerID], _nvXp2_, _nvYp2_, _voxelSize_, _l_);
+
+    const float qw = granData->oriQw[ownerID];
+    const float qx = granData->oriQx[ownerID];
+    const float qy = granData->oriQy[ownerID];
+    const float qz = granData->oriQz[ownerID];
+
+    const float xx = qx * qx;
+    const float yy = qy * qy;
+    const float zz = qz * qz;
+    const float xy = qx * qy;
+    const float xz = qx * qz;
+    const float yz = qy * qz;
+    const float wx = qw * qx;
+    const float wy = qw * qy;
+    const float wz = qw * qz;
+
+    r1 = make_float3(1.f - 2.f * (yy + zz), 2.f * (xy - wz),       2.f * (xz + wy));
+    r2 = make_float3(2.f * (xy + wz),       1.f - 2.f * (xx + zz), 2.f * (yz - wx));
+    r3 = make_float3(2.f * (xz - wy),       2.f * (yz + wx),       1.f - 2.f * (xx + yy));
 }
 
 
@@ -211,26 +265,20 @@ inline __device__ bool figureOutNodeAndBoundingBox(deme::DEMSimParams* simParams
 
 DEME_KERNEL void precomputeTriangleSandwichData(deme::DEMSimParams* simParams,
                                                deme::DEMDataKT* granData,
-                                               // World-space vertices for A-face triangle
                                                float3* vA1_all,
                                                float3* vB1_all,
                                                float3* vC1_all,
-                                               // Per-triangle translation B = A + shift_world (world-space)
                                                float3* shift_world_all,
-                                               // Per-triangle bounds for A and B (only valid if ok flag true)
                                                int3* LA_all,
                                                int3* UA_all,
                                                int3* LB_all,
                                                int3* UB_all,
-                                               // ok flags for A and B
                                                unsigned char* ok1_all,
                                                unsigned char* ok2_all,
-                                               // Precomputed mesh-owner pose (length nTriMeshes); may be nullptr if no meshes
                                                const float3* meshOwnerPos,
                                                const float3* meshR1,
                                                const float3* meshR2,
                                                const float3* meshR3,
-                                               // sandwich nodes (local, as produced by makeTriangleSandwich)
                                                const float3* nodeA1,
                                                const float3* nodeA2,
                                                const float3* nodeA3,
@@ -241,76 +289,38 @@ DEME_KERNEL void precomputeTriangleSandwichData(deme::DEMSimParams* simParams,
     }
 
     const deme::bodyID_t ownerID = granData->ownerTriMesh[triID];
-    const deme::bodyID_t mesh_owner_start = simParams->nOwnerBodies - simParams->nTriMeshes;
+    if (granData->ownerIsBigMesh && granData->ownerIsBigMesh[ownerID]) {
+        return;
+    }
 
     float3 ownerXYZ;
     float3 r1, r2, r3;
+    loadOwnerPoseRows(simParams, granData, ownerID, meshOwnerPos, meshR1, meshR2, meshR3, ownerXYZ, r1, r2, r3);
 
-    // Fast path: mesh owners live in [mesh_owner_start, mesh_owner_start + nTriMeshes)
-    if (simParams->nTriMeshes > 0 && meshOwnerPos && ownerID >= mesh_owner_start &&
-        ownerID < (mesh_owner_start + (deme::bodyID_t)simParams->nTriMeshes)) {
-        const deme::bodyID_t mi = ownerID - mesh_owner_start;
-        ownerXYZ = meshOwnerPos[mi];
-        r1 = meshR1[mi];
-        r2 = meshR2[mi];
-        r3 = meshR3[mi];
-    } else {
-        // Fallback: compute pose directly
-        voxelIDToPosition<float, deme::voxelID_t, deme::subVoxelPos_t>(
-            ownerXYZ.x, ownerXYZ.y, ownerXYZ.z, granData->voxelID[ownerID], granData->locX[ownerID],
-            granData->locY[ownerID], granData->locZ[ownerID], _nvXp2_, _nvYp2_, _voxelSize_, _l_);
-
-        const float qw = granData->oriQw[ownerID];
-        const float qx = granData->oriQx[ownerID];
-        const float qy = granData->oriQy[ownerID];
-        const float qz = granData->oriQz[ownerID];
-
-        const float xx = qx * qx;
-        const float yy = qy * qy;
-        const float zz = qz * qz;
-        const float xy = qx * qy;
-        const float xz = qx * qz;
-        const float yz = qy * qz;
-        const float wx = qw * qx;
-        const float wy = qw * qy;
-        const float wz = qw * qz;
-
-        r1 = make_float3(1.f - 2.f * (yy + zz), 2.f * (xy - wz),       2.f * (xz + wy));
-        r2 = make_float3(2.f * (xy + wz),       1.f - 2.f * (xx + zz), 2.f * (yz - wx));
-        r3 = make_float3(2.f * (xz - wy),       2.f * (yz + wx),       1.f - 2.f * (xx + yy));
-    }
-
-    // Transform A-face nodes to world.
     const float3 lA1 = nodeA1[triID];
     const float3 lA2 = nodeA2[triID];
     const float3 lA3 = nodeA3[triID];
-
     const float3 vA1 = ownerXYZ + applyRotRows(lA1, r1, r2, r3);
     const float3 vB1 = ownerXYZ + applyRotRows(lA2, r1, r2, r3);
     const float3 vC1 = ownerXYZ + applyRotRows(lA3, r1, r2, r3);
-
     vA1_all[triID] = vA1;
     vB1_all[triID] = vB1;
     vC1_all[triID] = vC1;
 
-    // Compute shift_world from B1 - A1 in local, then rotate (no translation).
     const float3 lB1 = nodeB1_only[triID];
     float3 shift_local = make_float3(lB1.x - lA1.x, lB1.y - lA1.y, lB1.z - lA1.z);
     const float3 shift_world = applyRotRows(shift_local, r1, r2, r3);
     shift_world_all[triID] = shift_world;
 
-    // Compute bounds for A and B (B is reconstructed from A + shift; note permutation for opposite normal).
     deme::binID_t L1[3], U1[3], L2[3], U2[3];
     const bool ok1 = boundingBoxIntersectBinAxisBounds(L1, U1, vA1, vB1, vC1, simParams);
-
     const float3 vA2 = vA1 + shift_world;
-    const float3 vB2 = vC1 + shift_world;  // swap 2<->3 for inverted normal
+    const float3 vB2 = vC1 + shift_world;
     const float3 vC2 = vB1 + shift_world;
     const bool ok2 = boundingBoxIntersectBinAxisBounds(L2, U2, vA2, vB2, vC2, simParams);
 
     ok1_all[triID] = (unsigned char)(ok1 ? 1 : 0);
     ok2_all[triID] = (unsigned char)(ok2 ? 1 : 0);
-
     if (ok1) {
         LA_all[triID] = make_int3(L1[0], L1[1], L1[2]);
         UA_all[triID] = make_int3(U1[0], U1[1], U1[2]);
@@ -318,6 +328,504 @@ DEME_KERNEL void precomputeTriangleSandwichData(deme::DEMSimParams* simParams,
     if (ok2) {
         LB_all[triID] = make_int3(L2[0], L2[1], L2[2]);
         UB_all[triID] = make_int3(U2[0], U2[1], U2[2]);
+    }
+}
+
+DEME_KERNEL void precomputeTriangleSandwichDataBigMeshOwners(deme::DEMSimParams* simParams,
+                                                             deme::DEMDataKT* granData,
+                                                             float3* vA1_all,
+                                                             float3* vB1_all,
+                                                             float3* vC1_all,
+                                                             float3* shift_world_all,
+                                                             int3* LA_all,
+                                                             int3* UA_all,
+                                                             int3* LB_all,
+                                                             int3* UB_all,
+                                                             unsigned char* ok1_all,
+                                                             unsigned char* ok2_all,
+                                                             const float3* meshOwnerPos,
+                                                             const float3* meshR1,
+                                                             const float3* meshR2,
+                                                             const float3* meshR3,
+                                                             const float3* nodeA1,
+                                                             const float3* nodeA2,
+                                                             const float3* nodeA3,
+                                                             const float3* nodeB1_only,
+                                                             bool writeBinBounds) {
+    const deme::bodyID_t bigOwnerIdx = blockIdx.x;
+    if (bigOwnerIdx >= simParams->nBigMeshOwners) {
+        return;
+    }
+
+    const deme::bodyID_t ownerID = granData->bigMeshOwners[bigOwnerIdx];
+    const deme::bodyID_t triStart = granData->ownerTriStart[ownerID];
+    const deme::bodyID_t triCount = granData->ownerTriCount[ownerID];
+    const deme::bodyID_t triLocal = blockIdx.y * blockDim.x + threadIdx.x;
+    if (triLocal >= triCount) {
+        return;
+    }
+
+    __shared__ float3 s_ownerXYZ;
+    __shared__ float3 s_r1;
+    __shared__ float3 s_r2;
+    __shared__ float3 s_r3;
+    if (threadIdx.x == 0) {
+        loadOwnerPoseRows(simParams, granData, ownerID, meshOwnerPos, meshR1, meshR2, meshR3, s_ownerXYZ, s_r1, s_r2,
+                          s_r3);
+    }
+    __syncthreads();
+
+    const deme::bodyID_t triID = triStart + triLocal;
+    const float3 lA1 = nodeA1[triID];
+    const float3 lA2 = nodeA2[triID];
+    const float3 lA3 = nodeA3[triID];
+    const float3 vA1 = s_ownerXYZ + applyRotRows(lA1, s_r1, s_r2, s_r3);
+    const float3 vB1 = s_ownerXYZ + applyRotRows(lA2, s_r1, s_r2, s_r3);
+    const float3 vC1 = s_ownerXYZ + applyRotRows(lA3, s_r1, s_r2, s_r3);
+    vA1_all[triID] = vA1;
+    vB1_all[triID] = vB1;
+    vC1_all[triID] = vC1;
+
+    const float3 lB1 = nodeB1_only[triID];
+    float3 shift_local = make_float3(lB1.x - lA1.x, lB1.y - lA1.y, lB1.z - lA1.z);
+    const float3 shift_world = applyRotRows(shift_local, s_r1, s_r2, s_r3);
+    shift_world_all[triID] = shift_world;
+
+    if (!writeBinBounds) {
+        return;
+    }
+
+    deme::binID_t L1[3], U1[3], L2[3], U2[3];
+    const bool ok1 = boundingBoxIntersectBinAxisBounds(L1, U1, vA1, vB1, vC1, simParams);
+    const float3 vA2 = vA1 + shift_world;
+    const float3 vB2 = vC1 + shift_world;
+    const float3 vC2 = vB1 + shift_world;
+    const bool ok2 = boundingBoxIntersectBinAxisBounds(L2, U2, vA2, vB2, vC2, simParams);
+
+    ok1_all[triID] = (unsigned char)(ok1 ? 1 : 0);
+    ok2_all[triID] = (unsigned char)(ok2 ? 1 : 0);
+    if (ok1) {
+        LA_all[triID] = make_int3(L1[0], L1[1], L1[2]);
+        UA_all[triID] = make_int3(U1[0], U1[1], U1[2]);
+    }
+    if (ok2) {
+        LB_all[triID] = make_int3(L2[0], L2[1], L2[2]);
+        UB_all[triID] = make_int3(U2[0], U2[1], U2[2]);
+    }
+}
+
+
+inline __device__ void updateMinMax3(float3& mn, float3& mx, const float3& p) {
+    mn.x = fminf(mn.x, p.x);
+    mn.y = fminf(mn.y, p.y);
+    mn.z = fminf(mn.z, p.z);
+    mx.x = fmaxf(mx.x, p.x);
+    mx.y = fmaxf(mx.y, p.y);
+    mx.z = fmaxf(mx.z, p.z);
+}
+
+inline __device__ void mergeMinMax3(float3& mn, float3& mx, const float3& otherMin, const float3& otherMax) {
+    mn.x = fminf(mn.x, otherMin.x);
+    mn.y = fminf(mn.y, otherMin.y);
+    mn.z = fminf(mn.z, otherMin.z);
+    mx.x = fmaxf(mx.x, otherMax.x);
+    mx.y = fmaxf(mx.y, otherMax.y);
+    mx.z = fmaxf(mx.z, otherMax.z);
+}
+
+inline __device__ size_t lowerBoundBinID(const deme::binID_t* data,
+                                         size_t first,
+                                         size_t last,
+                                         const deme::binID_t value) {
+    while (first < last) {
+        const size_t mid = first + ((last - first) >> 1);
+        if (data[mid] < value) {
+            first = mid + 1;
+        } else {
+            last = mid;
+        }
+    }
+    return first;
+}
+
+inline __device__ size_t upperBoundBinID(const deme::binID_t* data,
+                                         size_t first,
+                                         size_t last,
+                                         const deme::binID_t value) {
+    while (first < last) {
+        const size_t mid = first + ((last - first) >> 1);
+        if (data[mid] <= value) {
+            first = mid + 1;
+        } else {
+            last = mid;
+        }
+    }
+    return first;
+}
+
+inline __device__ void accumulateSandwichWorldBounds(const float3& vA1,
+                                                     const float3& vB1,
+                                                     const float3& vC1,
+                                                     const float3& shift_world,
+                                                     float3& mn,
+                                                     float3& mx) {
+    const float3 vA2 = vA1 + shift_world;
+    const float3 vB2 = vC1 + shift_world;
+    const float3 vC2 = vB1 + shift_world;
+    updateMinMax3(mn, mx, vA1);
+    updateMinMax3(mn, mx, vB1);
+    updateMinMax3(mn, mx, vC1);
+    updateMinMax3(mn, mx, vA2);
+    updateMinMax3(mn, mx, vB2);
+    updateMinMax3(mn, mx, vC2);
+}
+
+inline __device__ bool axisAlignedBoundsToBinBounds(deme::binID_t* L,
+                                                    deme::binID_t* U,
+                                                    const float3& min_pt_in,
+                                                    const float3& max_pt_in,
+                                                    deme::DEMSimParams* simParams) {
+    float3 min_pt = min_pt_in;
+    float3 max_pt = max_pt_in;
+    const float enlarge = (float)DEME_BIN_ENLARGE_RATIO_FOR_FACETS * (float)simParams->dyn.binSize;
+    min_pt -= enlarge;
+    max_pt += enlarge;
+
+    const double invBinSize = simParams->dyn.inv_binSize;
+    const int nbX = (int)simParams->nbX;
+    const int nbY = (int)simParams->nbY;
+    const int nbZ = (int)simParams->nbZ;
+
+    const double cx = 0.5 * ((double)min_pt.x + (double)max_pt.x);
+    const double rx = 0.5 * ((double)max_pt.x - (double)min_pt.x);
+    const deme::AxisBounds bx = axis_bounds(cx, rx, nbX, invBinSize);
+    if (bx.imax < bx.imin)
+        return false;
+
+    const double cy = 0.5 * ((double)min_pt.y + (double)max_pt.y);
+    const double ry = 0.5 * ((double)max_pt.y - (double)min_pt.y);
+    const deme::AxisBounds by = axis_bounds(cy, ry, nbY, invBinSize);
+    if (by.imax < by.imin)
+        return false;
+
+    const double cz = 0.5 * ((double)min_pt.z + (double)max_pt.z);
+    const double rz = 0.5 * ((double)max_pt.z - (double)min_pt.z);
+    const deme::AxisBounds bz = axis_bounds(cz, rz, nbZ, invBinSize);
+    if (bz.imax < bz.imin)
+        return false;
+
+    L[0] = (deme::binID_t)bx.imin;
+    U[0] = (deme::binID_t)bx.imax;
+    L[1] = (deme::binID_t)by.imin;
+    U[1] = (deme::binID_t)by.imax;
+    L[2] = (deme::binID_t)bz.imin;
+    U[2] = (deme::binID_t)bz.imax;
+    return true;
+}
+
+DEME_KERNEL void computeBigMeshLeafWorldBounds(deme::DEMSimParams* simParams,
+                                               deme::DEMDataKT* granData,
+                                               float3* leafWorldMin,
+                                               float3* leafWorldMax,
+                                               const float3* vA1_all,
+                                               const float3* vB1_all,
+                                               const float3* vC1_all,
+                                               const float3* shift_world_all) {
+    const deme::bodyID_t leafID = blockIdx.x;
+    if (leafID >= simParams->nBigMeshBVHLeaves) {
+        return;
+    }
+
+    const deme::bodyID_t triStart = granData->bigMeshLeafTriStart[leafID];
+    const deme::bodyID_t triCount = granData->bigMeshLeafTriCount[leafID];
+
+    float3 myMin = make_float3(1e30f, 1e30f, 1e30f);
+    float3 myMax = make_float3(-1e30f, -1e30f, -1e30f);
+    for (deme::bodyID_t local = threadIdx.x; local < triCount; local += blockDim.x) {
+        const deme::bodyID_t triID = granData->bigMeshLeafTriIDs[triStart + local];
+        accumulateSandwichWorldBounds(vA1_all[triID], vB1_all[triID], vC1_all[triID], shift_world_all[triID], myMin,
+                                      myMax);
+    }
+
+    __shared__ float3 sMin[DEME_NUM_TRIANGLE_PER_BLOCK];
+    __shared__ float3 sMax[DEME_NUM_TRIANGLE_PER_BLOCK];
+    sMin[threadIdx.x] = myMin;
+    sMax[threadIdx.x] = myMax;
+    __syncthreads();
+
+    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            mergeMinMax3(sMin[threadIdx.x], sMax[threadIdx.x], sMin[threadIdx.x + stride],
+                         sMax[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        leafWorldMin[leafID] = sMin[0];
+        leafWorldMax[leafID] = sMax[0];
+    }
+}
+
+DEME_KERNEL void countBinsEachBigMeshLeafTouches(deme::DEMSimParams* simParams,
+                                                 deme::binsTriangleTouches_t* numBinsEachLeafTouches,
+                                                 int3* leafL,
+                                                 int3* leafU,
+                                                 unsigned char* leafOk,
+                                                 const float3* leafWorldMin,
+                                                 const float3* leafWorldMax) {
+    const deme::bodyID_t leafID = blockIdx.x * blockDim.x + threadIdx.x;
+    if (leafID >= simParams->nBigMeshBVHLeaves) {
+        return;
+    }
+
+    deme::binID_t L[3], U[3];
+    const bool ok = axisAlignedBoundsToBinBounds(L, U, leafWorldMin[leafID], leafWorldMax[leafID], simParams);
+    leafOk[leafID] = (unsigned char)(ok ? 1 : 0);
+    if (!ok) {
+        numBinsEachLeafTouches[leafID] = 0;
+        return;
+    }
+    leafL[leafID] = make_int3(L[0], L[1], L[2]);
+    leafU[leafID] = make_int3(U[0], U[1], U[2]);
+    numBinsEachLeafTouches[leafID] =
+        (deme::binsTriangleTouches_t)((U[0] - L[0] + 1) * (U[1] - L[1] + 1) * (U[2] - L[2] + 1));
+}
+
+DEME_KERNEL void countActiveBinsEachBigMeshLeafTouches(deme::DEMSimParams* simParams,
+                                                       deme::binsTriangleTouches_t* numBinsEachLeafTouches,
+                                                       const deme::binID_t* activeBinIDs,
+                                                       const size_t nActiveBins,
+                                                       const int3* leafL,
+                                                       const int3* leafU,
+                                                       const unsigned char* leafOk) {
+    const deme::bodyID_t leafID = blockIdx.x;
+    if (leafID >= simParams->nBigMeshBVHLeaves) {
+        return;
+    }
+
+    __shared__ unsigned int sCount[DEME_NUM_TRIANGLE_PER_BLOCK];
+    unsigned int localCount = 0;
+
+    if (leafOk[leafID] != 0) {
+        const int3 L = leafL[leafID];
+        const int3 U = leafU[leafID];
+        const size_t rowsY = (size_t)(U.y - L.y + 1);
+        const size_t rowsZ = (size_t)(U.z - L.z + 1);
+        const size_t totalRows = rowsY * rowsZ;
+        const deme::binID_t nbX = (deme::binID_t)simParams->nbX;
+        const deme::binID_t nbY = (deme::binID_t)simParams->nbY;
+        size_t searchLo = 0;
+        for (size_t row = threadIdx.x; row < totalRows; row += blockDim.x) {
+            const size_t rowZ = row / rowsY;
+            const deme::binID_t k = (deme::binID_t)(L.z + (int)rowZ);
+            const deme::binID_t j = (deme::binID_t)(L.y + (int)(row - rowZ * rowsY));
+            const deme::binID_t rowBase = (k * nbY + j) * nbX;
+            const deme::binID_t rowBeg = rowBase + (deme::binID_t)L.x;
+            const deme::binID_t rowEnd = rowBase + (deme::binID_t)U.x;
+            const size_t lo = lowerBoundBinID(activeBinIDs, searchLo, nActiveBins, rowBeg);
+            const size_t hi = upperBoundBinID(activeBinIDs, lo, nActiveBins, rowEnd);
+            localCount += (unsigned int)(hi - lo);
+            searchLo = hi;
+        }
+    }
+
+    sCount[threadIdx.x] = localCount;
+    __syncthreads();
+
+    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sCount[threadIdx.x] += sCount[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        numBinsEachLeafTouches[leafID] = (deme::binsTriangleTouches_t)sCount[0];
+    }
+}
+
+DEME_KERNEL void populateBigMeshLeafActiveBinPairs(deme::DEMSimParams* simParams,
+                                                   const deme::binsTriangleTouchPairs_t* numBinsEachLeafTouchesScan,
+                                                   const deme::binID_t* activeBinIDs,
+                                                   const size_t nActiveBins,
+                                                   deme::binID_t* binIDsEachLeafTouches,
+                                                   deme::bodyID_t* leafIDsEachBinTouches,
+                                                   const int3* leafL,
+                                                   const int3* leafU,
+                                                   const unsigned char* leafOk) {
+    const deme::bodyID_t leafID = blockIdx.x;
+    if (leafID >= simParams->nBigMeshBVHLeaves || leafOk[leafID] == 0) {
+        return;
+    }
+
+    __shared__ deme::binsTriangleTouchPairs_t sWriteHead;
+    if (threadIdx.x == 0) {
+        sWriteHead = numBinsEachLeafTouchesScan[leafID];
+    }
+    __syncthreads();
+
+    const int3 L = leafL[leafID];
+    const int3 U = leafU[leafID];
+    const size_t rowsY = (size_t)(U.y - L.y + 1);
+    const size_t rowsZ = (size_t)(U.z - L.z + 1);
+    const size_t totalRows = rowsY * rowsZ;
+    const deme::binID_t nbX = (deme::binID_t)simParams->nbX;
+    const deme::binID_t nbY = (deme::binID_t)simParams->nbY;
+    size_t searchLo = 0;
+
+    for (size_t row = threadIdx.x; row < totalRows; row += blockDim.x) {
+        const size_t rowZ = row / rowsY;
+        const deme::binID_t k = (deme::binID_t)(L.z + (int)rowZ);
+        const deme::binID_t j = (deme::binID_t)(L.y + (int)(row - rowZ * rowsY));
+        const deme::binID_t rowBase = (k * nbY + j) * nbX;
+        const deme::binID_t rowBeg = rowBase + (deme::binID_t)L.x;
+        const deme::binID_t rowEnd = rowBase + (deme::binID_t)U.x;
+        const size_t lo = lowerBoundBinID(activeBinIDs, searchLo, nActiveBins, rowBeg);
+        const size_t hi = upperBoundBinID(activeBinIDs, lo, nActiveBins, rowEnd);
+        const deme::binsTriangleTouchPairs_t nRowHits = (deme::binsTriangleTouchPairs_t)(hi - lo);
+        if (nRowHits > 0) {
+            const deme::binsTriangleTouchPairs_t out = atomicAdd(&sWriteHead, nRowHits);
+            for (deme::binsTriangleTouchPairs_t n = 0; n < nRowHits; ++n) {
+                binIDsEachLeafTouches[out + n] = activeBinIDs[lo + n];
+                leafIDsEachBinTouches[out + n] = leafID;
+            }
+        }
+        searchLo = hi;
+    }
+}
+
+DEME_KERNEL void populateBigMeshLeafBinPairs(deme::DEMSimParams* simParams,
+                                             deme::DEMDataKT* granData,
+                                             deme::binsTriangleTouchPairs_t* numBinsEachLeafTouchesScan,
+                                             deme::binID_t* binIDsEachLeafTouches,
+                                             deme::bodyID_t* leafIDsEachBinTouches,
+                                             const int3* leafL,
+                                             const int3* leafU,
+                                             const unsigned char* leafOk) {
+    const deme::bodyID_t leafID = blockIdx.x * blockDim.x + threadIdx.x;
+    if (leafID >= simParams->nBigMeshBVHLeaves || leafOk[leafID] == 0) {
+        return;
+    }
+
+    const int3 L = leafL[leafID];
+    const int3 U = leafU[leafID];
+    const int nbX = (int)simParams->nbX;
+    const int nbXY = nbX * (int)simParams->nbY;
+    deme::binsTriangleTouchPairs_t offset = numBinsEachLeafTouchesScan[leafID];
+    for (int k = L.z; k <= U.z; ++k) {
+        const int baseZ = k * nbXY;
+        for (int j = L.y; j <= U.y; ++j) {
+            const int baseYZ = baseZ + j * nbX;
+            for (int i = L.x; i <= U.x; ++i) {
+                const deme::binID_t binLin = (deme::binID_t)(baseYZ + i);
+                binIDsEachLeafTouches[offset] = binLin;
+                leafIDsEachBinTouches[offset] = leafID;
+                ++offset;
+            }
+        }
+    }
+}
+
+DEME_KERNEL void countTriPairsEachBigMeshLeafBinTouch(deme::DEMSimParams* simParams,
+                                                      deme::DEMDataKT* granData,
+                                                      deme::bodyID_t numLeafBinPairs,
+                                                      deme::bodyID_t* numTriPairsEachLeafBin,
+                                                      const deme::binID_t* binIDsEachLeafTouches,
+                                                      const deme::bodyID_t* leafIDsEachBinTouches,
+                                                      const float3* vA1_all,
+                                                      const float3* vB1_all,
+                                                      const float3* vC1_all,
+                                                      const float3* shift_world_all) {
+    const deme::bodyID_t pairID = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pairID >= numLeafBinPairs) {
+        return;
+    }
+
+    const int nbX = (int)simParams->nbX;
+    const int nbY = (int)simParams->nbY;
+    const int nbXY = nbX * nbY;
+    const deme::binID_t binLin = binIDsEachLeafTouches[pairID];
+    const int kz = (int)(binLin / nbXY);
+    const int rem = (int)(binLin - kz * nbXY);
+    const int jy = rem / nbX;
+    const int ix = rem - jy * nbX;
+    const float binSizeF = (float)simParams->dyn.binSize;
+    const float binHalfSpan = binSizeF * (0.5f + (float)DEME_BIN_ENLARGE_RATIO_FOR_FACETS);
+    const float3 binCenter = make_float3(((float)ix + 0.5f) * binSizeF,
+                                         ((float)jy + 0.5f) * binSizeF,
+                                         ((float)kz + 0.5f) * binSizeF);
+
+    const deme::bodyID_t leafID = leafIDsEachBinTouches[pairID];
+    const deme::bodyID_t triStart = granData->bigMeshLeafTriStart[leafID];
+    const deme::bodyID_t triCount = granData->bigMeshLeafTriCount[leafID];
+    deme::bodyID_t count = 0;
+    for (deme::bodyID_t local = 0; local < triCount; local++) {
+        const deme::bodyID_t triID = granData->bigMeshLeafTriIDs[triStart + local];
+        const float3 vA1 = vA1_all[triID];
+        const float3 vB1 = vB1_all[triID];
+        const float3 vC1 = vC1_all[triID];
+        const float3 shift_world = shift_world_all[triID];
+        const float3 a0 = vA1 - binCenter;
+        const float3 a1 = vB1 - binCenter;
+        const float3 a2 = vC1 - binCenter;
+        if (triBoxOverlapBinLocalEdgesUnionShiftFP32(a0, a1, a2, shift_world, binHalfSpan, true, true)) {
+            ++count;
+        }
+    }
+    numTriPairsEachLeafBin[pairID] = count;
+}
+
+DEME_KERNEL void populateTriPairsFromBigMeshLeafBinPairs(deme::DEMSimParams* simParams,
+                                                         deme::DEMDataKT* granData,
+                                                         deme::bodyID_t numLeafBinPairs,
+                                                         const deme::binsTriangleTouchPairs_t baseOffset,
+                                                         const deme::binsTriangleTouchPairs_t* numTriPairsEachLeafBinScan,
+                                                         deme::binID_t* binIDsEachTriTouches,
+                                                         deme::bodyID_t* triIDsEachBinTouches,
+                                                         const deme::binID_t* binIDsEachLeafTouches,
+                                                         const deme::bodyID_t* leafIDsEachBinTouches,
+                                                         const float3* vA1_all,
+                                                         const float3* vB1_all,
+                                                         const float3* vC1_all,
+                                                         const float3* shift_world_all) {
+    const deme::bodyID_t pairID = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pairID >= numLeafBinPairs) {
+        return;
+    }
+
+    const int nbX = (int)simParams->nbX;
+    const int nbY = (int)simParams->nbY;
+    const int nbXY = nbX * nbY;
+    const deme::binID_t binLin = binIDsEachLeafTouches[pairID];
+    const int kz = (int)(binLin / nbXY);
+    const int rem = (int)(binLin - kz * nbXY);
+    const int jy = rem / nbX;
+    const int ix = rem - jy * nbX;
+    const float binSizeF = (float)simParams->dyn.binSize;
+    const float binHalfSpan = binSizeF * (0.5f + (float)DEME_BIN_ENLARGE_RATIO_FOR_FACETS);
+    const float3 binCenter = make_float3(((float)ix + 0.5f) * binSizeF,
+                                         ((float)jy + 0.5f) * binSizeF,
+                                         ((float)kz + 0.5f) * binSizeF);
+
+    deme::binsTriangleTouchPairs_t out = baseOffset + numTriPairsEachLeafBinScan[pairID];
+    const deme::bodyID_t leafID = leafIDsEachBinTouches[pairID];
+    const deme::bodyID_t triStart = granData->bigMeshLeafTriStart[leafID];
+    const deme::bodyID_t triCount = granData->bigMeshLeafTriCount[leafID];
+    for (deme::bodyID_t local = 0; local < triCount; local++) {
+        const deme::bodyID_t triID = granData->bigMeshLeafTriIDs[triStart + local];
+        const float3 vA1 = vA1_all[triID];
+        const float3 vB1 = vB1_all[triID];
+        const float3 vC1 = vC1_all[triID];
+        const float3 shift_world = shift_world_all[triID];
+        const float3 a0 = vA1 - binCenter;
+        const float3 a1 = vB1 - binCenter;
+        const float3 a2 = vC1 - binCenter;
+        if (triBoxOverlapBinLocalEdgesUnionShiftFP32(a0, a1, a2, shift_world, binHalfSpan, true, true)) {
+            binIDsEachTriTouches[out] = binLin;
+            triIDsEachBinTouches[out] = triID;
+            ++out;
+        }
     }
 }
 
@@ -410,7 +918,8 @@ DEME_KERNEL void getNumberOfBinsEachTriangleTouches(deme::DEMSimParams* simParam
                                                            const unsigned char* ok1_all,
                                                            const unsigned char* ok2_all,
                                                            const unsigned int* ownerGhostFlags,
-                                                           bool meshUniversalContact) {
+                                                           bool meshUniversalContact,
+                                                           bool skipBigMeshOwners) {
     deme::bodyID_t triID = blockIdx.x * blockDim.x + threadIdx.x;
     if (triID >= simParams->nTriGM) {
         return;
@@ -426,6 +935,10 @@ DEME_KERNEL void getNumberOfBinsEachTriangleTouches(deme::DEMSimParams* simParam
         }
         return;
     }
+
+    const deme::bodyID_t triOwnerID = granData->ownerTriMesh[triID];
+    const bool skipBinPairs =
+        (skipBigMeshOwners && granData->ownerIsBigMesh && granData->ownerIsBigMesh[triOwnerID]);
 
     const float3 vA1 = vA1_all[triID];
     const float3 vB1 = vB1_all[triID];
@@ -472,6 +985,7 @@ DEME_KERNEL void getNumberOfBinsEachTriangleTouches(deme::DEMSimParams* simParam
     }
 
     unsigned int numSDsTouched = 0;
+    if (!skipBinPairs) {
     const float binSizeF = (float)simParams->dyn.binSize;
     const float binHalfSpan = binSizeF * (0.5f + (float)DEME_BIN_ENLARGE_RATIO_FOR_FACETS);
     const float startX = binSizeF * (float)Lx + 0.5f * binSizeF;
@@ -773,14 +1287,18 @@ DEME_KERNEL void getNumberOfBinsEachTriangleTouches(deme::DEMSimParams* simParam
         }
     }
 
-    numBinsTriTouches[triID] = numSDsTouched + ghostBins;
+    numBinsTriTouches[triID] = skipBinPairs ? 0 : (numSDsTouched + ghostBins);
+    }
+
+    if (skipBinPairs) {
+        numBinsTriTouches[triID] = 0;
+    }
 
     if (meshUniversalContact) {
         deme::objID_t contact_count = 0;
         for (deme::objID_t objB = 0; objB < simParams->nAnalGM; objB++) {
             deme::bodyID_t objBOwner = objOwner[objB];
             unsigned int objFamilyNum = granData->familyID[objBOwner];
-            deme::bodyID_t triOwnerID = granData->ownerTriMesh[triID];
             unsigned int triFamilyNum = granData->familyID[triOwnerID];
             unsigned int maskMatID = locateMaskPair<unsigned int>(triFamilyNum, objFamilyNum);
             if (granData->familyMasks[maskMatID] != deme::DONT_PREVENT_CONTACT) {
@@ -851,7 +1369,8 @@ DEME_KERNEL void populateBinTriangleTouchingPairs(deme::DEMSimParams* simParams,
                                                          deme::bodyID_t* idGeoA,
                                                          deme::bodyID_t* idGeoB,
                                                          deme::contact_t* contactTypePrimitive,
-                                                         bool meshUniversalContact) {
+                                                         bool meshUniversalContact,
+                                                         bool skipBigMeshOwners) {
     deme::bodyID_t triID = blockIdx.x * blockDim.x + threadIdx.x;
     if (triID >= simParams->nTriGM) {
         return;
@@ -863,6 +1382,10 @@ DEME_KERNEL void populateBinTriangleTouchingPairs(deme::DEMSimParams* simParams,
     if (!ok1 && !ok2) {
         return;
     }
+
+    const deme::bodyID_t triOwnerID = granData->ownerTriMesh[triID];
+    const bool skipBinPairs =
+        (skipBigMeshOwners && granData->ownerIsBigMesh && granData->ownerIsBigMesh[triOwnerID]);
 
     const float3 vA1 = vA1_all[triID];
     const float3 vB1 = vB1_all[triID];
@@ -913,6 +1436,8 @@ DEME_KERNEL void populateBinTriangleTouchingPairs(deme::DEMSimParams* simParams,
     const deme::binsTriangleTouchPairs_t myUpperBound = numBinsTriTouchesScan[triID + 1];
 
     deme::binsTriangleTouchPairs_t count = 0;
+
+    if (!skipBinPairs) {
     const float binSizeF = (float)simParams->dyn.binSize;
     const float binHalfSpan = binSizeF * (0.5f + (float)DEME_BIN_ENLARGE_RATIO_FOR_FACETS);
     const float startX = binSizeF * (float)Lx + 0.5f * binSizeF;
@@ -1234,6 +1759,7 @@ DEME_KERNEL void populateBinTriangleTouchingPairs(deme::DEMSimParams* simParams,
         binIDsEachTriTouches[outIdx] = deme::NULL_BINID;
         triIDsEachBinTouches[outIdx] = triID;
     }
+    }
 
     // Tri-anal contacts: keep identical to original populate kernel
     if (meshUniversalContact) {
@@ -1243,7 +1769,6 @@ DEME_KERNEL void populateBinTriangleTouchingPairs(deme::DEMSimParams* simParams,
         for (deme::objID_t objB = 0; objB < simParams->nAnalGM; objB++) {
             deme::bodyID_t objBOwner = objOwner[objB];
             unsigned int objFamilyNum = granData->familyID[objBOwner];
-            deme::bodyID_t triOwnerID = granData->ownerTriMesh[triID];
             unsigned int triFamilyNum = granData->familyID[triOwnerID];
             unsigned int maskMatID = locateMaskPair<unsigned int>(triFamilyNum, objFamilyNum);
             if (granData->familyMasks[maskMatID] != deme::DONT_PREVENT_CONTACT) {

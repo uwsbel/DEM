@@ -68,6 +68,7 @@ DEME_KERNEL void computeMarginFromAbsv_implTri(deme::DEMSimParams* simParams,
                                               unsigned int* maxDrift,
                                               double* maxTriTriPenetration,
                                               bool meshUniversalContact,
+                                              bool skipBigMeshOwners,
                                               size_t n) {
     size_t triID = blockIdx.x * blockDim.x + threadIdx.x;
     if (triID < n) {
@@ -77,8 +78,9 @@ DEME_KERNEL void computeMarginFromAbsv_implTri(deme::DEMSimParams* simParams,
         float3 myRelPos = triangleCentroid<float3>(triBNode1, triBNode2, triBNode3);
 
         deme::bodyID_t ownerID = granData->ownerTriMesh[triID];
-        const float owner_abs_v = absVel_owner[ownerID];
-        const float owner_abs_angv = absAngVel_owner[ownerID];
+        if (skipBigMeshOwners && granData->ownerIsBigMesh && granData->ownerIsBigMesh[ownerID]) {
+            return;
+        }
         float vel = getApproxAbsVel(simParams, ownerID, absVel_owner, absAngVel_owner, myRelPos);
         unsigned int my_family = granData->familyID[ownerID];
 
@@ -91,23 +93,57 @@ DEME_KERNEL void computeMarginFromAbsv_implTri(deme::DEMSimParams* simParams,
         if (penetrationMargin > simParams->capTriTriPenetration) {
             penetrationMargin = simParams->capTriTriPenetration;
         }
-        // Keep broadphase coverage at least as large as currently observed tri-tri penetration
-        // for effectively static triangle owners. This stabilizes seam/support continuity against
-        // static meshes without globally inflating dynamic tri-tri broadphase in dense flows.
+        // We hope that penetrationMargin is small, so it's absorbed into the velocity-induce margin.
+        // But if not, it should prevail to avoid losing contacts involving triangles inside another mesh.
         double finalMargin =
             (double)(vel * simParams->dyn.expSafetyMulti + simParams->dyn.expSafetyAdder) * (*ts) * (*maxDrift) +
             granData->familyExtraMarginSize[my_family];
-        const bool owner_effectively_static =
-            (owner_abs_v <= 1e-6f && owner_abs_angv <= 1e-6f && isfinite(owner_abs_v) && isfinite(owner_abs_angv));
-        // For moving triangle owners, keep only a bounded penetration floor to avoid global
-        // broadphase explosion from a single outlier contact.
-        const double moving_pen_floor_cap = DEME_MIN((double)simParams->capTriTriPenetration, 1.0e-3);
-        const double penetrationFloor = owner_effectively_static ? penetrationMargin : DEME_MIN(penetrationMargin, moving_pen_floor_cap);
-        if (finalMargin < penetrationFloor) {
-            finalMargin = penetrationFloor;
-        }
+        // if (finalMargin < penetrationMargin) {
+        //     finalMargin = penetrationMargin;
+        // }
 
         granData->marginSizeTriangle[triID] = finalMargin;
+    }
+}
+
+DEME_KERNEL void computeMarginFromAbsv_implBigMeshLeaf(deme::DEMSimParams* simParams,
+                                                      deme::DEMDataKT* granData,
+                                                      const float* absVel_owner,
+                                                      const float* absAngVel_owner,
+                                                      float* ts,
+                                                      unsigned int* maxDrift,
+                                                      size_t n) {
+    size_t leafID = blockIdx.x * blockDim.x + threadIdx.x;
+    if (leafID < n) {
+        const deme::bodyID_t ownerID = granData->bigMeshLeafOwner[leafID];
+        const float radius = granData->bigMeshLeafMaxCentroidRadius[leafID];
+        float vel = absVel_owner[ownerID];
+        float abs_angv = absAngVel_owner[ownerID];
+        if (!isfinite(vel) || !isfinite(abs_angv)) {
+            DEME_ABORT_KERNEL(
+                "Absolute velocity or angular velocity for ownerID %llu is infinite (it's worse than "
+                "max-velocity-exceeded-allowance).\n",
+                static_cast<unsigned long long>(ownerID));
+        }
+        if (simParams->useAngVelMargin) {
+            vel += radius * abs_angv;
+        }
+        vel = fminf(vel, simParams->dyn.approxMaxVel);
+        const unsigned int my_family = granData->familyID[ownerID];
+        granData->bigMeshLeafMargin[leafID] =
+            (double)(vel * simParams->dyn.expSafetyMulti + simParams->dyn.expSafetyAdder) * (*ts) * (*maxDrift) +
+            granData->familyExtraMarginSize[my_family];
+    }
+}
+
+DEME_KERNEL void fillFixedMarginBigMeshLeaf(deme::DEMSimParams* simParams,
+                                          deme::DEMDataKT* granData,
+                                          size_t n) {
+    size_t leafID = blockIdx.x * blockDim.x + threadIdx.x;
+    if (leafID < n) {
+        const deme::bodyID_t ownerID = granData->bigMeshLeafOwner[leafID];
+        const unsigned int my_family = granData->familyID[ownerID];
+        granData->bigMeshLeafMargin[leafID] = simParams->dyn.beta + granData->familyExtraMarginSize[my_family];
     }
 }
 

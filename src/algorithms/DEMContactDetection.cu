@@ -561,10 +561,14 @@ void contactDetection(std::shared_ptr<JitHelper::CachedProgram>& bin_sphere_kern
             sandwichBNode1 = (float3*)scratchPad.allocateTempVector("sandwichBNode1", simParams->nTriGM * sizeof(float3));
             size_t blocks_needed_for_tri =
                 (simParams->nTriGM + DEME_NUM_TRIANGLE_PER_BLOCK - 1) / DEME_NUM_TRIANGLE_PER_BLOCK;
+            const bool useBigMeshBVHLeafPath =
+                (simParams->nBigMeshOwners > 0 && simParams->nBigMeshBVHLeaves > 0 &&
+                 !(simParams->useCylPeriodic && simParams->cylPeriodicSpan > 0.f));
             bin_triangle_kernels->kernel("makeTriangleSandwich")
                 .instantiate()
                 .configure(dim3(blocks_needed_for_tri), dim3(DEME_NUM_TRIANGLE_PER_BLOCK), 0, this_stream)
-                .launch(&simParams, &granData, sandwichANode1, sandwichANode2, sandwichANode3, sandwichBNode1);
+                .launch(&simParams, &granData, sandwichANode1, sandwichANode2, sandwichANode3, sandwichBNode1,
+                        false);
 
             // 1st step: register the number of triangle--bin touching pairs for each triangle for further processing.
             // We also use the opportunity to find how many analytical objects each triangle touches.
@@ -594,6 +598,8 @@ void contactDetection(std::shared_ptr<JitHelper::CachedProgram>& bin_sphere_kern
             CD_temp_arr_bytes = simParams->nTriGM * sizeof(uint8_t);
             uint8_t* tri_ok1 = (uint8_t*)scratchPad.allocateTempVector("tri_ok1", CD_temp_arr_bytes);
             uint8_t* tri_ok2 = (uint8_t*)scratchPad.allocateTempVector("tri_ok2", CD_temp_arr_bytes);
+            DEME_GPU_CALL(cudaMemsetAsync(tri_ok1, 0, CD_temp_arr_bytes, this_stream));
+            DEME_GPU_CALL(cudaMemsetAsync(tri_ok2, 0, CD_temp_arr_bytes, this_stream));
 
             
 // Precompute mesh-owner pose (position + rotation matrix rows) once per step (mesh owners only).
@@ -621,18 +627,22 @@ bin_triangle_kernels->kernel("precomputeTriangleSandwichData")
             meshOwnerPos, meshR1, meshR2, meshR3,
             sandwichANode1, sandwichANode2, sandwichANode3,
             sandwichBNode1);
-
-if (meshOwnerPos) {
-    scratchPad.finishUsingTempVector("meshOwnerPos");
-    scratchPad.finishUsingTempVector("meshR1");
-    scratchPad.finishUsingTempVector("meshR2");
-    scratchPad.finishUsingTempVector("meshR3");
+if (simParams->nBigMeshOwners > 0) {
+    const bool writeBigMeshBinBounds = !useBigMeshBVHLeafPath;
+    size_t blocks_needed_for_big_mesh_tiles =
+        (simParams->maxBigMeshOwnerTriCount + DEME_NUM_TRIANGLE_PER_BLOCK - 1) / DEME_NUM_TRIANGLE_PER_BLOCK;
+    bin_triangle_kernels->kernel("precomputeTriangleSandwichDataBigMeshOwners")
+        .instantiate()
+        .configure(dim3(simParams->nBigMeshOwners, blocks_needed_for_big_mesh_tiles, 1),
+                   dim3(DEME_NUM_TRIANGLE_PER_BLOCK), 0, this_stream)
+        .launch(&simParams, &granData,
+                tri_vA1, tri_vB1, tri_vC1,
+                tri_shift, tri_L1, tri_U1, tri_L2, tri_U2, tri_ok1, tri_ok2,
+                meshOwnerPos, meshR1, meshR2, meshR3,
+                sandwichANode1, sandwichANode2, sandwichANode3,
+                sandwichBNode1, writeBigMeshBinBounds);
 }
 
-
-            // Sandwich nodes are no longer needed beyond prepass.
-            scratchPad.finishUsingTempVector("sandwichANode1");
-            scratchPad.finishUsingTempVector("sandwichBNode1");
                     if (simParams->useCylPeriodic && simParams->cylPeriodicSpan > 0.f) {
                 CD_temp_arr_bytes = simParams->nOwnerBodies * sizeof(unsigned int);
                 ownerGhostFlags =
@@ -651,7 +661,7 @@ if (meshOwnerPos) {
                 .launch(&simParams, &granData, numBinsTriTouches, numAnalGeoTriTouches,
                         tri_vA1, tri_vB1, tri_vC1,
                         tri_shift, tri_L1, tri_U1, tri_L2, tri_U2, tri_ok1, tri_ok2, ownerGhostFlags,
-                        solverFlags.meshUniversalContact);
+                        solverFlags.meshUniversalContact, useBigMeshBVHLeafPath);
 
             // std::cout << "numBinsTriTouches: " << std::endl;
             // displayDeviceArray<binsTriangleTouches_t>(numBinsTriTouches, simParams->nTriGM);
@@ -706,17 +716,136 @@ if (meshOwnerPos) {
                 // displayDeviceArray<binsTriangleTouchPairs_t>(numAnalGeoTriTouchesScan, simParams->nTriGM);
             }
 
-            // 3rd step: use a custom kernel to figure out all tri--bin touching pairs. Note numBinsTriTouches can
-            // retire now.
+            // 3rd step: gather all tri--bin touching pairs. For regular owners we keep the old path.
+            // Big rigid mesh owners can take a BVH-leaf path that first bins leaf AABBs and expands triangles only for
+            // candidate leaf-bin pairs.
             scratchPad.finishUsingTempVector("numBinsTriTouches");
             scratchPad.finishUsingTempVector("numAnalGeoTriTouches");
 
-            CD_temp_arr_bytes = *pNumBinTriTouchPairs * sizeof(binID_t);
+            binsTriangleTouchPairs_t standardBinTriTouchPairs = (binsTriangleTouchPairs_t)(*pNumBinTriTouchPairs);
+            binsTriangleTouchPairs_t totalBinTriTouchPairs = standardBinTriTouchPairs;
+            binsTriangleTouchPairs_t* numTriPairsEachBigLeafBinScan = nullptr;
+            deme::binID_t* binIDsEachLeafTouches = nullptr;
+            bodyID_t* leafIDsEachBinTouches = nullptr;
+            bodyID_t numBigLeafBinPairs = 0;
+            size_t nBigMeshTriPairs = 0;
+
+            if (useBigMeshBVHLeafPath) {
+                CD_temp_arr_bytes = simParams->nBigMeshBVHLeaves * sizeof(float3);
+                float3* bigLeafWorldMin =
+                    (float3*)scratchPad.allocateTempVector("bigLeafWorldMin", CD_temp_arr_bytes);
+                float3* bigLeafWorldMax =
+                    (float3*)scratchPad.allocateTempVector("bigLeafWorldMax", CD_temp_arr_bytes);
+                CD_temp_arr_bytes = simParams->nBigMeshBVHLeaves * sizeof(binsTriangleTouches_t);
+                binsTriangleTouches_t* numBinsEachBigLeafTouches =
+                    (binsTriangleTouches_t*)scratchPad.allocateTempVector("numBinsEachBigLeafTouches", CD_temp_arr_bytes);
+                CD_temp_arr_bytes = simParams->nBigMeshBVHLeaves * sizeof(int3);
+                int3* bigLeafL = (int3*)scratchPad.allocateTempVector("bigLeafL", CD_temp_arr_bytes);
+                int3* bigLeafU = (int3*)scratchPad.allocateTempVector("bigLeafU", CD_temp_arr_bytes);
+                CD_temp_arr_bytes = simParams->nBigMeshBVHLeaves * sizeof(uint8_t);
+                uint8_t* bigLeafOk = (uint8_t*)scratchPad.allocateTempVector("bigLeafOk", CD_temp_arr_bytes);
+                size_t blocks_needed_for_big_leaves =
+                    (simParams->nBigMeshBVHLeaves + DEME_NUM_TRIANGLE_PER_BLOCK - 1) / DEME_NUM_TRIANGLE_PER_BLOCK;
+                bin_triangle_kernels->kernel("computeBigMeshLeafWorldBounds")
+                    .instantiate()
+                    .configure(dim3(simParams->nBigMeshBVHLeaves), dim3(DEME_NUM_TRIANGLE_PER_BLOCK), 0, this_stream)
+                    .launch(&simParams, &granData, bigLeafWorldMin, bigLeafWorldMax, tri_vA1, tri_vB1, tri_vC1,
+                            tri_shift);
+                bin_triangle_kernels->kernel("countBinsEachBigMeshLeafTouches")
+                    .instantiate()
+                    .configure(dim3(blocks_needed_for_big_leaves), dim3(DEME_NUM_TRIANGLE_PER_BLOCK), 0, this_stream)
+                    .launch(&simParams, numBinsEachBigLeafTouches, bigLeafL, bigLeafU, bigLeafOk,
+                            bigLeafWorldMin, bigLeafWorldMax);
+                if (*pNumActiveBins > 0) {
+                    bin_triangle_kernels->kernel("countActiveBinsEachBigMeshLeafTouches")
+                        .instantiate()
+                        .configure(dim3(simParams->nBigMeshBVHLeaves), dim3(DEME_NUM_TRIANGLE_PER_BLOCK), 0, this_stream)
+                        .launch(&simParams, numBinsEachBigLeafTouches, activeBinIDs, *pNumActiveBins, bigLeafL, bigLeafU,
+                                bigLeafOk);
+                } else {
+                    DEME_GPU_CALL(cudaMemsetAsync(numBinsEachBigLeafTouches, 0,
+                                                  simParams->nBigMeshBVHLeaves * sizeof(binsTriangleTouches_t),
+                                                  this_stream));
+                }
+
+                CD_temp_arr_bytes = (simParams->nBigMeshBVHLeaves + 1) * sizeof(binsTriangleTouchPairs_t);
+                binsTriangleTouchPairs_t* numBinsEachBigLeafTouchesScan =
+                    (binsTriangleTouchPairs_t*)scratchPad.allocateTempVector("numBinsEachBigLeafTouchesScan", CD_temp_arr_bytes);
+                cubDEMPrefixScan<binsTriangleTouches_t, binsTriangleTouchPairs_t>(
+                    numBinsEachBigLeafTouches, numBinsEachBigLeafTouchesScan, simParams->nBigMeshBVHLeaves,
+                    this_stream, scratchPad);
+                scratchPad.allocateDualStruct("numBigMeshLeafBinPairs");
+                size_t* pNumBigMeshLeafBinPairs = scratchPad.getDualStructDevice("numBigMeshLeafBinPairs");
+                deviceAdd<size_t, binsTriangleTouchPairs_t, binsTriangleTouches_t>(
+                    pNumBigMeshLeafBinPairs, &(numBinsEachBigLeafTouchesScan[simParams->nBigMeshBVHLeaves - 1]),
+                    &(numBinsEachBigLeafTouches[simParams->nBigMeshBVHLeaves - 1]), this_stream);
+                deviceAssign<binsTriangleTouchPairs_t, size_t>(&(numBinsEachBigLeafTouchesScan[simParams->nBigMeshBVHLeaves]),
+                                                               pNumBigMeshLeafBinPairs, this_stream);
+                scratchPad.syncDualStructDeviceToHost("numBigMeshLeafBinPairs");
+                numBigLeafBinPairs = (bodyID_t)(*scratchPad.getDualStructHost("numBigMeshLeafBinPairs"));
+
+                if (numBigLeafBinPairs > 0) {
+                    CD_temp_arr_bytes = numBigLeafBinPairs * sizeof(binID_t);
+                    binIDsEachLeafTouches =
+                        (binID_t*)scratchPad.allocateTempVector("binIDsEachLeafTouches", CD_temp_arr_bytes);
+                    CD_temp_arr_bytes = numBigLeafBinPairs * sizeof(bodyID_t);
+                    leafIDsEachBinTouches =
+                        (bodyID_t*)scratchPad.allocateTempVector("leafIDsEachBinTouches", CD_temp_arr_bytes);
+                    bin_triangle_kernels->kernel("populateBigMeshLeafActiveBinPairs")
+                        .instantiate()
+                        .configure(dim3(simParams->nBigMeshBVHLeaves), dim3(DEME_NUM_TRIANGLE_PER_BLOCK), 0, this_stream)
+                        .launch(&simParams, numBinsEachBigLeafTouchesScan, activeBinIDs, *pNumActiveBins,
+                                binIDsEachLeafTouches, leafIDsEachBinTouches, bigLeafL, bigLeafU, bigLeafOk);
+
+                    CD_temp_arr_bytes = numBigLeafBinPairs * sizeof(bodyID_t);
+                    bodyID_t* numTriPairsEachBigLeafBin =
+                        (bodyID_t*)scratchPad.allocateTempVector("numTriPairsEachBigLeafBin", CD_temp_arr_bytes);
+                    size_t blocks_needed_for_big_leaf_bin_pairs =
+                        (numBigLeafBinPairs + DEME_NUM_TRIANGLE_PER_BLOCK - 1) / DEME_NUM_TRIANGLE_PER_BLOCK;
+                    bin_triangle_kernels->kernel("countTriPairsEachBigMeshLeafBinTouch")
+                        .instantiate()
+                        .configure(dim3(blocks_needed_for_big_leaf_bin_pairs), dim3(DEME_NUM_TRIANGLE_PER_BLOCK), 0, this_stream)
+                        .launch(&simParams, &granData, numBigLeafBinPairs, numTriPairsEachBigLeafBin,
+                                binIDsEachLeafTouches, leafIDsEachBinTouches,
+                                tri_vA1, tri_vB1, tri_vC1, tri_shift);
+
+                    CD_temp_arr_bytes = (numBigLeafBinPairs + 1) * sizeof(binsTriangleTouchPairs_t);
+                    numTriPairsEachBigLeafBinScan =
+                        (binsTriangleTouchPairs_t*)scratchPad.allocateTempVector("numTriPairsEachBigLeafBinScan", CD_temp_arr_bytes);
+                    cubDEMPrefixScan<bodyID_t, binsTriangleTouchPairs_t>(numTriPairsEachBigLeafBin,
+                                                                         numTriPairsEachBigLeafBinScan,
+                                                                         numBigLeafBinPairs, this_stream, scratchPad);
+                    scratchPad.allocateDualStruct("numBigMeshTriTouchPairs");
+                    size_t* pNumBigMeshTriTouchPairs = scratchPad.getDualStructDevice("numBigMeshTriTouchPairs");
+                    deviceAdd<size_t, binsTriangleTouchPairs_t, bodyID_t>(
+                        pNumBigMeshTriTouchPairs, &(numTriPairsEachBigLeafBinScan[numBigLeafBinPairs - 1]),
+                        &(numTriPairsEachBigLeafBin[numBigLeafBinPairs - 1]), this_stream);
+                    deviceAssign<binsTriangleTouchPairs_t, size_t>(&(numTriPairsEachBigLeafBinScan[numBigLeafBinPairs]),
+                                                                   pNumBigMeshTriTouchPairs, this_stream);
+                    scratchPad.syncDualStructDeviceToHost("numBigMeshTriTouchPairs");
+                    nBigMeshTriPairs = *scratchPad.getDualStructHost("numBigMeshTriTouchPairs");
+                    totalBinTriTouchPairs += (binsTriangleTouchPairs_t)nBigMeshTriPairs;
+                    scratchPad.finishUsingDualStruct("numBigMeshTriTouchPairs");
+                    scratchPad.finishUsingTempVector("numTriPairsEachBigLeafBin");
+                }
+
+                scratchPad.finishUsingDualStruct("numBigMeshLeafBinPairs");
+                scratchPad.finishUsingTempVector("numBinsEachBigLeafTouches");
+                scratchPad.finishUsingTempVector("numBinsEachBigLeafTouchesScan");
+                scratchPad.finishUsingTempVector("bigLeafL");
+                scratchPad.finishUsingTempVector("bigLeafU");
+                scratchPad.finishUsingTempVector("bigLeafOk");
+                scratchPad.finishUsingTempVector("bigLeafWorldMin");
+                scratchPad.finishUsingTempVector("bigLeafWorldMax");
+            }
+
+            CD_temp_arr_bytes = totalBinTriTouchPairs * sizeof(binID_t);
             binID_t* binIDsEachTriTouches =
                 (binID_t*)scratchPad.allocateTempVector("binIDsEachTriTouches", CD_temp_arr_bytes);
-            CD_temp_arr_bytes = *pNumBinTriTouchPairs * sizeof(bodyID_t);
+            CD_temp_arr_bytes = totalBinTriTouchPairs * sizeof(bodyID_t);
             bodyID_t* triIDsEachBinTouches =
                 (bodyID_t*)scratchPad.allocateTempVector("triIDsEachBinTouches", CD_temp_arr_bytes);
+
             // Tri--geo contact pairs go after sphere--anal-geo contacts
             bodyID_t* idTriA = (granData->idPrimitiveA + nSphereGeoContact);
             bodyID_t* idGeoB = (granData->idPrimitiveB + nSphereGeoContact);
@@ -728,37 +857,73 @@ if (meshOwnerPos) {
                         binIDsEachTriTouches, triIDsEachBinTouches,
                         tri_vA1, tri_vB1, tri_vC1,
                         tri_shift, tri_L1, tri_U1, tri_L2, tri_U2, tri_ok1, tri_ok2, ownerGhostFlags,
-                        idTriA, idGeoB, dType, solverFlags.meshUniversalContact);
+                        idTriA, idGeoB, dType, solverFlags.meshUniversalContact, useBigMeshBVHLeafPath);
+
+            if (useBigMeshBVHLeafPath && nBigMeshTriPairs > 0) {
+                size_t blocks_needed_for_big_leaf_bin_pairs =
+                    (numBigLeafBinPairs + DEME_NUM_TRIANGLE_PER_BLOCK - 1) / DEME_NUM_TRIANGLE_PER_BLOCK;
+                bin_triangle_kernels->kernel("populateTriPairsFromBigMeshLeafBinPairs")
+                    .instantiate()
+                    .configure(dim3(blocks_needed_for_big_leaf_bin_pairs), dim3(DEME_NUM_TRIANGLE_PER_BLOCK), 0, this_stream)
+                    .launch(&simParams, &granData, numBigLeafBinPairs, standardBinTriTouchPairs,
+                            numTriPairsEachBigLeafBinScan,
+                            binIDsEachTriTouches, triIDsEachBinTouches,
+                            binIDsEachLeafTouches, leafIDsEachBinTouches,
+                            tri_vA1, tri_vB1, tri_vC1, tri_shift);
+            }
 
             if (ownerGhostFlags) {
                 scratchPad.finishUsingTempVector("ownerGhostFlags");
             }
-                                                                                                scratchPad.finishUsingTempVector("tri_L1");
+            scratchPad.finishUsingTempVector("tri_L1");
             scratchPad.finishUsingTempVector("tri_U1");
             scratchPad.finishUsingTempVector("tri_L2");
             scratchPad.finishUsingTempVector("tri_U2");
             scratchPad.finishUsingTempVector("tri_ok1");
             scratchPad.finishUsingTempVector("tri_ok2");
-
-            // std::cout << "binIDsEachTriTouches: " << std::endl;
-            // displayDeviceArray<binsTriangleTouches_t>(binIDsEachTriTouches, *pNumBinTriTouchPairs);
-            // std::cout << "dType: " << std::endl;
-            // displayDeviceArray<contact_t>(dType, nTriGeoContact);
-            // std::cout << "mesh patch pairs:" << std::endl;
-            // displayDeviceArray<patchIDPair_t>(patchPairs, nTriGeoContact);
+            if (numTriPairsEachBigLeafBinScan) {
+                scratchPad.finishUsingTempVector("numTriPairsEachBigLeafBinScan");
+            }
+            if (binIDsEachLeafTouches) {
+                scratchPad.finishUsingTempVector("binIDsEachLeafTouches");
+            }
+            if (leafIDsEachBinTouches) {
+                scratchPad.finishUsingTempVector("leafIDsEachBinTouches");
+            }
+            if (meshOwnerPos) {
+                scratchPad.finishUsingTempVector("meshOwnerPos");
+                scratchPad.finishUsingTempVector("meshR1");
+                scratchPad.finishUsingTempVector("meshR2");
+                scratchPad.finishUsingTempVector("meshR3");
+            }
+            scratchPad.finishUsingTempVector("sandwichANode1");
+            scratchPad.finishUsingTempVector("sandwichBNode1");
 
             // 4th step: allocate and populate SORTED binIDsEachTriTouches and triIDsEachBinTouches. Note
             // numBinsTriTouchesScan can retire now (analytical contacts also processed).
             scratchPad.finishUsingTempVector("numBinsTriTouchesScan");
             scratchPad.finishUsingTempVector("numAnalGeoTriTouchesScan");
-            CD_temp_arr_bytes = *pNumBinTriTouchPairs * sizeof(bodyID_t);
+            if (totalBinTriTouchPairs == 0) {
+                scratchPad.finishUsingTempVector("binIDsEachTriTouches");
+                scratchPad.finishUsingTempVector("triIDsEachBinTouches");
+                scratchPad.finishUsingDualStruct("numBinTriTouchPairs");
+                pNumActiveBinsForTri = scratchPad.getDualStructHost("numActiveBinsForTri");
+                *pNumActiveBinsForTri = 0;
+                stateParams.maxTriFoundInBin = 0;
+                triIDsEachBinTouches_sorted = nullptr;
+                numTrianglesBinTouches = nullptr;
+                triIDsLookUpTable = nullptr;
+                activeBinIDsForTri = nullptr;
+                mapTriActBinToSphActBin = nullptr;
+            } else {
+            CD_temp_arr_bytes = totalBinTriTouchPairs * sizeof(bodyID_t);
             triIDsEachBinTouches_sorted =
                 (bodyID_t*)scratchPad.allocateTempVector("triIDsEachBinTouches_sorted", CD_temp_arr_bytes);
-            CD_temp_arr_bytes = *pNumBinTriTouchPairs * sizeof(binID_t);
+            CD_temp_arr_bytes = totalBinTriTouchPairs * sizeof(binID_t);
             binID_t* binIDsEachTriTouches_sorted =
                 (binID_t*)scratchPad.allocateTempVector("binIDsEachTriTouches_sorted", CD_temp_arr_bytes);
             cubDEMSortByKeys<binID_t, bodyID_t>(binIDsEachTriTouches, binIDsEachTriTouches_sorted, triIDsEachBinTouches,
-                                                triIDsEachBinTouches_sorted, *pNumBinTriTouchPairs, this_stream,
+                                                triIDsEachBinTouches_sorted, totalBinTriTouchPairs, this_stream,
                                                 scratchPad);
 
             // 5th step: use DeviceRunLengthEncode to identify those active (that have tris in them) bins.
@@ -767,7 +932,7 @@ if (meshOwnerPos) {
             binID_t* binIDsUnique = (binID_t*)binIDsEachTriTouches;
             pNumActiveBinsForTri = scratchPad.getDualStructDevice("numActiveBinsForTri");
             cubDEMUnique<binID_t>(binIDsEachTriTouches_sorted, binIDsUnique, pNumActiveBinsForTri,
-                                  *pNumBinTriTouchPairs, this_stream, scratchPad);
+                                  totalBinTriTouchPairs, this_stream, scratchPad);
             // Allocate space for encoding output, and run it. Note the (unsorted) binIDsEachTriTouches and
             // triIDsEachBinTouches can retire now.
             scratchPad.finishUsingTempVector("binIDsEachTriTouches");
@@ -786,7 +951,7 @@ if (meshOwnerPos) {
             pNumActiveBinsForTri = scratchPad.getDualStructDevice("numActiveBinsForTri");
             cubDEMRunLengthEncode<binID_t, trianglesBinTouches_t>(binIDsEachTriTouches_sorted, activeBinIDsForTri,
                                                                   numTrianglesBinTouches, pNumActiveBinsForTri,
-                                                                  *pNumBinTriTouchPairs, this_stream, scratchPad);
+                                                                  totalBinTriTouchPairs, this_stream, scratchPad);
             pNumActiveBinsForTri = scratchPad.getDualStructHost("numActiveBinsForTri");
             // std::cout << "activeBinIDsForTri: " << std::endl;
             // displayDeviceArray<binID_t>(activeBinIDsForTri, *pNumActiveBinsForTri);
@@ -849,6 +1014,7 @@ if (meshOwnerPos) {
                 (binsTriangleTouchPairs_t*)scratchPad.allocateTempVector("triIDsLookUpTable", CD_temp_arr_bytes);
             cubDEMPrefixScan<trianglesBinTouches_t, binsTriangleTouchPairs_t>(
                 numTrianglesBinTouches, triIDsLookUpTable, *pNumActiveBinsForTri, this_stream, scratchPad);
+            }
         }
         timers.GetTimer("Discretize domain").stop();
 

@@ -9,6 +9,10 @@
 #include <thread>
 #include <utility>
 #include <atomic>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <vector>
 
 #include <core/ApiVersion.h>
 #include <core/utils/JitHelper.h>
@@ -44,6 +48,75 @@ namespace {
 struct DynamicProduceReadyPayload {
     ThreadManager* sched = nullptr;
 };
+
+inline uint32_t expandBits10(uint32_t v) {
+    v &= 0x000003ffu;
+    v = (v | (v << 16)) & 0x030000FFu;
+    v = (v | (v << 8)) & 0x0300F00Fu;
+    v = (v | (v << 4)) & 0x030C30C3u;
+    v = (v | (v << 2)) & 0x09249249u;
+    return v;
+}
+
+inline uint32_t morton3D10(uint32_t x, uint32_t y, uint32_t z) {
+    return expandBits10(x) | (expandBits10(y) << 1) | (expandBits10(z) << 2);
+}
+
+inline uint32_t quantizeUnitTo10Bits(float v) {
+    v = std::max(0.0f, std::min(1.0f, v));
+    return static_cast<uint32_t>(v * 1023.0f + 0.5f);
+}
+
+struct MortonTriEntry {
+    bodyID_t triID;
+    uint32_t key;
+};
+
+inline double hostDot3(const float3& a, const float3& b) {
+    return (double)a.x * (double)b.x + (double)a.y * (double)b.y + (double)a.z * (double)b.z;
+}
+
+inline double hostLength3(const float3& v) {
+    return std::sqrt(hostDot3(v, v));
+}
+
+inline float3 hostSub3(const float3& a, const float3& b) {
+    return make_float3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
+inline float3 hostTriangleCentroid(const float3& p1, const float3& p2, const float3& p3) {
+    return make_float3((p1.x + p2.x + p3.x) / 3.f, (p1.y + p2.y + p3.y) / 3.f, (p1.z + p2.z + p3.z) / 3.f);
+}
+
+inline float hostTriangleExpandCoeff(const float3& p1, const float3& p2, const float3& p3) {
+    const double a = hostLength3(hostSub3(p2, p3));
+    const double b = hostLength3(hostSub3(p3, p1));
+    const double c = hostLength3(hostSub3(p1, p2));
+    const double perimeter = a + b + c;
+    if (perimeter <= 1e-12) {
+        return 1024.f;
+    }
+
+    const float3 incenter = make_float3((float)((a * (double)p1.x + b * (double)p2.x + c * (double)p3.x) / perimeter),
+                                        (float)((a * (double)p1.y + b * (double)p2.y + c * (double)p3.y) / perimeter),
+                                        (float)((a * (double)p1.z + b * (double)p2.z + c * (double)p3.z) / perimeter));
+
+    auto coeff_for_vertex = [&](const float3& vertex, const float3& side_end) {
+        const float3 expand = hostSub3(vertex, incenter);
+        const float3 side = hostSub3(side_end, vertex);
+        const double expand_len = hostLength3(expand);
+        const double side_len = hostLength3(side);
+        if (expand_len <= 1e-12 || side_len <= 1e-12) {
+            return 1024.0;
+        }
+        const double cos_half = std::max(-1.0, std::min(1.0, -hostDot3(expand, side) / (expand_len * side_len)));
+        const double sin_sq = std::max(1e-12, 1.0 - cos_half * cos_half);
+        return 1.0 + 1.0 / std::sqrt(sin_sq);
+    };
+
+    const double coeff = std::max({coeff_for_vertex(p1, p2), coeff_for_vertex(p2, p3), coeff_for_vertex(p3, p1)});
+    return (float)coeff;
+}
 
 void CUDART_CB NotifyDynamicProduceReady(void* userData) {
     auto* payload = static_cast<DynamicProduceReadyPayload*>(userData);
@@ -175,13 +248,26 @@ inline void DEMKinematicThread::computeMarginFromAbsv(float* absVel_owner, float
             .launch(&simParams, &granData, absVel_owner, absAngVel_owner, &(stateParams.ts), &(stateParams.maxDrift),
                     (size_t)simParams->nSpheresGM);
     }
+    const bool useBigMeshBVHLeafPath =
+        (simParams->nBigMeshOwners > 0 && simParams->nBigMeshBVHLeaves > 0 &&
+            !(simParams->useCylPeriodic && simParams->cylPeriodicSpan > 0.f));
+
     blocks_needed = (simParams->nTriGM + DEME_MAX_THREADS_PER_BLOCK - 1) / DEME_MAX_THREADS_PER_BLOCK;
     if (blocks_needed > 0) {
         misc_kernels->kernel("computeMarginFromAbsv_implTri")
             .instantiate()
             .configure(dim3(blocks_needed), dim3(DEME_MAX_THREADS_PER_BLOCK), 0, streamInfo.stream)
             .launch(&simParams, &granData, absVel_owner, absAngVel_owner, &(stateParams.ts), &(stateParams.maxDrift),
-                    &(stateParams.maxTriTriPenetration), solverFlags.meshUniversalContact, (size_t)simParams->nTriGM);
+                    &(stateParams.maxTriTriPenetration), solverFlags.meshUniversalContact,
+                    false, (size_t)simParams->nTriGM);
+    }
+    if (useBigMeshBVHLeafPath && simParams->nBigMeshBVHLeaves > 0) {
+        blocks_needed = (simParams->nBigMeshBVHLeaves + DEME_MAX_THREADS_PER_BLOCK - 1) / DEME_MAX_THREADS_PER_BLOCK;
+        misc_kernels->kernel("computeMarginFromAbsv_implBigMeshLeaf")
+            .instantiate()
+            .configure(dim3(blocks_needed), dim3(DEME_MAX_THREADS_PER_BLOCK), 0, streamInfo.stream)
+            .launch(&simParams, &granData, absVel_owner, absAngVel_owner, &(stateParams.ts), &(stateParams.maxDrift),
+                    (size_t)simParams->nBigMeshBVHLeaves);
     }
     blocks_needed = (simParams->nAnalGM + DEME_MAX_THREADS_PER_BLOCK - 1) / DEME_MAX_THREADS_PER_BLOCK;
     if (blocks_needed > 0) {
@@ -339,6 +425,17 @@ inline void DEMKinematicThread::unpackMyBuffer() {
         // This one is statically compiled, unlike the other branch
         fillMarginValues(&simParams, &granData, (size_t)(simParams->nSpheresGM), (size_t)(simParams->nTriGM),
                          (size_t)(simParams->nAnalGM), streamInfo.stream);
+        const bool useBigMeshBVHLeafPath =
+            (simParams->nBigMeshOwners > 0 && simParams->nBigMeshBVHLeaves > 0 && !solverFlags.meshUniversalContact &&
+             !(simParams->useCylPeriodic && simParams->cylPeriodicSpan > 0.f));
+        if (useBigMeshBVHLeafPath && simParams->nBigMeshBVHLeaves > 0) {
+            size_t blocks_needed = (simParams->nBigMeshBVHLeaves + DEME_MAX_THREADS_PER_BLOCK - 1) /
+                                   DEME_MAX_THREADS_PER_BLOCK;
+            misc_kernels->kernel("fillFixedMarginBigMeshLeaf")
+                .instantiate()
+                .configure(dim3(blocks_needed), dim3(DEME_MAX_THREADS_PER_BLOCK), 0, streamInfo.stream)
+                .launch(&simParams, &granData, (size_t)simParams->nBigMeshBVHLeaves);
+        }
     }
 
     // Keep ghosting/wrapping margins consistent with kT's dynamic margin size.
@@ -348,9 +445,14 @@ inline void DEMKinematicThread::unpackMyBuffer() {
             float max_margin = 0.f;
             float tmp_sph = -DEME_HUGE_FLOAT;
             float tmp_tri = -DEME_HUGE_FLOAT;
+            float tmp_big_leaf = -DEME_HUGE_FLOAT;
             float tmp_anal = -DEME_HUGE_FLOAT;
+            const bool useBigMeshBVHLeafPath =
+                (simParams->nBigMeshOwners > 0 && simParams->nBigMeshBVHLeaves > 0 && !solverFlags.meshUniversalContact &&
+                 !(simParams->useCylPeriodic && simParams->cylPeriodicSpan > 0.f));
             const bool has_margins =
-                (simParams->nSpheresGM > 0) || (simParams->nTriGM > 0) || (simParams->nAnalGM > 0);
+                (simParams->nSpheresGM > 0) || (simParams->nTriGM > 0) || (simParams->nAnalGM > 0) ||
+                (useBigMeshBVHLeafPath && simParams->nBigMeshBVHLeaves > 0);
             if (has_margins) {
                 float* max_margin_dev =
                     (float*)solverScratchSpace.allocateTempVector("maxMarginTmp", sizeof(float));
@@ -366,6 +468,12 @@ inline void DEMKinematicThread::unpackMyBuffer() {
                     DEME_GPU_CALL(cudaMemcpyAsync(&tmp_tri, max_margin_dev, sizeof(float), cudaMemcpyDeviceToHost,
                                                   streamInfo.stream));
                 }
+                if (useBigMeshBVHLeafPath && simParams->nBigMeshBVHLeaves > 0) {
+                    cubMaxReduce<float>(granData->bigMeshLeafMargin, max_margin_dev, simParams->nBigMeshBVHLeaves,
+                                        streamInfo.stream, solverScratchSpace);
+                    DEME_GPU_CALL(cudaMemcpyAsync(&tmp_big_leaf, max_margin_dev, sizeof(float), cudaMemcpyDeviceToHost,
+                                                  streamInfo.stream));
+                }
                 if (simParams->nAnalGM > 0) {
                     cubMaxReduce<float>(granData->marginSizeAnalytical, max_margin_dev, simParams->nAnalGM,
                                         streamInfo.stream, solverScratchSpace);
@@ -378,6 +486,9 @@ inline void DEMKinematicThread::unpackMyBuffer() {
                 }
                 if (std::isfinite(tmp_tri) && tmp_tri > max_margin) {
                     max_margin = tmp_tri;
+                }
+                if (std::isfinite(tmp_big_leaf) && tmp_big_leaf > max_margin) {
+                    max_margin = tmp_big_leaf;
                 }
                 if (std::isfinite(tmp_anal) && tmp_anal > max_margin) {
                     max_margin = tmp_anal;
@@ -612,7 +723,7 @@ void DEMKinematicThread::workerThread() {
             // updating it
             {
                 std::lock_guard<std::mutex> order_lock(pSchedSupport->kinematicOrderStateLock);
-                pSchedSupport->kinematicOwned_Cons2ProdBuffer_isFresh.store(false, std::memory_order_release);
+            pSchedSupport->kinematicOwned_Cons2ProdBuffer_isFresh.store(false, std::memory_order_release);
                 pSchedSupport->kinematicOrderClaimed.store(false, std::memory_order_release);
             }
 
@@ -739,7 +850,7 @@ void DEMKinematicThread::breakWaitingStatus() {
     // breakWaitingStatus is called, they will always be reset to default soon
     {
         std::lock_guard<std::mutex> order_lock(pSchedSupport->kinematicOrderStateLock);
-        pSchedSupport->kinematicOwned_Cons2ProdBuffer_isFresh.store(true, std::memory_order_release);
+    pSchedSupport->kinematicOwned_Cons2ProdBuffer_isFresh.store(true, std::memory_order_release);
         pSchedSupport->kinematicOrderClaimed.store(false, std::memory_order_release);
     }
     kTShouldReset = true;
@@ -752,7 +863,7 @@ void DEMKinematicThread::resetUserCallStat() {
     // Reset kT stats variables, making ready for next user call
     {
         std::lock_guard<std::mutex> order_lock(pSchedSupport->kinematicOrderStateLock);
-        pSchedSupport->kinematicOwned_Cons2ProdBuffer_isFresh.store(false, std::memory_order_release);
+    pSchedSupport->kinematicOwned_Cons2ProdBuffer_isFresh.store(false, std::memory_order_release);
         pSchedSupport->kinematicOrderClaimed.store(false, std::memory_order_release);
     }
     kTShouldReset = false;
@@ -825,6 +936,21 @@ void DEMKinematicThread::packDataPointers() {
 
     // Mesh-related
     ownerTriMesh.bindDevicePointer(&(granData->ownerTriMesh));
+    ownerTriStart.bindDevicePointer(&(granData->ownerTriStart));
+    ownerTriCount.bindDevicePointer(&(granData->ownerTriCount));
+    ownerIsBigMesh.bindDevicePointer(&(granData->ownerIsBigMesh));
+    bigMeshOwners.bindDevicePointer(&(granData->bigMeshOwners));
+    ownerBigMeshLeafStart.bindDevicePointer(&(granData->ownerBigMeshLeafStart));
+    ownerBigMeshLeafCount.bindDevicePointer(&(granData->ownerBigMeshLeafCount));
+    bigMeshLeafOwner.bindDevicePointer(&(granData->bigMeshLeafOwner));
+    bigMeshLeafTriStart.bindDevicePointer(&(granData->bigMeshLeafTriStart));
+    bigMeshLeafTriCount.bindDevicePointer(&(granData->bigMeshLeafTriCount));
+    bigMeshLeafTriIDs.bindDevicePointer(&(granData->bigMeshLeafTriIDs));
+    bigMeshLeafLocalMin.bindDevicePointer(&(granData->bigMeshLeafLocalMin));
+    bigMeshLeafLocalMax.bindDevicePointer(&(granData->bigMeshLeafLocalMax));
+    bigMeshLeafMaxCentroidRadius.bindDevicePointer(&(granData->bigMeshLeafMaxCentroidRadius));
+    bigMeshLeafMaxExpandCoeff.bindDevicePointer(&(granData->bigMeshLeafMaxExpandCoeff));
+    bigMeshLeafMargin.bindDevicePointer(&(granData->bigMeshLeafMargin));
     ownerMeshConvex.bindDevicePointer(&(granData->ownerMeshConvex));
     ownerMeshNeverWinner.bindDevicePointer(&(granData->ownerMeshNeverWinner));
     triPatchID.bindDevicePointer(&(granData->triPatchID));
@@ -881,6 +1007,21 @@ void DEMKinematicThread::migrateDataToDevice() {
     ownerAnalBody.toDeviceAsync(streamInfo.stream);
 
     ownerTriMesh.toDeviceAsync(streamInfo.stream);
+    ownerTriStart.toDeviceAsync(streamInfo.stream);
+    ownerTriCount.toDeviceAsync(streamInfo.stream);
+    ownerIsBigMesh.toDeviceAsync(streamInfo.stream);
+    bigMeshOwners.toDeviceAsync(streamInfo.stream);
+    ownerBigMeshLeafStart.toDeviceAsync(streamInfo.stream);
+    ownerBigMeshLeafCount.toDeviceAsync(streamInfo.stream);
+    bigMeshLeafOwner.toDeviceAsync(streamInfo.stream);
+    bigMeshLeafTriStart.toDeviceAsync(streamInfo.stream);
+    bigMeshLeafTriCount.toDeviceAsync(streamInfo.stream);
+    bigMeshLeafTriIDs.toDeviceAsync(streamInfo.stream);
+    bigMeshLeafLocalMin.toDeviceAsync(streamInfo.stream);
+    bigMeshLeafLocalMax.toDeviceAsync(streamInfo.stream);
+    bigMeshLeafMaxCentroidRadius.toDeviceAsync(streamInfo.stream);
+    bigMeshLeafMaxExpandCoeff.toDeviceAsync(streamInfo.stream);
+    bigMeshLeafMargin.toDeviceAsync(streamInfo.stream);
     ownerMeshConvex.toDeviceAsync(streamInfo.stream);
     ownerMeshNeverWinner.toDeviceAsync(streamInfo.stream);
     triPatchID.toDeviceAsync(streamInfo.stream);
@@ -1016,6 +1157,11 @@ void DEMKinematicThread::allocateGPUArrays(size_t nOwnerBodies,
     simParams->nOwnerClumps = nOwnerClumps;
     simParams->nExtObj = nExtObj;
     simParams->nTriMeshes = nTriMeshes;
+    simParams->nBigMeshOwners = 0;
+    simParams->maxBigMeshOwnerTriCount = 0;
+    simParams->bigMeshOwnerTriThreshold = 65536;
+    simParams->nBigMeshBVHLeaves = 0;
+    simParams->bigMeshBVHLeafTriCap = 64;
     simParams->nDistinctMassProperties = nMassProperties;
     simParams->nDistinctClumpBodyTopologies = nClumpTopo;
     simParams->nJitifiableClumpComponents = nJitifiableClumpComponents;
@@ -1085,6 +1231,21 @@ void DEMKinematicThread::allocateGPUArrays(size_t nOwnerBodies,
 
     // Resize to the number of triangle facets
     DEME_DUAL_ARRAY_RESIZE(ownerTriMesh, nTriGM, 0);
+    DEME_DUAL_ARRAY_RESIZE(ownerTriStart, nOwnerBodies, 0);
+    DEME_DUAL_ARRAY_RESIZE(ownerTriCount, nOwnerBodies, 0);
+    DEME_DUAL_ARRAY_RESIZE(ownerIsBigMesh, nOwnerBodies, 0);
+    DEME_DUAL_ARRAY_RESIZE(bigMeshOwners, nTriMeshes > 0 ? nTriMeshes : 1, 0);
+    DEME_DUAL_ARRAY_RESIZE(ownerBigMeshLeafStart, nOwnerBodies, 0);
+    DEME_DUAL_ARRAY_RESIZE(ownerBigMeshLeafCount, nOwnerBodies, 0);
+    DEME_DUAL_ARRAY_RESIZE(bigMeshLeafOwner, 1, 0);
+    DEME_DUAL_ARRAY_RESIZE(bigMeshLeafTriStart, 1, 0);
+    DEME_DUAL_ARRAY_RESIZE(bigMeshLeafTriCount, 1, 0);
+    DEME_DUAL_ARRAY_RESIZE(bigMeshLeafTriIDs, 1, 0);
+    DEME_DUAL_ARRAY_RESIZE(bigMeshLeafLocalMin, 1, make_float3(0.f, 0.f, 0.f));
+    DEME_DUAL_ARRAY_RESIZE(bigMeshLeafLocalMax, 1, make_float3(0.f, 0.f, 0.f));
+    DEME_DUAL_ARRAY_RESIZE(bigMeshLeafMaxCentroidRadius, 1, 0.f);
+    DEME_DUAL_ARRAY_RESIZE(bigMeshLeafMaxExpandCoeff, 1, 0.f);
+    DEME_DUAL_ARRAY_RESIZE(bigMeshLeafMargin, 1, 0.f);
     DEME_DUAL_ARRAY_RESIZE(triPatchID, nTriGM, 0);
     DEME_DUAL_ARRAY_RESIZE(triNeighborIndex, nTriGM, NULL_BODYID);
     DEME_DUAL_ARRAY_RESIZE(triNeighbor1, nTriNeighbors, NULL_BODYID);
@@ -1273,6 +1434,7 @@ void DEMKinematicThread::populateEntityArrays(const std::vector<std::shared_ptr<
     size_t neighbor_write = nExistingTriNeighbors;
     for (size_t i = 0; i < input_mesh_obj_family.size(); i++) {
         // Per-facet info
+        const size_t local_tri_begin = k;
         size_t this_facet_owner = input_mesh_facet_owner.at(k);
         const bool mesh_needs_neighbors =
             !(input_mesh_obj_convex.at(this_facet_owner) != 0 && input_mesh_obj_never_winner.at(this_facet_owner) != 0);
@@ -1299,6 +1461,8 @@ void DEMKinematicThread::populateEntityArrays(const std::vector<std::shared_ptr<
         }
 
         const bodyID_t owner_id = owner_offset_for_mesh_obj + i;
+        ownerTriStart[owner_id] = nExistingFacets + local_tri_begin;
+        ownerTriCount[owner_id] = k - local_tri_begin;
         family_t this_family_num = input_mesh_obj_family.at(i);
         familyID[owner_id] = this_family_num;
         ownerMeshConvex[owner_id] = input_mesh_obj_convex.at(i);
@@ -1331,6 +1495,7 @@ void DEMKinematicThread::initGPUArrays(const std::vector<std::shared_ptr<DEMClum
                          input_mesh_obj_never_winner, input_mesh_facet_owner, input_mesh_facet_patch,
                          input_mesh_facet_neighbor1, input_mesh_facet_neighbor2, input_mesh_facet_neighbor3,
                          input_mesh_facets, clump_templates, ext_obj_comp_num, 0, 0, 0, 0, 0);
+    rebuildBigMeshOwnerMetadata();
 }
 
 void DEMKinematicThread::updateClumpMeshArrays(const std::vector<std::shared_ptr<DEMClumpBatch>>& input_clump_batches,
@@ -1361,6 +1526,145 @@ void DEMKinematicThread::updateClumpMeshArrays(const std::vector<std::shared_ptr
                          input_mesh_facet_neighbor1, input_mesh_facet_neighbor2, input_mesh_facet_neighbor3,
                          input_mesh_facets, clump_templates, ext_obj_comp_num, nExistingOwners, nExistingSpheres,
                          nExistingFacets, nExistingPatches, nExistingTriNeighbors);
+    rebuildBigMeshOwnerMetadata();
+}
+
+void DEMKinematicThread::rebuildBigMeshOwnerMetadata() {
+    const bodyID_t mesh_owner_start = simParams->nOwnerBodies - simParams->nTriMeshes;
+    bodyID_t write_idx = 0;
+    bodyID_t write_leaf = 0;
+    bodyID_t max_tri_count = 0;
+    bodyID_t total_leaf_tri_ids = 0;
+    const bodyID_t leaf_cap = DEME_MAX((bodyID_t)1, simParams->bigMeshBVHLeafTriCap);
+
+    for (bodyID_t owner = 0; owner < simParams->nOwnerBodies; owner++) {
+        ownerIsBigMesh[owner] = 0;
+        ownerBigMeshLeafStart[owner] = 0;
+        ownerBigMeshLeafCount[owner] = 0;
+        if (owner >= mesh_owner_start && ownerTriCount[owner] >= simParams->bigMeshOwnerTriThreshold) {
+            ownerIsBigMesh[owner] = 1;
+            write_idx++;
+            max_tri_count = DEME_MAX(max_tri_count, ownerTriCount[owner]);
+            write_leaf += (ownerTriCount[owner] + leaf_cap - 1) / leaf_cap;
+            total_leaf_tri_ids += ownerTriCount[owner];
+        }
+    }
+
+    DEME_DUAL_ARRAY_RESIZE(bigMeshOwners, write_idx > 0 ? write_idx : 1, 0);
+    DEME_DUAL_ARRAY_RESIZE(bigMeshLeafOwner, write_leaf > 0 ? write_leaf : 1, 0);
+    DEME_DUAL_ARRAY_RESIZE(bigMeshLeafTriStart, write_leaf > 0 ? write_leaf : 1, 0);
+    DEME_DUAL_ARRAY_RESIZE(bigMeshLeafTriCount, write_leaf > 0 ? write_leaf : 1, 0);
+    DEME_DUAL_ARRAY_RESIZE(bigMeshLeafTriIDs, total_leaf_tri_ids > 0 ? total_leaf_tri_ids : 1, 0);
+    DEME_DUAL_ARRAY_RESIZE(bigMeshLeafLocalMin, write_leaf > 0 ? write_leaf : 1, make_float3(0.f, 0.f, 0.f));
+    DEME_DUAL_ARRAY_RESIZE(bigMeshLeafLocalMax, write_leaf > 0 ? write_leaf : 1, make_float3(0.f, 0.f, 0.f));
+    DEME_DUAL_ARRAY_RESIZE(bigMeshLeafMaxCentroidRadius, write_leaf > 0 ? write_leaf : 1, 0.f);
+    DEME_DUAL_ARRAY_RESIZE(bigMeshLeafMaxExpandCoeff, write_leaf > 0 ? write_leaf : 1, 0.f);
+    DEME_DUAL_ARRAY_RESIZE(bigMeshLeafMargin, write_leaf > 0 ? write_leaf : 1, 0.f);
+
+    write_idx = 0;
+    write_leaf = 0;
+    bodyID_t tri_id_write = 0;
+    std::vector<MortonTriEntry> morton_sorted_tris;
+    morton_sorted_tris.reserve((size_t)DEME_MAX(max_tri_count, (bodyID_t)1));
+
+    for (bodyID_t owner = 0; owner < simParams->nOwnerBodies; owner++) {
+        if (!(owner >= mesh_owner_start && ownerIsBigMesh[owner])) {
+            continue;
+        }
+
+        bigMeshOwners[write_idx++] = owner;
+        ownerBigMeshLeafStart[owner] = write_leaf;
+
+        const bodyID_t tri_start = ownerTriStart[owner];
+        const bodyID_t tri_count = ownerTriCount[owner];
+        morton_sorted_tris.clear();
+        morton_sorted_tris.reserve((size_t)tri_count);
+
+        float3 bbox_min = make_float3(DEME_HUGE_FLOAT, DEME_HUGE_FLOAT, DEME_HUGE_FLOAT);
+        float3 bbox_max = make_float3(-DEME_HUGE_FLOAT, -DEME_HUGE_FLOAT, -DEME_HUGE_FLOAT);
+        for (bodyID_t local = 0; local < tri_count; local++) {
+            const bodyID_t triID = tri_start + local;
+            const float3 p1 = relPosNode1[triID];
+            const float3 p2 = relPosNode2[triID];
+            const float3 p3 = relPosNode3[triID];
+            const float3 c = hostTriangleCentroid(p1, p2, p3);
+            bbox_min.x = std::min(bbox_min.x, c.x);
+            bbox_min.y = std::min(bbox_min.y, c.y);
+            bbox_min.z = std::min(bbox_min.z, c.z);
+            bbox_max.x = std::max(bbox_max.x, c.x);
+            bbox_max.y = std::max(bbox_max.y, c.y);
+            bbox_max.z = std::max(bbox_max.z, c.z);
+            morton_sorted_tris.push_back({triID, 0u});
+        }
+
+        const float span_x = std::max(bbox_max.x - bbox_min.x, 1e-9f);
+        const float span_y = std::max(bbox_max.y - bbox_min.y, 1e-9f);
+        const float span_z = std::max(bbox_max.z - bbox_min.z, 1e-9f);
+        for (auto& entry : morton_sorted_tris) {
+            const float3 p1 = relPosNode1[entry.triID];
+            const float3 p2 = relPosNode2[entry.triID];
+            const float3 p3 = relPosNode3[entry.triID];
+            const float3 c = hostTriangleCentroid(p1, p2, p3);
+            const uint32_t qx = quantizeUnitTo10Bits((c.x - bbox_min.x) / span_x);
+            const uint32_t qy = quantizeUnitTo10Bits((c.y - bbox_min.y) / span_y);
+            const uint32_t qz = quantizeUnitTo10Bits((c.z - bbox_min.z) / span_z);
+            entry.key = morton3D10(qx, qy, qz);
+        }
+        std::stable_sort(morton_sorted_tris.begin(), morton_sorted_tris.end(),
+                         [](const MortonTriEntry& a, const MortonTriEntry& b) {
+                             if (a.key != b.key) {
+                                 return a.key < b.key;
+                             }
+                             return a.triID < b.triID;
+                         });
+
+        const bodyID_t n_leaves = (tri_count + leaf_cap - 1) / leaf_cap;
+        ownerBigMeshLeafCount[owner] = n_leaves;
+        for (bodyID_t li = 0; li < n_leaves; li++) {
+            const bodyID_t leaf_tri_offset = li * leaf_cap;
+            const bodyID_t remaining = tri_count - leaf_tri_offset;
+            const bodyID_t leaf_tri_count = DEME_MIN(leaf_cap, remaining);
+            bigMeshLeafOwner[write_leaf] = owner;
+            bigMeshLeafTriStart[write_leaf] = tri_id_write;
+            bigMeshLeafTriCount[write_leaf] = leaf_tri_count;
+
+            float3 leaf_min = make_float3(DEME_HUGE_FLOAT, DEME_HUGE_FLOAT, DEME_HUGE_FLOAT);
+            float3 leaf_max = make_float3(-DEME_HUGE_FLOAT, -DEME_HUGE_FLOAT, -DEME_HUGE_FLOAT);
+            float max_centroid_radius = 0.f;
+            float max_expand_coeff = 0.f;
+
+            for (bodyID_t local = 0; local < leaf_tri_count; local++) {
+                const bodyID_t triID = morton_sorted_tris[leaf_tri_offset + local].triID;
+                bigMeshLeafTriIDs[tri_id_write++] = triID;
+
+                const float3 p1 = relPosNode1[triID];
+                const float3 p2 = relPosNode2[triID];
+                const float3 p3 = relPosNode3[triID];
+                leaf_min.x = std::min(leaf_min.x, std::min(p1.x, std::min(p2.x, p3.x)));
+                leaf_min.y = std::min(leaf_min.y, std::min(p1.y, std::min(p2.y, p3.y)));
+                leaf_min.z = std::min(leaf_min.z, std::min(p1.z, std::min(p2.z, p3.z)));
+                leaf_max.x = std::max(leaf_max.x, std::max(p1.x, std::max(p2.x, p3.x)));
+                leaf_max.y = std::max(leaf_max.y, std::max(p1.y, std::max(p2.y, p3.y)));
+                leaf_max.z = std::max(leaf_max.z, std::max(p1.z, std::max(p2.z, p3.z)));
+
+                const float3 centroid = hostTriangleCentroid(p1, p2, p3);
+                max_centroid_radius = std::max(max_centroid_radius, (float)hostLength3(centroid));
+                max_expand_coeff = std::max(max_expand_coeff, hostTriangleExpandCoeff(p1, p2, p3));
+            }
+
+            bigMeshLeafLocalMin[write_leaf] = leaf_min;
+            bigMeshLeafLocalMax[write_leaf] = leaf_max;
+            bigMeshLeafMaxCentroidRadius[write_leaf] = max_centroid_radius;
+            bigMeshLeafMaxExpandCoeff[write_leaf] = max_expand_coeff;
+            bigMeshLeafMargin[write_leaf] = 0.f;
+            write_leaf++;
+        }
+    }
+
+    simParams->nBigMeshOwners = write_idx;
+    simParams->maxBigMeshOwnerTriCount = max_tri_count;
+    simParams->nBigMeshBVHLeaves = write_leaf;
+    packDataPointers();
 }
 
 void DEMKinematicThread::updatePrevContactArrays(DualStruct<DEMDataDT>& dT_data, size_t nContacts) {
@@ -1454,6 +1758,14 @@ void DEMKinematicThread::prewarmKernels() {
     }
     if (bin_triangle_kernels) {
         bin_triangle_kernels->kernel("precomputeTriangleSandwichData").instantiate();
+        bin_triangle_kernels->kernel("precomputeTriangleSandwichDataBigMeshOwners").instantiate();
+        bin_triangle_kernels->kernel("computeBigMeshLeafWorldBounds").instantiate();
+        bin_triangle_kernels->kernel("countBinsEachBigMeshLeafTouches").instantiate();
+        bin_triangle_kernels->kernel("countActiveBinsEachBigMeshLeafTouches").instantiate();
+        bin_triangle_kernels->kernel("populateBigMeshLeafActiveBinPairs").instantiate();
+        bin_triangle_kernels->kernel("populateBigMeshLeafBinPairs").instantiate();
+        bin_triangle_kernels->kernel("countTriPairsEachBigMeshLeafBinTouch").instantiate();
+        bin_triangle_kernels->kernel("populateTriPairsFromBigMeshLeafBinPairs").instantiate();
         bin_triangle_kernels->kernel("markCylPeriodicOwnerGhosts").instantiate();
         bin_triangle_kernels->kernel("getNumberOfBinsEachTriangleTouches").instantiate();
         bin_triangle_kernels->kernel("populateBinTriangleTouchingPairs").instantiate();
@@ -1472,6 +1784,8 @@ void DEMKinematicThread::prewarmKernels() {
     if (misc_kernels) {
         misc_kernels->kernel("computeMarginFromAbsv_implSph").instantiate();
         misc_kernels->kernel("computeMarginFromAbsv_implTri").instantiate();
+        misc_kernels->kernel("computeMarginFromAbsv_implBigMeshLeaf").instantiate();
+        misc_kernels->kernel("fillFixedMarginBigMeshLeaf").instantiate();
         misc_kernels->kernel("computeMarginFromAbsv_implAnal").instantiate();
     }
 }

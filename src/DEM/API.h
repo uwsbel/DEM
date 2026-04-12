@@ -1861,7 +1861,7 @@ class DEMSolver {
     bool m_gpu_timers_enabled = true;
 
     // Error-out avg num contacts
-    float threshold_error_out_num_cnts = 300.;
+    float threshold_error_out_num_cnts = 1000.;
 
     // Integrator type
     TIME_INTEGRATOR m_integrator = TIME_INTEGRATOR::EXTENDED_TAYLOR;
