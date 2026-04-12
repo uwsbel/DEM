@@ -563,6 +563,32 @@ bool DEMMesh::LoadWavefrontMesh(std::string input_file, bool load_normals, bool 
     return true;
 }
 
+void DEMMesh::SetPatchIDs(const std::vector<patchID_t>& patch_ids) {
+    assertTriLength(patch_ids.size(), "SetPatchIDs");
+    m_patch_ids = patch_ids;
+
+    // Compact arbitrary user patch labels into contiguous IDs [0, nPatches),
+    // preserving first-seen order for determinism.
+    std::unordered_map<patchID_t, patchID_t> compact_map;
+    compact_map.reserve(m_patch_ids.size());
+    patchID_t next_id = 0;
+    for (auto& pid : m_patch_ids) {
+        auto it = compact_map.find(pid);
+        if (it == compact_map.end()) {
+            it = compact_map.emplace(pid, next_id).first;
+            next_id++;
+        }
+        pid = it->second;
+    }
+    nPatches = static_cast<unsigned int>(next_id);
+    patches_explicitly_set = true;
+
+    if (m_patch_locations.size() != nPatches) {
+        m_patch_locations.clear();
+        patch_locations_explicitly_set = false;
+    }
+}
+
 // Write the specified meshes in a Wavefront .obj file
 void DEMMesh::WriteWavefront(const std::string& filename, std::vector<DEMMesh>& meshes) {
     std::ofstream mf(filename);

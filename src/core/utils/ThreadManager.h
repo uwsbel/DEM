@@ -47,6 +47,10 @@ class ThreadManager {
 
     // kT's
     std::atomic<int64_t> kinematicIngredProdDateStamp;  // dT tags this when sending it to kT
+    std::atomic<int64_t> kinematicOrderIssuedStamp;    // stamp associated with the order currently in dT->kT mailbox
+    std::atomic<int64_t> kinematicProduceSourceStamp;  // stamp of the order that actually generated the current kT produce
+    std::atomic<int64_t> kinematicOrderUsableDrift;    // portion of the commanded drift horizon dT plans to consume
+    std::atomic<int64_t> kinematicProduceUsableDrift;  // usable drift horizon attached to the current kT produce
     std::atomic<int64_t> kinematicMaxFutureDrift;       // kT tags this to its produce before shipping
     // Shared ghosting margin and max owner bound radius for cylindrical periodicity (kT -> dT)
     std::atomic<float> kinematicGhostMargin;
@@ -56,6 +60,11 @@ class ThreadManager {
     // Use acquire/release on loads/stores so buffer writes are visible before consumption without extra locking.
     std::atomic<bool> dynamicOwned_Prod2ConsBuffer_isFresh;
     std::atomic<bool> kinematicOwned_Cons2ProdBuffer_isFresh;
+    // dT may replace a not-yet-claimed kT work order, but only when the current certified kT coverage
+    // still has enough headroom. This preserves continuity near the safety frontier without stalling dT
+    // or requiring multiple transfer buffers.
+    std::atomic<bool> kinematicOrderClaimed;
+    std::mutex kinematicOrderStateLock;
 
     std::mutex kinematicCanProceed;
     std::mutex dynamicCanProceed;
@@ -80,11 +89,16 @@ class ThreadManager {
         dynamicMaxFutureDrift = -1;
         stampLastDynamicUpdateProdDate = -1;
         kinematicIngredProdDateStamp = -1;
+        kinematicOrderIssuedStamp = -1;
+        kinematicProduceSourceStamp = -1;
+        kinematicOrderUsableDrift = -1;
+        kinematicProduceUsableDrift = -1;
         currentStampOfDynamic = 0;
         completedStampOfDynamic = 0;
         dynamicDone = false;
         dynamicOwned_Prod2ConsBuffer_isFresh = false;
         kinematicOwned_Cons2ProdBuffer_isFresh = false;
+        kinematicOrderClaimed = false;
         kinematicGhostMargin = 0.f;
         maxOwnerBoundRadius = 0.f;
     }

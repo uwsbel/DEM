@@ -383,70 +383,66 @@ bool __device__ calcTriEntityOverlap(const T1& A,
 /// triangle.
 /// Code from Ericson, "real-time collision detection", 2005, pp. 141
 template <typename T1 = double3, typename T2 = double>
-__device__ bool snap_to_face(const T1& A, const T1& B, const T1& C, const T1& P, T1& res) {
-    T1 AB = B - A;
-    T1 AC = C - A;
+__device__ __forceinline__ bool snap_to_face(const T1& A, const T1& B, const T1& C, const T1& P, T1& res) {
+    const T1 AB = B - A;
+    const T1 AC = C - A;
 
     // Check if P in vertex region outside A
-    T1 AP = P - A;
-    T2 d1 = dot(AB, AP);
-    T2 d2 = dot(AC, AP);
-    if (d1 <= 0 && d2 <= 0) {
+    const T1 AP = P - A;
+    const T2 d1 = dot(AB, AP);
+    const T2 d2 = dot(AC, AP);
+    if (d1 <= (T2)0 && d2 <= (T2)0) {
         res = A;  // barycentric coordinates (1,0,0)
         return true;
     }
 
     // Check if P in vertex region outside B
-    T1 BP = P - B;
-    T2 d3 = dot(AB, BP);
-    T2 d4 = dot(AC, BP);
-    if (d3 >= 0 && d4 <= d3) {
+    const T1 BP = P - B;
+    const T2 d3 = dot(AB, BP);
+    const T2 d4 = dot(AC, BP);
+    if (d3 >= (T2)0 && d4 <= d3) {
         res = B;  // barycentric coordinates (0,1,0)
         return true;
     }
 
     // Check if P in edge region of AB
-    T2 vc = d1 * d4 - d3 * d2;
-    if (vc <= 0 && d1 >= 0 && d3 <= 0) {
-        // Return projection of P onto AB
-        T2 v = d1 / (d1 - d3);
+    const T2 vc = d1 * d4 - d3 * d2;
+    if (vc <= (T2)0 && d1 >= (T2)0 && d3 <= (T2)0) {
+        const T2 v = d1 / (d1 - d3);
         res = A + v * AB;  // barycentric coordinates (1-v,v,0)
         return true;
     }
 
     // Check if P in vertex region outside C
-    T1 CP = P - C;
-    T2 d5 = dot(AB, CP);
-    T2 d6 = dot(AC, CP);
-    if (d6 >= 0 && d5 <= d6) {
+    const T1 CP = P - C;
+    const T2 d5 = dot(AB, CP);
+    const T2 d6 = dot(AC, CP);
+    if (d6 >= (T2)0 && d5 <= d6) {
         res = C;  // barycentric coordinates (0,0,1)
         return true;
     }
 
     // Check if P in edge region of AC
-    T2 vb = d5 * d2 - d1 * d6;
-    if (vb <= 0 && d2 >= 0 && d6 <= 0) {
-        // Return projection of P onto AC
-        T2 w = d2 / (d2 - d6);
+    const T2 vb = d5 * d2 - d1 * d6;
+    if (vb <= (T2)0 && d2 >= (T2)0 && d6 <= (T2)0) {
+        const T2 w = d2 / (d2 - d6);
         res = A + w * AC;  // barycentric coordinates (1-w,0,w)
         return true;
     }
 
     // Check if P in edge region of BC
-    T2 va = d3 * d6 - d5 * d4;
-    if (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0) {
-        // Return projection of P onto BC
-        T2 w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+    const T2 va = d3 * d6 - d5 * d4;
+    if (va <= (T2)0 && (d4 - d3) >= (T2)0 && (d5 - d6) >= (T2)0) {
+        const T2 w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
         res = B + w * (C - B);  // barycentric coordinates (0,1-w,w)
         return true;
     }
 
     // P inside face region. Return projection of P onto face
-    // barycentric coordinates (u,v,w)
-    T2 denom = __drcp_ru(va + vb + vc);
-    T2 v = __dmul_ru(vb, denom);
-    T2 w = __dmul_ru(vc, denom);
-    res = A + v * AB + w * AC;  // = u*A + v*B + w*C  where  (u = 1 - v - w)
+    const T2 inv = (T2)1 / (va + vb + vc);
+    const T2 v = vb * inv;
+    const T2 w = vc * inv;
+    res = A + v * AB + w * AC;
     return false;
 }
 
@@ -460,6 +456,208 @@ template <typename T2>
 __device__ __forceinline__ T2 clampRange(const T2& x, const T2& lo, const T2& hi) {
     return x < lo ? lo : (x > hi ? hi : x);
 }
+
+__device__ __forceinline__ float fast_atan2_area(float y, float x) {
+    const float ax = fabsf(x);
+    const float ay = fabsf(y);
+    const float mx = fmaxf(ax, ay);
+    const float mn = fminf(ax, ay);
+    if (mx <= 0.0f) {
+        return 0.0f;
+    }
+
+    const float a = mn / mx;
+    const float s = a * a;
+    float r = ((-0.0464964749f * s + 0.15931422f) * s - 0.327622764f) * s * a + a;
+
+    if (ay > ax) r = 1.57079632679f - r;
+    if (x < 0.0f) r = 3.14159265359f - r;
+    if (y < 0.0f) r = -r;
+    return r;
+}
+
+__device__ __forceinline__ double fast_atan2_area(double y, double x) {
+#ifdef DEME_FAST_APPROX_AREA_DOUBLE
+    return (double)fast_atan2_area((float)y, (float)x);
+#else
+    return atan2(y, x);
+#endif
+}
+
+template <typename T1, typename T2>
+__device__ __forceinline__ T2 signed_sector_area3(const T1& a,
+                                                  const T1& b,
+                                                  const T1& unit_n,
+                                                  const T2 r2) {
+    const T2 cr = dot(unit_n, cross(a, b));
+    const T2 dt = dot(a, b);
+    return (T2)0.5 * r2 * fast_atan2_area(cr, dt);
+}
+
+template <typename T1, typename T2>
+__device__ __forceinline__ int segment_circle_intersections3(const T1& a,
+                                                             const T1& b,
+                                                             const T2 r2,
+                                                             T2& t0,
+                                                             T2& t1) {
+    const T1 d = b - a;
+    const T2 A = dot(d, d);
+    if (A <= (T2)DEME_TINY_FLOAT) {
+        return 0;
+    }
+
+    const T2 B = (T2)2 * dot(a, d);
+    const T2 C = dot(a, a) - r2;
+    const T2 D = B * B - (T2)4 * A * C;
+    if (D <= (T2)0) {
+        return 0;
+    }
+
+    const T2 sD = sqrt(D);
+    const T2 inv2A = (T2)0.5 / A;
+
+    int n = 0;
+    const T2 u0 = (-B - sD) * inv2A;
+    const T2 u1 = (-B + sD) * inv2A;
+
+    if (u0 > (T2)0 && u0 < (T2)1) {
+        t0 = u0;
+        ++n;
+    }
+    if (u1 > (T2)0 && u1 < (T2)1 && u1 != u0) {
+        if (n == 0) {
+            t0 = u1;
+        } else {
+            t1 = u1;
+        }
+        ++n;
+    }
+
+    return n;
+}
+
+template <typename T1, typename T2>
+__device__ __forceinline__ T2 signed_edge_disk_area3(const T1& a,
+                                                     const T1& b,
+                                                     const T1& unit_n,
+                                                     const T2 r2) {
+    T2 ts[4];
+    int n = 0;
+    ts[n++] = (T2)0;
+
+    T2 t0 = (T2)0;
+    T2 t1 = (T2)0;
+    const int ni = segment_circle_intersections3<T1, T2>(a, b, r2, t0, t1);
+    if (ni >= 1) ts[n++] = t0;
+    if (ni >= 2) ts[n++] = t1;
+    ts[n++] = (T2)1;
+
+    for (int i = 1; i < n; ++i) {
+        const T2 key = ts[i];
+        int j = i - 1;
+        while (j >= 0 && ts[j] > key) {
+            ts[j + 1] = ts[j];
+            --j;
+        }
+        ts[j + 1] = key;
+    }
+
+    const T1 d = b - a;
+    T2 area = (T2)0;
+    for (int i = 0; i < n - 1; ++i) {
+        const T2 ta = ts[i];
+        const T2 tb = ts[i + 1];
+        const T2 tm = (T2)0.5 * (ta + tb);
+
+        const T1 p = a + ta * d;
+        const T1 q = a + tb * d;
+        const T1 m = a + tm * d;
+
+        if (dot(m, m) <= r2) {
+            area += (T2)0.5 * dot(unit_n, cross(p, q));
+        } else {
+            area += signed_sector_area3<T1, T2>(p, q, unit_n, r2);
+        }
+    }
+
+    return area;
+}
+
+template <typename T1, typename T2>
+__device__ __forceinline__ bool point_in_triangle_on_plane(const T1& P,
+                                                           const T1& A,
+                                                           const T1& B,
+                                                           const T1& C,
+                                                           const T1& unit_n) {
+    const T2 s0 = dot(unit_n, cross(B - A, P - A));
+    const T2 s1 = dot(unit_n, cross(C - B, P - B));
+    const T2 s2 = dot(unit_n, cross(A - C, P - C));
+    return ((s0 >= (T2)0) && (s1 >= (T2)0) && (s2 >= (T2)0)) ||
+           ((s0 <= (T2)0) && (s1 <= (T2)0) && (s2 <= (T2)0));
+}
+
+template <typename T1, typename T2>
+__device__ __forceinline__ T2 point_line_distance_on_plane_sq(const T1& P,
+                                                              const T1& A,
+                                                              const T1& B,
+                                                              const T1& unit_n) {
+    const T1 e = B - A;
+    const T2 e2 = dot(e, e);
+    if (e2 <= (T2)DEME_TINY_FLOAT) {
+        const T1 d = P - A;
+        return dot(d, d);
+    }
+
+    const T2 num = dot(unit_n, cross(e, P - A));
+    return (num * num) / e2;
+}
+
+template <typename T1, typename T2>
+__device__ __forceinline__ T2 additive_circle_triangle_area_fast(const T1& A,
+                                                                 const T1& B,
+                                                                 const T1& C,
+                                                                 const T1& circle_center,
+                                                                 const T1& unit_n,
+                                                                 const T2 circle_r) {
+    const T2 r2 = circle_r * circle_r;
+
+    const T1 a = A - circle_center;
+    const T1 b = B - circle_center;
+    const T1 c = C - circle_center;
+
+    const T2 da2 = dot(a, a);
+    const T2 db2 = dot(b, b);
+    const T2 dc2 = dot(c, c);
+    const T2 triArea = (T2)0.5 * absT(dot(unit_n, cross(B - A, C - A)));
+
+    // Fast path: whole triangle lies inside the circle.
+    if (da2 <= r2 && db2 <= r2 && dc2 <= r2) {
+        return triArea;
+    }
+
+    // Fast path: whole circle lies inside the triangle.
+    if (point_in_triangle_on_plane<T1, T2>(circle_center, A, B, C, unit_n)) {
+        const T2 d0_2 = point_line_distance_on_plane_sq<T1, T2>(circle_center, A, B, unit_n);
+        const T2 d1_2 = point_line_distance_on_plane_sq<T1, T2>(circle_center, B, C, unit_n);
+        const T2 d2_2 = point_line_distance_on_plane_sq<T1, T2>(circle_center, C, A, unit_n);
+        const T2 dmin2 = tmin3(d0_2, d1_2, d2_2);
+        if (dmin2 >= r2) {
+            return (T2)deme::PI * r2;
+        }
+    }
+
+    T2 area = (T2)0;
+    area += signed_edge_disk_area3<T1, T2>(a, b, unit_n, r2);
+    area += signed_edge_disk_area3<T1, T2>(b, c, unit_n, r2);
+    area += signed_edge_disk_area3<T1, T2>(c, a, unit_n, r2);
+    area = absT(area);
+
+    if (area > triArea) {
+        area = triArea;
+    }
+    return area;
+}
+
 
 template <typename T1, typename T2>
 __device__ bool checkSphereTriPrismCandidate(const T1& outerA,
@@ -478,7 +676,11 @@ __device__ bool checkSphereTriPrismCandidate(const T1& outerA,
     snap_to_face<T1, T2>(outerA, outerB, outerC, sphere_pos, tri_closest);
 
     const T2 z = dot(sphere_pos - outerA, n_out);
-    const T2 zc = clampRange<T2>(z, (T2)(-thick), (T2)0);
+    // Candidate slab thickness must not be thinner than the sphere radius on the
+    // back side; otherwise once penetration exceeds dynamic margin thickness, kT
+    // can drop valid recovery contacts before dT resolves the overlap.
+    const T2 backReach = fmax(thick, radius);
+    const T2 zc = clampRange<T2>(z, (T2)(-backReach), (T2)0);
     closest = tri_closest + zc * n_out;
 
     const T1 d = sphere_pos - closest;
@@ -518,7 +720,9 @@ __device__ bool checkSphereOuterTriPrismBarrier(const T1& A,
     const bool face_is_edge = snap_to_face<T1, T2>(outerA, outerB, outerC, sphere_pos, face_loc);
     if (!face_is_edge) {
         const T2 h = dot(sphere_pos - outerA, n_out);
-        const T2 cand_depth = radius - h;
+        // One-sided outer-face barrier: outside uses geometric depth (radius - h),
+        // while inside keeps a saturated full-radius recovery depth.
+        const T2 cand_depth = radius - max2(h, (T2)0);
         if (cand_depth > (T2)0) {
             have_candidate = true;
             best_is_barrier = true;
@@ -547,7 +751,7 @@ __device__ bool checkSphereOuterTriPrismBarrier(const T1& A,
         if (u_raw >= (T2)0 && u_raw <= (T2)1 && w_raw >= (T2)0 && w_raw <= (T2)1) {
             T1 s_out = normalize(cross(edge, n_out));
             const T2 g = dot(rel, s_out);
-            const T2 cand_depth = radius - g;
+            const T2 cand_depth = radius - max2(g, (T2)0);
             if (cand_depth > (T2)0) {
                 if (!have_candidate || g < best_metric) {
                     have_candidate = true;
@@ -590,18 +794,15 @@ __device__ bool checkSphereOuterTriPrismBarrier(const T1& A,
         return false;
     }
 
-    // Cap recovery depth to avoid explosive impulses if a particle already ended up deep inside.
-    // Keep this intentionally conservative so first-time recovery contacts do not inject excessive energy.
-    const T2 max_recovery_depth = (T2)0.02 * radius;
-    const T2 capped_depth = best_depth > max_recovery_depth ? max_recovery_depth : best_depth;
-    depth = capped_depth;
+    depth = best_depth;
     normal = best_normal;
-    // Keep the contact point on/near the sphere-side interface midpoint so downstream
-    // lever-arm logic stays bounded even for deep barrier recoveries.
-    const T2 sphere_to_cp = radius - (T2)0.5 * capped_depth;
+    const T2 sphere_to_cp = radius - (T2)0.5 * depth;
     pt1 = sphere_pos - sphere_to_cp * normal;
 
-    const float depth_f = static_cast<float>(capped_depth);
+    // Use a monotone geometric area proxy. For very deep recovery states, keep the
+    // effective patch area at the hemisphere limit instead of letting it collapse.
+    const T2 depth_for_area = depth > radius ? radius : depth;
+    const float depth_f = static_cast<float>(depth_for_area);
     const float radius_f = static_cast<float>(radius);
     const float overlap_area_f = static_cast<float>(deme::PI) * (2.0f * radius_f * depth_f - depth_f * depth_f);
     overlapArea = overlap_area_f > 0.0f ? static_cast<T2>(overlap_area_f) : (T2)0;
@@ -742,77 +943,69 @@ Output:
 A return value of "true" signals collision.
 */
 template <typename T1, typename T2>
-__device__ bool checkTriSphereOverlap(const T1& A,           ///< First vertex of the triangle
-                                      const T1& B,           ///< Second vertex of the triangle
-                                      const T1& C,           ///< Third vertex of the triangle
-                                      const T1& sphere_pos,  ///< Location of the center of the sphere
-                                      const T2 radius,       ///< Sphere radius
-                                      T1& normal,            ///< contact normal
-                                      T2& depth,             ///< penetration (positive if in contact)
-                                      T2& overlapArea,       ///< overlap area
-                                      T1& pt1                ///< contact point on triangle
+__device__ __forceinline__ bool checkTriSphereOverlap(const T1& A,           ///< First vertex of the triangle
+                                                      const T1& B,           ///< Second vertex of the triangle
+                                                      const T1& C,           ///< Third vertex of the triangle
+                                                      const T1& sphere_pos,  ///< Location of the center of the sphere
+                                                      const T2 radius,       ///< Sphere radius
+                                                      T1& normal,            ///< contact normal
+                                                      T2& depth,             ///< penetration (positive if in contact)
+                                                      T2& overlapArea,       ///< overlap area
+                                                      T1& pt1                ///< contact point on triangle
 ) {
-    // Calculate face normal using RHR
-    T1 face_n = normalize(cross(B - A, C - A));
-
-    // Calculate signed height of sphere center above face plane
-    T2 h = dot(sphere_pos - A, face_n);
-
-    // Find the closest point on the face to the sphere center and determine
-    // whether or not this location is inside the face or on an edge.
     T1 faceLoc;
+    snap_to_face<T1, T2>(A, B, C, sphere_pos, faceLoc);
 
-    // Triangle in contact with sphere or not
-    bool in_contact;
+    const T1 AB = B - A;
+    const T1 AC = C - A;
+    const T1 N = cross(AB, AC);
+    const T2 N2 = dot(N, N);
 
-    // Still do the following since we need depth
-    if (!snap_to_face<T1, T2>(A, B, C, sphere_pos, faceLoc)) {
-        // Nearest point on the triangle is on its face
-        // printf("FACE CONTACT\n");
-        depth = radius - h;  // Positive for contact
-        normal.x = face_n.x;
-        normal.y = face_n.y;
-        normal.z = face_n.z;
-        // The contact point is somewhere in the midpoint of the deepest penetration line segment. Go from faceLoc,
-        // backwards wrt normal, half the penetration depth.
-        pt1 = faceLoc - (depth * 0.5) * normal;
-        if (h >= radius || h <= -radius) {
-            in_contact = false;
-        } else {
-            in_contact = true;
-        }
-        // overlapArea = deme::PI * (radius * radius - (radius - depth) * (radius - depth));
-        // Simplify it and assign it at the end of this call
+    T1 face_n = make_one3<T1>(1, 0, 0);
+    if (N2 > (T2)DEME_TINY_FLOAT * (T2)DEME_TINY_FLOAT) {
+        face_n = ((T2)1 / sqrt(N2)) * N;
+    }
+
+    const T1 normal_d = sphere_pos - faceLoc;
+    const T2 dist2 = dot(normal_d, normal_d);
+    const T2 dist = sqrt(dist2);
+    depth = radius - dist;
+
+    if (dist > (T2)DEME_TINY_FLOAT) {
+        normal = ((T2)1 / dist) * normal_d;
     } else {
-        // printf("EDGE CONTACT\n");
-        // Nearest point on the triangle is on an edge
-        {
-            T1 normal_d = sphere_pos - faceLoc;
-            normal.x = normal_d.x;
-            normal.y = normal_d.y;
-            normal.z = normal_d.z;
-        }
-        T2 dist = length(normal);
-        depth = radius - dist;  // Positive for contact
+        normal = face_n;
+    }
 
-        normal = (1.0 / dist) * normal;
-        // Go from faceLoc, backwards wrt normal, half the penetration depth
-        pt1 = faceLoc - (depth * 0.5) * normal;
-        if (depth < 0. || h >= radius || h <= -radius) {
-            in_contact = false;
-        } else {
-            in_contact = true;
-        }
-        // In the edge case, overlapArea is a bit tricky to define accurately.
-        // Here we still just approximate it as a circle area.
+    pt1 = faceLoc - (depth * (T2)0.5) * normal;
+
+    if (depth <= (T2)0) {
+        overlapArea = (T2)0;
+        return false;
     }
-    {
-        const float depth_f = static_cast<float>(depth);
-        const float radius_f = static_cast<float>(radius);
-        const float overlap_area_f = static_cast<float>(deme::PI) * (2.0f * radius_f * depth_f - depth_f * depth_f);
-        overlapArea = static_cast<T2>(overlap_area_f);
+
+    if (N2 <= (T2)DEME_TINY_FLOAT * (T2)DEME_TINY_FLOAT) {
+        overlapArea = (T2)0;
+        return true;
     }
-    return in_contact;
+
+    const T2 signed_h = dot(sphere_pos - A, face_n);
+    const T2 abs_h = absT(signed_h);
+    if (abs_h >= radius) {
+        overlapArea = (T2)0;
+        return true;
+    }
+
+    const T2 circle_r2 = radius * radius - signed_h * signed_h;
+    if (circle_r2 <= (T2)0) {
+        overlapArea = (T2)0;
+        return true;
+    }
+
+    const T2 circle_r = sqrt(circle_r2);
+    const T1 circle_center = sphere_pos - signed_h * face_n;
+    overlapArea = additive_circle_triangle_area_fast<T1, T2>(A, B, C, circle_center, face_n, circle_r);
+    return true;
 }
 
 /**
@@ -843,57 +1036,50 @@ __device__ bool checkTriSphereOverlap_directional(const T1& A,           ///< Fi
                                                   T2& depth,             ///< penetration (positive if in contact)
                                                   T1& pt1                ///< contact point on triangle
 ) {
-    // Calculate face normal using RHR
-    T1 face_n = normalize(cross(B - A, C - A));
+    // Directional law:
+    // - Face witness: oriented one-sided barrier depth (radius - signed height), normal fixed to face normal.
+    // - Edge/vertex witness: geometric closest-point depth, but prefer oriented face support when active.
+    // This maintains outward recovery when the center drifts behind the local face.
+    const T1 face_n = normalize(cross(B - A, C - A));
 
-    // Calculate signed height of sphere center above face plane
-    T2 h = dot(sphere_pos - A, face_n);
-
-    // Find the closest point on the face to the sphere center and determine
-    // whether or not this location is inside the face or on an edge.
     T1 faceLoc;
+    const bool on_edge = snap_to_face<T1, T2>(A, B, C, sphere_pos, faceLoc);
 
-    // Triangle in contact with sphere or not
-    bool in_contact;
+    const T2 h = dot(sphere_pos - faceLoc, face_n);
+    const T1 normal_d = sphere_pos - faceLoc;
+    const T2 dist = length(normal_d);
+    const T2 depth_geom = radius - dist;
+    const T2 depth_face = radius - h;
 
-    // Still do the following since we need depth
-    if (!snap_to_face<T1, T2>(A, B, C, sphere_pos, faceLoc)) {
-        // Nearest point on the triangle is on its face
-        // printf("FACE CONTACT\n");
-        depth = radius - h;  // Positive for contact
-        normal.x = face_n.x;
-        normal.y = face_n.y;
-        normal.z = face_n.z;
-        // The contact point is somewhere in the midpoint of the deepest penetration line segment. Go from faceLoc,
-        // backwards wrt normal, half the penetration depth.
-        pt1 = faceLoc - (depth * 0.5) * normal;
-        if (depth < 0.) {
-            in_contact = false;
-        } else {
-            in_contact = true;
-        }
+    if (!on_edge) {
+        depth = depth_face;
+        normal = face_n;
     } else {
-        // printf("EDGE CONTACT\n");
-        // Nearest point on the triangle is on an edge
-        {
-            T1 normal_d = sphere_pos - faceLoc;
-            normal.x = normal_d.x;
-            normal.y = normal_d.y;
-            normal.z = normal_d.z;
-        }
-        T2 dist = length(normal);
-        depth = radius - dist;  // Positive for contact
-
-        normal = (1.0 / dist) * normal;
-        // Go from faceLoc, backwards wrt normal, half the penetration depth
-        pt1 = faceLoc - (depth * 0.5) * normal;
-        if (depth < 0. || h >= radius) {
-            in_contact = false;
+        // Edge/vertex witness:
+        // - Outside the oriented face plane (h >= 0): use geometric closest-point contact.
+        // - Behind the face plane (h < 0): switch to one-sided face recovery to avoid inward normals.
+        // Using `depth_face > 0` here is too permissive (true for almost all contact states) and
+        // can override edge geometry, creating seam-support discontinuities.
+        if (h < (T2)0) {
+            depth = depth_face;
+            normal = face_n;
         } else {
-            in_contact = true;
+            depth = depth_geom;
+            if (dist > (T2)DEME_TINY_FLOAT) {
+                normal = ((T2)1 / dist) * normal_d;
+            } else {
+                // Deterministic fallback when center is exactly on the witness point.
+                normal = face_n;
+            }
+            // Keep edge/vertex normals in the outward hemisphere to avoid repulsive force inversion.
+            if (dot(normal, face_n) < (T2)0) {
+                normal = -normal;
+            }
         }
     }
-    return in_contact;
+
+    pt1 = faceLoc - (depth * (T2)0.5) * normal;
+    return depth > (T2)0;
 }
 
 // -----------------------------------------------------------------------------

@@ -615,24 +615,6 @@ __device__ __forceinline__ void calculatePatchContactForces_impl(deme::DEMSimPar
         }
     }
 
-    // Patch-level geometric invariant guard for real owner-owner contacts.
-    // Prevent rare depth outliers from injecting unphysical force/energy.
-    if constexpr (AType == deme::GEO_T_SPHERE && BType == deme::GEO_T_TRIANGLE) {
-        if (ContactType != deme::NOT_A_CONTACT) {
-            const float3 cpRelToSphere = to_float3(contactPnt - bodyAPos);
-            const float cpRel2 = dot(cpRelToSphere, cpRelToSphere);
-            const float shell_half_B = ownerShellHalfThickness(simParams, granData, ownerB);
-            const float maxSphereReach =
-                ARadius + shell_half_B +
-                fmaxf(simParams->dyn.beta + simParams->maxFamilyExtraMargin + extraMarginSize, 0.f) + 1e-6f;
-            if (!isfinite(cpRel2) || cpRel2 > maxSphereReach * maxSphereReach) {
-                ContactType = deme::NOT_A_CONTACT;
-                overlapDepth = -DEME_HUGE_FLOAT;
-                overlapArea = 0.0;
-            }
-        }
-    }
-
     // Now compute forces using the patch-based contact data
     _forceModelContactWildcardAcq_;
 
@@ -717,6 +699,7 @@ __device__ __forceinline__ void calculatePatchContactForces_impl(deme::DEMSimPar
             atomicAdd(granData->ownerCylSkipPotentialTotal, 1u);
         }
     }
+    const deme::contact_t ContactType_prev = ContactType;
     const bool activeForThisStep =
         (ContactType_candidate != deme::NOT_A_CONTACT) && !discardGhostGhost && !cylPeriodicSkipPair &&
         !ownerBoundReject;
@@ -750,8 +733,12 @@ __device__ __forceinline__ void calculatePatchContactForces_impl(deme::DEMSimPar
             ownerBoundReject && ContactType_candidate != deme::NOT_A_CONTACT && !discardGhostGhost) {
             _forceModelContactWildcardDestroy_;
         }
-        // True non-contacts still destroy history.
-        if (ContactType_candidate == deme::NOT_A_CONTACT || discardGhostGhost) {
+        // True non-contacts still destroy history, but keep history across transient mesh misses.
+        const bool transientMeshMiss =
+            (ContactType_candidate == deme::NOT_A_CONTACT) &&
+            (ContactType_prev == deme::TRIANGLE_TRIANGLE_CONTACT || ContactType_prev == deme::SPHERE_TRIANGLE_CONTACT ||
+             ContactType_prev == deme::TRIANGLE_ANALYTICAL_CONTACT);
+        if ((ContactType_candidate == deme::NOT_A_CONTACT || discardGhostGhost) && !transientMeshMiss) {
             _forceModelContactWildcardDestroy_;
         }
     }

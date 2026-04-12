@@ -19,6 +19,83 @@ inline __device__ float triRadiusFromNodes(const float3& center,
     return sqrtf(r2);
 }
 
+inline __device__ bool stableOwnSphTriPairByAABB(const float3& sphXYZ,
+                                                 const float sphRadius,
+                                                 const float artificialMargin,
+                                                 const float3& triANode1,
+                                                 const float3& triANode2,
+                                                 const float3& triANode3,
+                                                 const float3& triBNode1,
+                                                 const float3& triBNode2,
+                                                 const float3& triBNode3,
+                                                 const deme::binID_t& binID,
+                                                 const deme::DEMSimParams* simParams) {
+    const int nbX = (int)simParams->nbX;
+    const int nbY = (int)simParams->nbY;
+    const int nbZ = (int)simParams->nbZ;
+    const double invBinSize = simParams->dyn.inv_binSize;
+
+    // Ownership bin must be chosen from the same geometric support used by bin-touch generation.
+    // Sphere binning uses the true radius (no extra margin), so including artificialMargin here
+    // can pick a bin that this sphere never visits in the current pass, causing one-step contact loss.
+    (void)artificialMargin;
+    const float sphRange = sphRadius;
+    const deme::AxisBounds sx = axis_bounds((double)sphXYZ.x, (double)sphRange, nbX, invBinSize);
+    const deme::AxisBounds sy = axis_bounds((double)sphXYZ.y, (double)sphRange, nbY, invBinSize);
+    const deme::AxisBounds sz = axis_bounds((double)sphXYZ.z, (double)sphRange, nbZ, invBinSize);
+    if (sx.imax < sx.imin || sy.imax < sy.imin || sz.imax < sz.imin) {
+        return false;
+    }
+
+    float min_x = triANode1.x, max_x = triANode1.x;
+    float min_y = triANode1.y, max_y = triANode1.y;
+    float min_z = triANode1.z, max_z = triANode1.z;
+    const float3 triNodes[5] = {triANode2, triANode3, triBNode1, triBNode2, triBNode3};
+    for (int i = 0; i < 5; i++) {
+        min_x = fminf(min_x, triNodes[i].x);
+        max_x = fmaxf(max_x, triNodes[i].x);
+        min_y = fminf(min_y, triNodes[i].y);
+        max_y = fmaxf(max_y, triNodes[i].y);
+        min_z = fminf(min_z, triNodes[i].z);
+        max_z = fmaxf(max_z, triNodes[i].z);
+    }
+    const float enlarge = (float)DEME_BIN_ENLARGE_RATIO_FOR_FACETS * (float)simParams->dyn.binSize;
+    min_x -= enlarge;
+    min_y -= enlarge;
+    min_z -= enlarge;
+    max_x += enlarge;
+    max_y += enlarge;
+    max_z += enlarge;
+
+    const double cx = 0.5 * ((double)min_x + (double)max_x);
+    const double cy = 0.5 * ((double)min_y + (double)max_y);
+    const double cz = 0.5 * ((double)min_z + (double)max_z);
+    const double rx = 0.5 * ((double)max_x - (double)min_x);
+    const double ry = 0.5 * ((double)max_y - (double)min_y);
+    const double rz = 0.5 * ((double)max_z - (double)min_z);
+    const deme::AxisBounds tx = axis_bounds(cx, rx, nbX, invBinSize);
+    const deme::AxisBounds ty = axis_bounds(cy, ry, nbY, invBinSize);
+    const deme::AxisBounds tz = axis_bounds(cz, rz, nbZ, invBinSize);
+    if (tx.imax < tx.imin || ty.imax < ty.imin || tz.imax < tz.imin) {
+        return false;
+    }
+
+    const int ix = (sx.imin > tx.imin) ? sx.imin : tx.imin;
+    const int iy = (sy.imin > ty.imin) ? sy.imin : ty.imin;
+    const int iz = (sz.imin > tz.imin) ? sz.imin : tz.imin;
+    const int ux = (sx.imax < tx.imax) ? sx.imax : tx.imax;
+    const int uy = (sy.imax < ty.imax) ? sy.imax : ty.imax;
+    const int uz = (sz.imax < tz.imax) ? sz.imax : tz.imax;
+    if (ux < ix || uy < iy || uz < iz) {
+        return false;
+    }
+
+    const deme::binID_t owner_bin =
+        binIDFrom3Indices<deme::binID_t>((deme::binID_t)ix, (deme::binID_t)iy, (deme::binID_t)iz,
+                                         simParams->nbX, simParams->nbY, simParams->nbZ);
+    return owner_bin == binID;
+}
+
 // #include <cub/block/block_load.cuh>
 // #include <cub/block/block_store.cuh>
 // #include <cub/block/block_reduce.cuh>
@@ -357,35 +434,18 @@ if (!cylPeriodicShouldUseGhostPair(ownerPosA, radA_owner, sphGhost, sphGhost_neg
                                                  ? granData->familyExtraMarginSize[ownerFamily]
                                                  : granData->familyExtraMarginSize[triOwnerFamilies[ind]];
 
-                    float3 cntPnt, normal;
-                    float depth;
-                    bool in_contact_A, in_contact_B;
-                    // NOTE: checkTriSphereOverlap_directional, instead of checkTriSphereOverlap, is in use here. This
-                    // is because if the later is in use, then if a sphere is between 2 sandwiching triangles, then its
-                    // potential contact with the original triangle will not be registered.
-                    in_contact_A = checkTriSphereOverlap_directional<float3, float>(
-                        triANode1[ind], triANode2[ind], triANode3[ind], sphXYZ, myRadius, normal, depth, cntPnt);
-                    // If the contact is too shallow (smaller than the smaller of artificial margin, then it can be
-                    // dropped to reduce the overall number of contact pairs, as when making sandwich, the added safety
-                    // margin already includes familyExtra). Note checkTriSphereOverlap_directional gives positive
-                    // number for contacts.
-                    in_contact_A = in_contact_A && (depth > artificialMargin);
+                    float3 cntPntPrism = make_float3(0.f, 0.f, 0.f);
+                    float depthPrism = -DEME_HUGE_FLOAT;
+                    bool in_contact = checkSphereTriPrismCandidate<float3, float>(
+                        triANode1[ind], triANode2[ind], triANode3[ind], triBNode1[ind], sphXYZ, myRadius,
+                        depthPrism, cntPntPrism);
+                    // Keep all geometric prism-overlap witnesses; dT performs final exact culling.
 
-                    // And triangle B...
-                    in_contact_B = checkTriSphereOverlap_directional<float3, float>(
-                        triBNode1[ind], triBNode2[ind], triBNode3[ind], sphXYZ, myRadius, normal, depth, cntPnt);
-                    // Same treatment for B...
-                    in_contact_B = in_contact_B && (depth > artificialMargin);
-
-                    // Note the contact point must be calculated through one triangle, not the 2 phantom
-                    // triangles; or we will have double count problems. Use the first triangle as standard.
-                    if (in_contact_A || in_contact_B) {
-                        snap_to_face(triANode1[ind], triANode2[ind], triANode3[ind], sphXYZ, cntPnt);
-                        deme::binID_t contactPntBin = getPointBinID<deme::binID_t>(
-                            cntPnt.x, cntPnt.y, cntPnt.z, simParams->dyn.inv_binSize, simParams->nbX, simParams->nbY);
-                        if (contactPntBin == binID) {
-                            atomicAdd(&blockSphTriPairCnt, 1);
-                        }
+                    if (in_contact) {
+                        // Do not gate by a single ownership bin here.
+                        // This gate can intermittently drop valid sph-tri pairs when overlap support
+                        // moves across bins; downstream sorting + duplicate removal already canonicalizes pairs.
+                        atomicAdd(&blockSphTriPairCnt, 1);
                     }
                 }  // End of a 256-sphere sweep
             }
@@ -714,41 +774,24 @@ if (!cylPeriodicShouldUseGhostPair(ownerPosA, radA_owner, sphGhost, sphGhost_neg
                                                  ? granData->familyExtraMarginSize[ownerFamily]
                                                  : granData->familyExtraMarginSize[triOwnerFamilies[ind]];
 
-                    float3 cntPnt, normal;
-                    float depth;
-                    bool in_contact_A, in_contact_B;
-                    // NOTE: checkTriSphereOverlap_directional, instead of checkTriSphereOverlap, is in use here. This
-                    // is because if the later is in use, then if a sphere is between 2 sandwiching triangles, then its
-                    // potential contact with the original triangle will not be registered.
-                    in_contact_A = checkTriSphereOverlap_directional<float3, float>(
-                        triANode1[ind], triANode2[ind], triANode3[ind], sphXYZ, myRadius, normal, depth, cntPnt);
-                    // If the contact is too shallow (smaller than the smaller of artificial margin, then it can be
-                    // dropped to reduce the overall number of contact pairs, as when making sandwich, the added safety
-                    // margin already includes familyExtra). Note checkTriSphereOverlap_directional gives positive
-                    // number for contacts.
-                    in_contact_A = in_contact_A && (depth > artificialMargin);
+                    float3 cntPntPrism = make_float3(0.f, 0.f, 0.f);
+                    float depthPrism = -DEME_HUGE_FLOAT;
+                    bool in_contact = checkSphereTriPrismCandidate<float3, float>(
+                        triANode1[ind], triANode2[ind], triANode3[ind], triBNode1[ind], sphXYZ, myRadius,
+                        depthPrism, cntPntPrism);
+                    // Keep all geometric prism-overlap witnesses; dT performs final exact culling.
 
-                    // And triangle B...
-                    in_contact_B = checkTriSphereOverlap_directional<float3, float>(
-                        triBNode1[ind], triBNode2[ind], triBNode3[ind], sphXYZ, myRadius, normal, depth, cntPnt);
-                    // Same treatment for B...
-                    in_contact_B = in_contact_B && (depth > artificialMargin);
-
-                    // Note the contact point must be calculated through one triangle, not the 2 phantom
-                    // triangles; or we will have double count problems. Use the first triangle as standard.
-                    if (in_contact_A || in_contact_B) {
-                        snap_to_face(triANode1[ind], triANode2[ind], triANode3[ind], sphXYZ, cntPnt);
-                        deme::binID_t contactPntBin = getPointBinID<deme::binID_t>(
-                            cntPnt.x, cntPnt.y, cntPnt.z, simParams->dyn.inv_binSize, simParams->nbX, simParams->nbY);
-                        if (contactPntBin == binID) {
-                            deme::contactPairs_t inBlockOffset = smReportOffset + atomicAdd(&blockSphTriPairCnt, 1);
-                            if (inBlockOffset < smReportOffset_end) {
-                                idSphA_sm[inBlockOffset] =
-                                    sphGhost ? cylPeriodicEncodeGhostID(sphereID, sphGhost_neg) : sphereID;
-                                idTriB_sm[inBlockOffset] =
-                                    triGhost ? cylPeriodicEncodeGhostID(triIDs[ind], triGhost_neg) : triIDs[ind];
-                                dType_sm[inBlockOffset] = deme::SPHERE_TRIANGLE_CONTACT;
-                            }
+                    if (in_contact) {
+                        // Do not gate by a single ownership bin here.
+                        // This gate can intermittently drop valid sph-tri pairs when overlap support
+                        // moves across bins; downstream sorting + duplicate removal already canonicalizes pairs.
+                        deme::contactPairs_t inBlockOffset = smReportOffset + atomicAdd(&blockSphTriPairCnt, 1);
+                        if (inBlockOffset < smReportOffset_end) {
+                            idSphA_sm[inBlockOffset] =
+                                sphGhost ? cylPeriodicEncodeGhostID(sphereID, sphGhost_neg) : sphereID;
+                            idTriB_sm[inBlockOffset] =
+                                triGhost ? cylPeriodicEncodeGhostID(triIDs[ind], triGhost_neg) : triIDs[ind];
+                            dType_sm[inBlockOffset] = deme::SPHERE_TRIANGLE_CONTACT;
                         }
                     }
                 }  // End of a 256-sphere sweep

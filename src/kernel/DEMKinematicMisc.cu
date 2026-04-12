@@ -77,6 +77,8 @@ DEME_KERNEL void computeMarginFromAbsv_implTri(deme::DEMSimParams* simParams,
         float3 myRelPos = triangleCentroid<float3>(triBNode1, triBNode2, triBNode3);
 
         deme::bodyID_t ownerID = granData->ownerTriMesh[triID];
+        const float owner_abs_v = absVel_owner[ownerID];
+        const float owner_abs_angv = absAngVel_owner[ownerID];
         float vel = getApproxAbsVel(simParams, ownerID, absVel_owner, absAngVel_owner, myRelPos);
         unsigned int my_family = granData->familyID[ownerID];
 
@@ -89,14 +91,21 @@ DEME_KERNEL void computeMarginFromAbsv_implTri(deme::DEMSimParams* simParams,
         if (penetrationMargin > simParams->capTriTriPenetration) {
             penetrationMargin = simParams->capTriTriPenetration;
         }
-        // We hope that penetrationMargin is small, so it's absorbed into the velocity-induce margin.
-        // But if not, it should prevail to avoid losing contacts involving triangles inside another mesh.
+        // Keep broadphase coverage at least as large as currently observed tri-tri penetration
+        // for effectively static triangle owners. This stabilizes seam/support continuity against
+        // static meshes without globally inflating dynamic tri-tri broadphase in dense flows.
         double finalMargin =
             (double)(vel * simParams->dyn.expSafetyMulti + simParams->dyn.expSafetyAdder) * (*ts) * (*maxDrift) +
             granData->familyExtraMarginSize[my_family];
-        // if (finalMargin < penetrationMargin) {
-        //     finalMargin = penetrationMargin;
-        // }
+        const bool owner_effectively_static =
+            (owner_abs_v <= 1e-6f && owner_abs_angv <= 1e-6f && isfinite(owner_abs_v) && isfinite(owner_abs_angv));
+        // For moving triangle owners, keep only a bounded penetration floor to avoid global
+        // broadphase explosion from a single outlier contact.
+        const double moving_pen_floor_cap = DEME_MIN((double)simParams->capTriTriPenetration, 1.0e-3);
+        const double penetrationFloor = owner_effectively_static ? penetrationMargin : DEME_MIN(penetrationMargin, moving_pen_floor_cap);
+        if (finalMargin < penetrationFloor) {
+            finalMargin = penetrationFloor;
+        }
 
         granData->marginSizeTriangle[triID] = finalMargin;
     }
