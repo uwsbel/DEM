@@ -4,7 +4,7 @@
 // when we added extra contact margins
 if (overlapDepth > 0) {
     // Material properties
-    float E_cnt, G_cnt, CoR_cnt, mu_cnt, Crr_cnt;
+    float E_cnt, G_cnt, CoR_cnt, mu_0_cnt, mu_min_cnt, mu_v_min_cnt, mu_dyn_cnt, mu_v_dyn_cnt, Crr_cnt;
     {
         // E and nu are associated with each material, so obtain them this way
         float E_A = E[bodyAMatType];
@@ -12,9 +12,13 @@ if (overlapDepth > 0) {
         float E_B = E[bodyBMatType];
         float nu_B = nu[bodyBMatType];
         matProxy2ContactParam<float>(E_cnt, G_cnt, E_A, nu_A, E_B, nu_B);
-        // CoR, mu and Crr are pair-wise, so obtain them this way
+        // CoR, friction and Crr are pair-wise, so obtain them this way
         CoR_cnt = CoR[bodyAMatType][bodyBMatType];
-        mu_cnt = mu[bodyAMatType][bodyBMatType];
+        mu_0_cnt = mu_0[bodyAMatType][bodyBMatType];
+        mu_min_cnt = mu_min[bodyAMatType][bodyBMatType];
+        mu_v_min_cnt = mu_v_min[bodyAMatType][bodyBMatType];
+        mu_dyn_cnt = mu_dyn[bodyAMatType][bodyBMatType];
+        mu_v_dyn_cnt = mu_v_dyn[bodyAMatType][bodyBMatType];
         Crr_cnt = Crr[bodyAMatType][bodyBMatType];
     }
 
@@ -126,6 +130,18 @@ if (overlapDepth > 0) {
     }
 
     // Tangential force part
+    const float vrel_tan_mag = length(vrel_tan);
+    const float mu_v_span = mu_v_dyn_cnt - mu_v_min_cnt;
+    float mu_cnt = mu_dyn_cnt;
+    if (mu_v_min_cnt > DEME_TINY_FLOAT && vrel_tan_mag <= mu_v_min_cnt) {
+        const float t = fminf(fmaxf(vrel_tan_mag / mu_v_min_cnt, 0.f), 1.f);
+        const float s = t * t * (3.f - 2.f * t);
+        mu_cnt = mu_0_cnt + (mu_min_cnt - mu_0_cnt) * s;
+    } else if (mu_v_span > DEME_TINY_FLOAT && vrel_tan_mag < mu_v_dyn_cnt) {
+        const float t = fminf(fmaxf((vrel_tan_mag - mu_v_min_cnt) / mu_v_span, 0.f), 1.f);
+        const float s = t * t * (3.f - 2.f * t);
+        mu_cnt = mu_min_cnt + (mu_dyn_cnt - mu_min_cnt) * s;
+    }
     if (mu_cnt > 0.f) {
         float gt;
         const float kt = 8.f * G_cnt * contact_radius;
@@ -144,7 +160,7 @@ if (overlapDepth > 0) {
                 delta_tan = (tangent_force + gt * vrel_tan) / (-kt);
             }
         } else {
-            tangent_force = make_float3(0, 0, 0);
+            tangent_force = make_float3(0.f, 0.f, 0.f);
         }
         // Use force to collect tangent_force
         force += tangent_force;

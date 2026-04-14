@@ -17,7 +17,7 @@
 //   bridge_on                   : wet bridge hysteresis state (0/1 encoded as float)
 
 // Material properties
-float E_cnt, G_cnt, CoR_cnt, mu_cnt, Crr_cnt;
+float E_cnt, G_cnt, CoR_cnt, mu_0_cnt, mu_min_cnt, mu_v_min_cnt, mu_dyn_cnt, mu_v_dyn_cnt, Crr_cnt;
 float dry_pull_off_cnt = 0.f;
 float dry_delta_cnt = 0.f;
 float wet_cap_cnt = 0.f;
@@ -31,7 +31,11 @@ float wet_rupture_cnt = 0.f;
     matProxy2ContactParam<float>(E_cnt, G_cnt, E_A, nu_A, E_B, nu_B);
     // Pair-wise properties
     CoR_cnt = CoR[bodyAMatType][bodyBMatType];
-    mu_cnt = mu[bodyAMatType][bodyBMatType];
+    mu_0_cnt = mu_0[bodyAMatType][bodyBMatType];
+    mu_min_cnt = mu_min[bodyAMatType][bodyBMatType];
+    mu_v_min_cnt = mu_v_min[bodyAMatType][bodyBMatType];
+    mu_dyn_cnt = mu_dyn[bodyAMatType][bodyBMatType];
+    mu_v_dyn_cnt = mu_v_dyn[bodyAMatType][bodyBMatType];
     Crr_cnt = Crr[bodyAMatType][bodyBMatType];
     dry_pull_off_cnt = AdhesionDryPullOff[bodyAMatType][bodyBMatType];
     dry_delta_cnt = AdhesionDryDistance[bodyAMatType][bodyBMatType];
@@ -176,6 +180,18 @@ if (physical_contact || wet_bridge_live) {
         }
 
         // Tangential force part
+        const float vrel_tan_mag = length(vrel_tan);
+        const float mu_v_span = mu_v_dyn_cnt - mu_v_min_cnt;
+        float mu_cnt = mu_dyn_cnt;
+        if (mu_v_min_cnt > DEME_TINY_FLOAT && vrel_tan_mag <= mu_v_min_cnt) {
+            const float t = fminf(fmaxf(vrel_tan_mag / mu_v_min_cnt, 0.f), 1.f);
+            const float s = t * t * (3.f - 2.f * t);
+            mu_cnt = mu_0_cnt + (mu_min_cnt - mu_0_cnt) * s;
+        } else if (mu_v_span > DEME_TINY_FLOAT && vrel_tan_mag < mu_v_dyn_cnt) {
+            const float t = fminf(fmaxf((vrel_tan_mag - mu_v_min_cnt) / mu_v_span, 0.f), 1.f);
+            const float s = t * t * (3.f - 2.f * t);
+            mu_cnt = mu_min_cnt + (mu_dyn_cnt - mu_min_cnt) * s;
+        }
         if (mu_cnt > 0.f) {
             float gt;
             const float kt = 8.f * G_cnt * contact_radius;

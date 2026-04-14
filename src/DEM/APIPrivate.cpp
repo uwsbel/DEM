@@ -37,6 +37,70 @@ inline uint64_t makeEdgeKey(int a, int b) {
     return (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi);
 }
 
+
+
+inline bool isSmoothFrictionProp(const std::string& prop_name) {
+    return prop_name == "mu_0" || prop_name == "mu_min" || prop_name == "mu_v_min" ||
+           prop_name == "mu_dyn" || prop_name == "mu_v_dyn";
+}
+
+inline bool tryGetSmoothFrictionDiagValue(const std::unordered_map<std::string, float>& name_val_pairs,
+                                          const std::string& prop_name,
+                                          float& val) {
+    if (!isSmoothFrictionProp(prop_name)) {
+        return false;
+    }
+
+    bool found_any = false;
+    auto find_or = [&name_val_pairs, &found_any](const std::string& key, float fallback) {
+        auto it = name_val_pairs.find(key);
+        if (it != name_val_pairs.end()) {
+            found_any = true;
+            return it->second;
+        }
+        return fallback;
+    };
+
+    const float mu_legacy = find_or("mu", 0.f);
+    const float mu0 = find_or("mu_0", mu_legacy);
+    const float mu_dyn = find_or("mu_dyn", mu0);
+    const float mu_min = find_or("mu_min", mu_dyn);
+    const float mu_v_min = find_or("mu_v_min", 0.1f);
+    const float mu_v_dyn = find_or("mu_v_dyn", 1.8f);
+
+    if (!found_any) {
+        return false;
+    }
+
+    if (prop_name == "mu_0") {
+        val = mu0;
+    } else if (prop_name == "mu_min") {
+        val = mu_min;
+    } else if (prop_name == "mu_v_min") {
+        val = mu_v_min;
+    } else if (prop_name == "mu_v_dyn") {
+        val = mu_v_dyn;
+    } else {
+        val = mu_dyn;
+    }
+    return true;
+}
+
+inline const std::vector<std::pair<std::pair<unsigned int, unsigned int>, float>>* getPairOverridesWithLegacyFallback(
+    const std::unordered_map<std::string, std::vector<std::pair<std::pair<unsigned int, unsigned int>, float>>>& pairmap,
+    const std::string& prop_name) {
+    auto it = pairmap.find(prop_name);
+    if (it != pairmap.end()) {
+        return &(it->second);
+    }
+    if (prop_name == "mu_0" || prop_name == "mu_dyn") {
+        auto legacy_it = pairmap.find("mu");
+        if (legacy_it != pairmap.end()) {
+            return &(legacy_it->second);
+        }
+    }
+    return nullptr;
+}
 std::vector<std::array<bodyID_t, 3>> buildTriangleEdgeNeighbors(const std::vector<int3>& face_v_indices,
                                                                  const std::vector<float3>& vertices) {
     const size_t n_faces = face_v_indices.size();
@@ -2574,6 +2638,16 @@ inline void DEMSolver::equipMaterials(std::unordered_map<std::string, std::strin
     m_material_prop_names.insert(mat_prop_that_must_exist.begin(), mat_prop_that_must_exist.end());
     m_material_prop_names.insert(m_pairwise_material_prop_names.begin(), m_pairwise_material_prop_names.end());
 
+    // Keep runtime/JIT paths backward compatible with legacy "mu" definitions.
+    // Some runs may still provide/set only "mu", while newer Hertzian scripts read the smooth-friction symbols.
+    if (check_exist(m_material_prop_names, std::string("mu")) || check_exist(m_pairwise_material_prop_names, std::string("mu"))) {
+        const std::array<const char*, 5> smooth_props = {"mu_0", "mu_min", "mu_v_min", "mu_dyn", "mu_v_dyn"};
+        for (const auto* smooth_name : smooth_props) {
+            m_material_prop_names.insert(smooth_name);
+            m_pairwise_material_prop_names.insert(smooth_name);
+        }
+    }
+
     // Init
     std::string materialDefs = " ";
 
@@ -2601,8 +2675,8 @@ inline void DEMSolver::equipMaterials(std::unordered_map<std::string, std::strin
             if (check_exist(name_val_pairs, prop_name)) {
                 val = name_val_pairs.at(prop_name);
                 flags[i][i] = 1;
-                // If prop_name does not exist for this material, then if prop_name is one of the
-                // mat_prop_that_must_exist, the user should know there is trouble...
+            } else if (tryGetSmoothFrictionDiagValue(name_val_pairs, prop_name, val)) {
+                flags[i][i] = 1;
             }
             // Write down the value at diagnoal
             pair_mat[i][i] = val;
@@ -2647,10 +2721,10 @@ inline void DEMSolver::equipMaterials(std::unordered_map<std::string, std::strin
                 }
             }
             // Now if user specified them, add to the matrix
-            if (check_exist(m_pairwise_matprop, prop_name)) {
-                const auto& pair_props = m_pairwise_matprop.at(prop_name);
+            const auto* pair_props = getPairOverridesWithLegacyFallback(m_pairwise_matprop, prop_name);
+            if (pair_props) {
                 // Loop through every pair that is associated with this property name
-                for (const auto& pair_prop : pair_props) {
+                for (const auto& pair_prop : *pair_props) {
                     const std::pair<unsigned int, unsigned int>& order_pair = pair_prop.first;
                     float val = pair_prop.second;
                     pair_mat[order_pair.first][order_pair.second] = val;

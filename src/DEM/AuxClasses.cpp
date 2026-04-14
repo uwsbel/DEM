@@ -807,8 +807,8 @@ void DEMForceModel::SetForceModelType(FORCE_MODEL model_type) {
     type = model_type;
     switch (model_type) {
         case (FORCE_MODEL::HERTZIAN):
-            m_must_have_mat_props = {"E", "nu", "CoR", "mu", "Crr"};
-            m_pairwise_mat_props = {"CoR", "mu", "Crr"};
+            m_must_have_mat_props = {"E", "nu", "CoR", "mu_0", "mu_min", "mu_v_min", "mu_dyn", "mu_v_dyn", "Crr"};
+            m_pairwise_mat_props = {"CoR", "mu_0", "mu_min", "mu_v_min", "mu_dyn", "mu_v_dyn", "Crr"};
             m_force_model = HERTZIAN_FORCE_MODEL();
             // History-based model uses these history-related arrays
             m_contact_wildcards = {"delta_time", "delta_tan_x", "delta_tan_y", "delta_tan_z"};
@@ -823,9 +823,9 @@ void DEMForceModel::SetForceModelType(FORCE_MODEL model_type) {
             m_owner_wildcards.clear();
             break;
         case (FORCE_MODEL::HERTZIAN_ADHESION):
-            m_must_have_mat_props = {"E", "nu", "CoR", "mu", "Crr", "AdhesionDryPullOff", "AdhesionDryDistance",
+            m_must_have_mat_props = {"E", "nu", "CoR", "mu_0", "mu_min", "mu_v_min", "mu_dyn", "mu_v_dyn", "Crr", "AdhesionDryPullOff", "AdhesionDryDistance",
                                      "AdhesionWetCap", "AdhesionWetRupture"};
-            m_pairwise_mat_props = {"CoR", "mu", "Crr", "AdhesionDryPullOff", "AdhesionDryDistance",
+            m_pairwise_mat_props = {"CoR", "mu_0", "mu_min", "mu_v_min", "mu_dyn", "mu_v_dyn", "Crr", "AdhesionDryPullOff", "AdhesionDryDistance",
                                     "AdhesionWetCap", "AdhesionWetRupture"};
             m_force_model = HERTZIAN_FORCE_MODEL_ADHESION();
             m_contact_wildcards = {"delta_time", "delta_tan_x", "delta_tan_y", "delta_tan_z", "delta_max",
