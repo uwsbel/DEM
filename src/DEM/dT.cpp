@@ -47,6 +47,356 @@
 
 namespace deme {
 
+namespace {
+inline bool triangle_scene(const DEMSimParams* simParams) {
+    return simParams && simParams->nTriGM > 0;
+}
+
+inline bool triangle_scene(const DualStruct<DEMSimParams>& simParams) {
+    return triangle_scene(&(*simParams));
+}
+
+struct DriftSchedulerTuning {
+    // Tune these first if you want to trade speed against VRAM growth.
+    // Higher gains / lower gates => stricter scheduler, lower drift, lower VRAM.
+    // Lower gains / higher gates => looser scheduler, more drift, more speed.
+
+    // Base contact-pressure gains.
+    double tri_primitive_density_gain = 0.10;
+    double tri_patch_density_gain = 0.12;
+    double sphere_contact_density_gain = 1.5;
+
+    // Contact-emergence gains (new contacts appearing per step / per observed drift).
+    double tri_primitive_emergence_step_gain = 18.0;
+    double tri_patch_emergence_step_gain = 26.0;
+    double tri_primitive_emergence_drift_gain = 10.0;
+    double tri_patch_emergence_drift_gain = 14.0;
+    double sphere_primitive_emergence_step_gain = 12.0;
+    double sphere_primitive_emergence_drift_gain = 7.0;
+    double emergence_up_alpha = 0.35;
+    double emergence_down_alpha = 0.12;
+
+    // Usable-horizon thresholds. Raise these to loosen the scheduler.
+    double tri_usable_t1 = 0.68;
+    double tri_usable_t2 = 0.82;
+    double tri_ratio_t0 = 0.86;
+    double tri_ratio_t1 = 0.66;
+    double tri_ratio_t2 = 0.54;
+
+    double sphere_usable_t1 = 0.72;
+    double sphere_usable_t2 = 0.86;
+    double sphere_usable_t3 = 0.94;
+    double sphere_ratio_t0 = 0.91;
+    double sphere_ratio_t1 = 0.86;
+    double sphere_ratio_t2 = 0.78;
+    double sphere_ratio_t3 = 0.70;
+
+    // Total-drift guard. Lower gates / ratios => stricter cap near observed drift.
+    double tri_guard_pressure_gate = 0.50;
+    double tri_guard_cost_gate = 0.98;
+    double sphere_guard_pressure_gate = 0.60;
+    double sphere_guard_cost_gate = 1.04;
+
+    double tri_total_keep_ratio_soft = 0.78;
+    double tri_total_keep_ratio_mid = 0.62;
+    double tri_total_keep_ratio_hard = 0.46;
+    double tri_total_keep_ratio_extreme = 0.32;
+
+    double sphere_total_keep_ratio_soft = 0.86;
+    double sphere_total_keep_ratio_mid = 0.74;
+    double sphere_total_keep_ratio_hard = 0.60;
+    double sphere_total_keep_ratio_extreme = 0.46;
+
+    // Usable-horizon guard after total-drift selection.
+    double tri_usable_keep_ratio_soft = 0.62;
+    double tri_usable_keep_ratio_mid = 0.48;
+    double tri_usable_keep_ratio_hard = 0.36;
+    double tri_usable_keep_ratio_extreme = 0.24;
+
+    double sphere_usable_keep_ratio_soft = 0.72;
+    double sphere_usable_keep_ratio_mid = 0.60;
+    double sphere_usable_keep_ratio_hard = 0.48;
+    double sphere_usable_keep_ratio_extreme = 0.36;
+};
+
+inline const DriftSchedulerTuning& drift_tuning() {
+    static const DriftSchedulerTuning kTune {};
+    return kTune;
+}
+
+inline size_t quantized_contact_capacity(size_t n) {
+    const size_t floor_cap = 1024;
+    n = std::max(n, floor_cap);
+    const size_t padded = n + n / 8 + 64;
+    const size_t quantum = (padded < 8192) ? 256 : ((padded < 65536) ? 1024 : 4096);
+    return ((padded + quantum - 1) / quantum) * quantum;
+}
+
+template <class T>
+inline void compact_dual_array(DualArray<T>& arr, size_t target) {
+#ifdef DEME_USE_MANAGED_ARRAYS
+    arr.resize(target);
+#else
+    arr.resizeHost(target);
+    arr.resizeDevice(target, true);
+#endif
+}
+
+inline double contact_pressure_metric(const DEMSimParams* simParams,
+                                     bool tri_scene_flag,
+                                     size_t nPrimitivePairs,
+                                     size_t primitiveCapacity,
+                                     size_t nPatchPairs,
+                                     size_t patchCapacity) {
+    const auto& tune = drift_tuning();
+    const double prim_util = primitiveCapacity ? (double)nPrimitivePairs / (double)primitiveCapacity : 0.0;
+    const double patch_util = patchCapacity ? (double)nPatchPairs / (double)patchCapacity : 0.0;
+    const double owner_count = (simParams && simParams->nOwnerBodies > 0) ? (double)simParams->nOwnerBodies : 1.0;
+    if (tri_scene_flag) {
+        const double prim_density_pressure =
+            std::clamp(((double)nPrimitivePairs / owner_count) * tune.tri_primitive_density_gain, 0.0, 1.0);
+        const double patch_density_pressure =
+            std::clamp(((double)nPatchPairs / owner_count) * tune.tri_patch_density_gain, 0.0, 1.0);
+        return std::clamp(std::max(std::max(prim_util, patch_util), std::max(prim_density_pressure, patch_density_pressure)),
+                          0.0, 1.0);
+    }
+    const double contact_density = (double)nPrimitivePairs / owner_count;
+    const double density_pressure = std::clamp(contact_density * tune.sphere_contact_density_gain, 0.0, 1.0);
+    return std::clamp(std::max(prim_util, density_pressure), 0.0, 1.0);
+}
+
+inline double contact_pressure_metric(const DualStruct<DEMSimParams>& simParams,
+                                      bool tri_scene_flag,
+                                      size_t nPrimitivePairs,
+                                      size_t primitiveCapacity,
+                                      size_t nPatchPairs,
+                                      size_t patchCapacity) {
+    return contact_pressure_metric(&(*simParams), tri_scene_flag, nPrimitivePairs, primitiveCapacity, nPatchPairs,
+                                   patchCapacity);
+}
+
+inline double contact_emergence_metric(const DEMSimParams* simParams,
+                                       bool tri_scene_flag,
+                                       uint64_t steps,
+                                       unsigned observed_drift,
+                                       size_t prevPrimitivePairs,
+                                       size_t prevPatchPairs,
+                                       size_t currPrimitivePairs,
+                                       size_t currPatchPairs) {
+    if (!simParams || steps == 0) {
+        return 0.0;
+    }
+    const auto& tune = drift_tuning();
+    const double owner_count = (simParams->nOwnerBodies > 0) ? (double)simParams->nOwnerBodies : 1.0;
+    const double step_norm = (double)std::max<uint64_t>(steps, 1);
+    const double drift_norm = (double)std::max(1u, observed_drift);
+
+    const double delta_prim = (currPrimitivePairs > prevPrimitivePairs)
+                                  ? (double)(currPrimitivePairs - prevPrimitivePairs)
+                                  : 0.0;
+    const double delta_patch = (currPatchPairs > prevPatchPairs) ? (double)(currPatchPairs - prevPatchPairs) : 0.0;
+
+    const double prim_per_owner_step = delta_prim / (owner_count * step_norm);
+    const double patch_per_owner_step = delta_patch / (owner_count * step_norm);
+    const double prim_per_owner_drift = delta_prim / (owner_count * drift_norm);
+    const double patch_per_owner_drift = delta_patch / (owner_count * drift_norm);
+
+    if (tri_scene_flag) {
+        const double prim_step_p = prim_per_owner_step * tune.tri_primitive_emergence_step_gain;
+        const double patch_step_p = patch_per_owner_step * tune.tri_patch_emergence_step_gain;
+        const double prim_drift_p = prim_per_owner_drift * tune.tri_primitive_emergence_drift_gain;
+        const double patch_drift_p = patch_per_owner_drift * tune.tri_patch_emergence_drift_gain;
+        return std::clamp(std::max(std::max(prim_step_p, patch_step_p), std::max(prim_drift_p, patch_drift_p)), 0.0,
+                          1.0);
+    }
+
+    const double prim_step_p = prim_per_owner_step * tune.sphere_primitive_emergence_step_gain;
+    const double prim_drift_p = prim_per_owner_drift * tune.sphere_primitive_emergence_drift_gain;
+    return std::clamp(std::max(prim_step_p, prim_drift_p), 0.0, 1.0);
+}
+
+inline double contact_emergence_metric(const DualStruct<DEMSimParams>& simParams,
+                                       bool tri_scene_flag,
+                                       uint64_t steps,
+                                       unsigned observed_drift,
+                                       size_t prevPrimitivePairs,
+                                       size_t prevPatchPairs,
+                                       size_t currPrimitivePairs,
+                                       size_t currPatchPairs) {
+    return contact_emergence_metric(&(*simParams), tri_scene_flag, steps, observed_drift, prevPrimitivePairs,
+                                    prevPatchPairs, currPrimitivePairs, currPatchPairs);
+}
+
+inline unsigned choose_usable_drift_horizon(unsigned total, unsigned lag, unsigned maxv, bool tri_scene_flag,
+                                            double pressure) {
+    const auto& tune = drift_tuning();
+    total = std::max(1u, std::min(total, maxv));
+    pressure = std::clamp(pressure, 0.0, 1.0);
+    if (total <= 2u) {
+        return total;
+    }
+    unsigned slack = tri_scene_flag ? std::max(2u, total / 5u) : std::max(1u, total / 8u);
+    double ratio = tri_scene_flag ? tune.tri_ratio_t0 : tune.sphere_ratio_t0;
+    if (tri_scene_flag) {
+        if (pressure > tune.tri_usable_t2) {
+            ratio = tune.tri_ratio_t2;
+            slack = std::max(slack, total / 2u);
+        } else if (pressure > tune.tri_usable_t1) {
+            ratio = tune.tri_ratio_t1;
+            slack = std::max(slack, total / 3u);
+        }
+    } else {
+        if (pressure > tune.sphere_usable_t3) {
+            ratio = tune.sphere_ratio_t3;
+            slack = std::max(slack, total / 3u);
+        } else if (pressure > tune.sphere_usable_t2) {
+            ratio = tune.sphere_ratio_t2;
+            slack = std::max(slack, total / 4u);
+        } else if (pressure > tune.sphere_usable_t1) {
+            ratio = tune.sphere_ratio_t1;
+            slack = std::max(slack, total / 5u);
+        }
+    }
+    const unsigned floor_from_lag = std::min(total, lag + (tri_scene_flag ? std::max(2u, total / 6u)
+                                                            : std::max(1u, total / 10u)));
+    const unsigned ratio_target = std::max(1u, std::min(total, (unsigned)std::llround((double)total * ratio)));
+    const unsigned capped_from_back = (total > slack) ? (total - slack) : 1u;
+    const unsigned usable = std::max(floor_from_lag, std::min(capped_from_back, ratio_target));
+    return std::min(total, std::max(1u, usable));
+}
+
+inline unsigned choose_pending_overwrite_gap(unsigned usable, bool tri_scene_flag, double pressure) {
+    pressure = std::clamp(pressure, 0.0, 1.0);
+    if (usable <= 2u) {
+        return 1u;
+    }
+    unsigned gap = tri_scene_flag ? std::max(2u, usable / 3u) : std::max(1u, usable / 4u);
+    if (tri_scene_flag && pressure > 0.75) {
+        gap = std::max(1u, usable / 4u);
+    } else if (!tri_scene_flag) {
+        if (pressure > 0.85) {
+            gap = std::max(1u, usable / 5u);
+        } else if (pressure > 0.65) {
+            gap = std::max(1u, usable / 4u);
+        }
+    }
+    return gap;
+}
+
+inline double motion_guard_severity(bool tri_scene_flag, double pressure, double cost_ratio) {
+    const auto& tune = drift_tuning();
+    pressure = std::clamp(pressure, 0.0, 1.0);
+    cost_ratio = std::max(0.0, cost_ratio);
+    const double pressure_gate = tri_scene_flag ? tune.tri_guard_pressure_gate : tune.sphere_guard_pressure_gate;
+    const double cost_gate = tri_scene_flag ? tune.tri_guard_cost_gate : tune.sphere_guard_cost_gate;
+    const double p = (pressure - pressure_gate) / std::max(1e-6, 1.0 - pressure_gate);
+    const double c = (cost_ratio - cost_gate) / std::max(0.20, 1.7 - cost_gate);
+    return std::max(0.0, std::max(p, c));
+}
+
+inline unsigned choose_motion_total_cap(unsigned proposed_total,
+                                        unsigned observed_total,
+                                        unsigned lag,
+                                        unsigned maxv,
+                                        bool tri_scene_flag,
+                                        double pressure,
+                                        double cost_ratio) {
+    const auto& tune = drift_tuning();
+    proposed_total = std::max(1u, std::min(proposed_total, maxv));
+    observed_total = std::max(1u, std::min(observed_total, maxv));
+    lag = std::min(lag, maxv);
+
+    const unsigned floor_keep = std::min(proposed_total, lag + (tri_scene_flag ? 2u : 1u));
+    if (proposed_total <= floor_keep) {
+        return proposed_total;
+    }
+
+    const double sev = motion_guard_severity(tri_scene_flag, pressure, cost_ratio);
+    if (sev <= 0.0) {
+        return proposed_total;
+    }
+
+    unsigned extra_allow = tri_scene_flag ? 1u : 2u;
+    if (sev > 0.90) {
+        extra_allow = 0u;
+    } else if (sev > 0.65) {
+        extra_allow = 1u;
+    }
+
+    unsigned cap = std::min(maxv, observed_total + extra_allow);
+
+    if (observed_total > lag) {
+        const unsigned obs_excess = observed_total - lag;
+        double keep_ratio = tri_scene_flag ? tune.tri_total_keep_ratio_soft : tune.sphere_total_keep_ratio_soft;
+        if (sev > 0.90) {
+            keep_ratio = tri_scene_flag ? tune.tri_total_keep_ratio_extreme : tune.sphere_total_keep_ratio_extreme;
+        } else if (sev > 0.70) {
+            keep_ratio = tri_scene_flag ? tune.tri_total_keep_ratio_hard : tune.sphere_total_keep_ratio_hard;
+        } else if (sev > 0.50) {
+            keep_ratio = tri_scene_flag ? tune.tri_total_keep_ratio_mid : tune.sphere_total_keep_ratio_mid;
+        }
+        const unsigned kept_excess =
+            std::max(tri_scene_flag ? 2u : 1u, (unsigned)std::llround((double)obs_excess * keep_ratio));
+        cap = std::min(cap, std::min(maxv, lag + kept_excess));
+    } else {
+        cap = std::min(cap, floor_keep);
+    }
+
+    return std::max(floor_keep, std::min(proposed_total, cap));
+}
+
+inline unsigned choose_motion_usable_cap(unsigned total,
+                                         unsigned lag,
+                                         bool tri_scene_flag,
+                                         double pressure,
+                                         double cost_ratio) {
+    const auto& tune = drift_tuning();
+    total = std::max(1u, total);
+    if (total <= lag + 1u) {
+        return total;
+    }
+    const double sev = motion_guard_severity(tri_scene_flag, pressure, cost_ratio);
+    if (sev <= 0.0) {
+        return total;
+    }
+
+    const unsigned excess = total - lag;
+    double keep_ratio = tri_scene_flag ? tune.tri_usable_keep_ratio_soft : tune.sphere_usable_keep_ratio_soft;
+    if (sev > 0.90) {
+        keep_ratio = tri_scene_flag ? tune.tri_usable_keep_ratio_extreme : tune.sphere_usable_keep_ratio_extreme;
+    } else if (sev > 0.70) {
+        keep_ratio = tri_scene_flag ? tune.tri_usable_keep_ratio_hard : tune.sphere_usable_keep_ratio_hard;
+    } else if (sev > 0.50) {
+        keep_ratio = tri_scene_flag ? tune.tri_usable_keep_ratio_mid : tune.sphere_usable_keep_ratio_mid;
+    }
+    const unsigned keep = std::max(1u, (unsigned)std::llround((double)excess * keep_ratio));
+    return std::max(std::min(total, lag + 1u), std::min(total, lag + keep));
+}
+
+inline double choose_drift_floor(bool tri_scene_flag, bool strong_motion_scene, double pressure, unsigned lag_sched) {
+    (void)strong_motion_scene;
+    pressure = std::clamp(pressure, 0.0, 1.0);
+    double floor = std::max(5.0, (double)lag_sched);
+    if (!tri_scene_flag) {
+        return floor;
+    }
+
+    // Drift floor is now tied primarily to contact pressure / emergence, not to any motion-class hint.
+    if (pressure > 0.90) {
+        floor = std::max(4.0, (double)lag_sched);
+    } else if (pressure > 0.78) {
+        floor = std::max(5.0, (double)lag_sched);
+    } else if (pressure > 0.64) {
+        floor = std::max(6.0, (double)lag_sched);
+    } else if (pressure > 0.50) {
+        floor = std::max(7.0, (double)lag_sched);
+    } else {
+        floor = std::max(8.0, (double)lag_sched);
+    }
+    return floor;
+}
+}  // namespace
+
 // Put sim data array pointers in place
 void DEMDynamicThread::packDataPointers() {
     inertiaPropOffsets.bindDevicePointer(&(granData->inertiaPropOffsets));
@@ -2759,9 +3109,10 @@ inline void DEMDynamicThread::unpackMyBuffer() {
         }
         return !(env[0] == '0' && env[1] == '\0');
     }();
+    const bool tri_scene = triangle_scene(simParams);
     bool swapped = false;
 #ifndef DEME_USE_MANAGED_ARRAYS
-    if (kT && allow_swap && streamInfo.device == kT->streamInfo.device) {
+    if (!tri_scene && kT && allow_swap && streamInfo.device == kT->streamInfo.device) {
         swapped = swap_device_buffer(idPrimitiveA, idPrimitiveA_buffer[read_idx]);
         swapped = swap_device_buffer(idPrimitiveB, idPrimitiveB_buffer[read_idx]) && swapped;
         swapped = swap_device_buffer(contactTypePrimitive, contactTypePrimitive_buffer[read_idx]) && swapped;
@@ -2788,7 +3139,7 @@ inline void DEMDynamicThread::unpackMyBuffer() {
     }
 
     if (!solverFlags.isHistoryless) {
-        if (kT && allow_direct_mapping && streamInfo.device == kT->streamInfo.device) {
+        if (!tri_scene && kT && allow_direct_mapping && streamInfo.device == kT->streamInfo.device) {
             granData->contactMapping = contactMapping_buffer[read_idx].data();
             contactMappingUsesBuffer = true;
         } else {
@@ -2869,6 +3220,144 @@ bool DEMDynamicThread::tryConsumeKinematicProduce(bool allow_blocking, bool mark
     return true;
 }
 
+void DEMDynamicThread::compactTriangleContactStorage(size_t nPrimitivePairs, size_t nPatchPairs) {
+    if (!triangle_scene(simParams) || !kT) {
+        return;
+    }
+    const size_t prim_target = quantized_contact_capacity(std::max<size_t>(nPrimitivePairs, 1));
+    const size_t patch_target = quantized_contact_capacity(std::max<size_t>(nPatchPairs, 1));
+
+    if (idPrimitiveA.size() > prim_target * 3 / 2) {
+        compact_dual_array(idPrimitiveA, prim_target);
+        compact_dual_array(idPrimitiveB, prim_target);
+        compact_dual_array(contactTypePrimitive, prim_target);
+        compact_dual_array(geomToPatchMap, prim_target);
+        if (!(solverFlags.useNoContactRecord && simParams->nTriGM == 0)) {
+            compact_dual_array(contactForces, prim_target);
+            compact_dual_array(contactTorque_convToForce, prim_target);
+            compact_dual_array(contactPointGeometryA, prim_target);
+            compact_dual_array(contactPointGeometryB, prim_target);
+        }
+    }
+
+    if (idPatchA.size() > patch_target * 3 / 2) {
+        compact_dual_array(idPatchA, patch_target);
+        compact_dual_array(idPatchB, patch_target);
+        compact_dual_array(contactTypePatch, patch_target);
+        compact_dual_array(contactPatchIsland, patch_target);
+    }
+
+    const int write_idx = kt_write_buf;
+    if (write_idx >= 0 && write_idx < 2) {
+        if (idPrimitiveA_buffer[write_idx].size() > prim_target * 3 / 2) {
+            idPrimitiveA_buffer[write_idx].resize(prim_target, true);
+            idPrimitiveB_buffer[write_idx].resize(prim_target, true);
+            contactTypePrimitive_buffer[write_idx].resize(prim_target, true);
+            geomToPatchMap_buffer[write_idx].resize(prim_target, true);
+        }
+        if (idPatchA_buffer[write_idx].size() > patch_target * 3 / 2) {
+            idPatchA_buffer[write_idx].resize(patch_target, true);
+            idPatchB_buffer[write_idx].resize(patch_target, true);
+            contactTypePatch_buffer[write_idx].resize(patch_target, true);
+            contactPatchIsland_buffer[write_idx].resize(patch_target, true);
+            if (!solverFlags.isHistoryless) {
+                contactMapping_buffer[write_idx].resize(patch_target, true);
+            }
+        }
+        if (kT) {
+            kT->granData->pDTOwnedBuffer_idPrimitiveA = idPrimitiveA_buffer[write_idx].data();
+            kT->granData->pDTOwnedBuffer_idPrimitiveB = idPrimitiveB_buffer[write_idx].data();
+            kT->granData->pDTOwnedBuffer_contactType = contactTypePrimitive_buffer[write_idx].data();
+            kT->granData->pDTOwnedBuffer_geomToPatchMap = geomToPatchMap_buffer[write_idx].data();
+            kT->granData->pDTOwnedBuffer_idPatchA = idPatchA_buffer[write_idx].data();
+            kT->granData->pDTOwnedBuffer_idPatchB = idPatchB_buffer[write_idx].data();
+            kT->granData->pDTOwnedBuffer_contactTypePatch = contactTypePatch_buffer[write_idx].data();
+            kT->granData->pDTOwnedBuffer_contactPatchIsland = contactPatchIsland_buffer[write_idx].data();
+            if (!solverFlags.isHistoryless) {
+                kT->granData->pDTOwnedBuffer_contactMapping = contactMapping_buffer[write_idx].data();
+            }
+        }
+    }
+}
+
+bool DEMDynamicThread::publishKinematicWorkOrder(bool allow_overwrite_pending, bool* overwrote_pending) {
+    if (!kT) {
+        return false;
+    }
+
+    const bool tri_scene_flag = triangle_scene(simParams);
+    const double contact_pressure = contact_pressure_metric(simParams, tri_scene_flag,
+                                                            *solverScratchSpace.numPrimitiveContacts,
+                                                            idPrimitiveA.size(),
+                                                            *solverScratchSpace.numContacts, idPatchA.size());
+    const double sph_bin_pressure =
+        (simParams->errOutBinSphNum > 0)
+            ? std::clamp((double)pSchedSupport->kinematicMaxSphInBin.load(std::memory_order_relaxed) /
+                             (double)simParams->errOutBinSphNum,
+                         0.0, 1.0)
+            : 0.0;
+    const double tri_bin_pressure =
+        (simParams->errOutBinTriNum > 0)
+            ? std::clamp((double)pSchedSupport->kinematicMaxTriInBin.load(std::memory_order_relaxed) /
+                             (double)simParams->errOutBinTriNum,
+                         0.0, 1.0)
+            : 0.0;
+    const bool strong_prescribed_motion = (solverFlags.prescribedAngVelMagnitudeHint > 20.f);
+    const double pressure =
+        strong_prescribed_motion ? std::max(contact_pressure, std::max(sph_bin_pressure, tri_bin_pressure))
+                                 : contact_pressure;
+    bool did_overwrite = false;
+    {
+        std::lock_guard<std::mutex> order_lock(pSchedSupport->kinematicOrderStateLock);
+        const bool mailbox_fresh =
+            pSchedSupport->kinematicOwned_Cons2ProdBuffer_isFresh.load(std::memory_order_acquire);
+        const bool mailbox_claimed = pSchedSupport->kinematicOrderClaimed.load(std::memory_order_acquire);
+        const int64_t now_stamp = pSchedSupport->currentStampOfDynamic.load(std::memory_order_relaxed);
+        if (mailbox_fresh) {
+            if (!allow_overwrite_pending || mailbox_claimed) {
+                if (overwrote_pending) {
+                    *overwrote_pending = false;
+                }
+                return false;
+            }
+            const int64_t issued = pSchedSupport->kinematicOrderIssuedStamp.load(std::memory_order_acquire);
+            const unsigned commanded = std::max(1u, *perhapsIdealFutureDrift);
+            const unsigned usable =
+                std::min(commanded, std::max(1u, futureDriftRegulator.last_usable ? futureDriftRegulator.last_usable
+                                                                                  : commanded));
+            const unsigned min_gap = choose_pending_overwrite_gap(usable, tri_scene_flag, pressure);
+            const int64_t age = (issued >= 0 && now_stamp >= issued) ? (now_stamp - issued) : 0;
+            if ((unsigned)age < min_gap) {
+                if (overwrote_pending) {
+                    *overwrote_pending = false;
+                }
+                return false;
+            }
+            did_overwrite = true;
+        }
+
+        determineSysVel();
+        sendToTheirBuffer();
+
+        const unsigned commanded = std::max(1u, *perhapsIdealFutureDrift);
+        const unsigned usable =
+            std::min(commanded, std::max(1u, futureDriftRegulator.last_usable ? futureDriftRegulator.last_usable
+                                                                              : commanded));
+        pSchedSupport->kinematicOrderIssuedStamp.store(now_stamp, std::memory_order_release);
+        pSchedSupport->kinematicOrderUsableDrift.store(static_cast<int64_t>(usable), std::memory_order_release);
+        pSchedSupport->kinematicOrderClaimed.store(false, std::memory_order_release);
+        pSchedSupport->kinematicOwned_Cons2ProdBuffer_isFresh.store(true, std::memory_order_release);
+    }
+
+    pSchedSupport->schedulingStats.nKinematicUpdates++;
+    pSchedSupport->cv_KinematicCanProceed.notify_all();
+
+    if (overwrote_pending) {
+        *overwrote_pending = did_overwrite;
+    }
+    return true;
+}
+
 inline void DEMDynamicThread::sendToTheirBuffer() {
     const int srcDev = streamInfo.device;      // dT GPU
     const int dstDev = kT->streamInfo.device;  // kT GPU
@@ -2917,6 +3406,45 @@ inline void DEMDynamicThread::sendToTheirBuffer() {
     }
     // Note that perhapsIdealFutureDrift is non-negative, and it will be used to determine the margin size; however, if
     // scheduleHelper is instructed to have negative future drift then perhapsIdealFutureDrift no longer affects them.
+    unsigned int drift_to_send = std::max(1u, *perhapsIdealFutureDrift);
+    if (triangle_scene(simParams) && solverFlags.prescribedAngVelMagnitudeHint > 20.f) {
+        // Strong prescribed-motion + triangle scenes are sensitive to one-step drift overshoots.
+        // Clamp commanded drift before sending to kT so candidate memory cannot spike in one update.
+        unsigned int hard_cap = (simParams->nContactWildcards > 0) ? 6u : 8u;
+        const double avg_prim_contacts =
+            std::max(0.0, (double)pSchedSupport->kinematicAvgPrimitiveContacts.load(std::memory_order_relaxed));
+        const int64_t dyn_stamp = pSchedSupport->currentStampOfDynamic.load(std::memory_order_relaxed);
+        const double sph_bin_pressure =
+            (simParams->errOutBinSphNum > 0)
+                ? std::clamp((double)pSchedSupport->kinematicMaxSphInBin.load(std::memory_order_relaxed) /
+                                 (double)simParams->errOutBinSphNum,
+                             0.0, 1.0)
+                : 0.0;
+        const double tri_bin_pressure =
+            (simParams->errOutBinTriNum > 0)
+                ? std::clamp((double)pSchedSupport->kinematicMaxTriInBin.load(std::memory_order_relaxed) /
+                                 (double)simParams->errOutBinTriNum,
+                             0.0, 1.0)
+                : 0.0;
+        const double bin_pressure = std::max(sph_bin_pressure, tri_bin_pressure);
+        // Early-step guard: startup spikes can be catastrophic in larger cases (OOM-risk), so be conservative briefly.
+        if (dyn_stamp >= 0 && dyn_stamp < 8000) {
+            hard_cap = std::min(hard_cap, 3u);
+        }
+        // Contact-rich scenes are at highest risk of transient candidate bursts.
+        if (avg_prim_contacts > 10.0) {
+            hard_cap = std::min(hard_cap, 4u);
+        } else if (avg_prim_contacts > 6.0) {
+            hard_cap = std::min(hard_cap, 5u);
+        }
+        if (bin_pressure > 0.78) {
+            hard_cap = std::min(hard_cap, 5u);
+        } else if (bin_pressure > 0.62) {
+            hard_cap = std::min(hard_cap, 6u);
+        }
+        drift_to_send = std::min(drift_to_send, hard_cap);
+    }
+    *perhapsIdealFutureDrift = drift_to_send;
     if (same_dev) {
         DEME_GPU_CALL(cudaMemcpyAsync(granData->pKTOwnedBuffer_maxDrift, perhapsIdealFutureDrift.getHostPointer(),
                                       sizeof(unsigned int), cudaMemcpyHostToDevice, streamInfo.stream));
@@ -3426,7 +3954,10 @@ inline void DEMDynamicThread::unpack_impl() {
     // Reference to the stamp of the ingredient batch that produced this update (exclude the 1-step pipeline).
     const int64_t recv_stamp =
         (recv_stamp_override >= 0) ? recv_stamp_override : (pSchedSupport->completedStampOfDynamic).load();
-    const int64_t send_stamp = (pSchedSupport->kinematicIngredProdDateStamp).load();
+    int64_t send_stamp = pSchedSupport->kinematicProduceSourceStamp.load(std::memory_order_acquire);
+    if (send_stamp < 0) {
+        send_stamp = (pSchedSupport->kinematicIngredProdDateStamp).load();
+    }
     int64_t lag_steps = recv_stamp - send_stamp;
     if (lag_steps > 0) {
         lag_steps -= 1;
@@ -3438,6 +3969,7 @@ inline void DEMDynamicThread::unpack_impl() {
     // dT needs to know how fresh the contact pair info is, and that is determined by when kT received this batch of
     // ingredients.
     pSchedSupport->stampLastDynamicUpdateProdDate = send_stamp;
+    compactTriangleContactStorage(*solverScratchSpace.numPrimitiveContacts, *solverScratchSpace.numContacts);
 
     // If this is a history-based run, then when contacts are received, we need to migrate the contact
     // history info, to match the structure of the new contact array
@@ -3571,18 +4103,48 @@ inline void DEMDynamicThread::calibrateParams() {
     const uint64_t send = (uint64_t)send_i;
     const unsigned lag_steps = (recv > send + 1) ? (unsigned)(recv - send - 1) : 0u;
     r.last_observed_kinematic_lag_steps = lag_steps;
+    const bool tri_scene_flag = triangle_scene(simParams);
+    const unsigned lag_u = std::min(lag_steps, MAX);
+    const size_t current_primitive_pairs = *solverScratchSpace.numPrimitiveContacts;
+    const size_t current_patch_pairs = *solverScratchSpace.numContacts;
+    const double contact_pressure = contact_pressure_metric(simParams,
+                                                            tri_scene_flag,
+                                                            current_primitive_pairs,
+                                                            idPrimitiveA.size(),
+                                                            current_patch_pairs,
+                                                            idPatchA.size());
+    const double sph_bin_pressure =
+        (simParams->errOutBinSphNum > 0)
+            ? std::clamp((double)pSchedSupport->kinematicMaxSphInBin.load(std::memory_order_relaxed) /
+                             (double)simParams->errOutBinSphNum,
+                         0.0, 1.0)
+            : 0.0;
+    const double tri_bin_pressure =
+        (simParams->errOutBinTriNum > 0)
+            ? std::clamp((double)pSchedSupport->kinematicMaxTriInBin.load(std::memory_order_relaxed) /
+                             (double)simParams->errOutBinTriNum,
+                         0.0, 1.0)
+            : 0.0;
+    const double bin_pressure_raw = std::max(sph_bin_pressure, tri_bin_pressure);
+    ema_asym(r.bin_pressure_ema, r.bin_pressure_initialized, bin_pressure_raw, 0.30, 0.12, 0.0);
+    const double bin_pressure =
+        r.bin_pressure_initialized ? std::max(bin_pressure_raw, r.bin_pressure_ema) : bin_pressure_raw;
+    const bool strong_prescribed_motion =
+        (solverFlags.prescribedAngVelMagnitudeHint > 20.f);
+    const double avg_prim_contacts =
+        std::max(0.0, (double)pSchedSupport->kinematicAvgPrimitiveContacts.load(std::memory_order_relaxed));
+    const double early_drift_pressure =
+        tri_scene_flag ? std::max(contact_pressure, bin_pressure) : contact_pressure;
     if (simParams->useCylPeriodic && simParams->cylPeriodicSpan > 0.f) {
-        // Cylindrical periodicity is sensitive to schedule jitter. Use a fixed, low total drift target
-        // to keep contact maps fresh and reduce run-to-run variance from time-based auto tuning.
-        constexpr unsigned kCylPeriodicTargetTotalDrift = 2u;
-        const unsigned lag_u = std::min(lag_steps, MAX);
-        const unsigned target_total = clamp_drift_u(kCylPeriodicTargetTotalDrift, MAX);
-        const unsigned wait = (target_total > lag_u) ? (target_total - lag_u) : 0u;
-        const unsigned total = clamp_drift_u(wait + lag_u, MAX);
+        const unsigned cmd_cur = clamp_drift_u(std::max(1u, *perhapsIdealFutureDrift), MAX);
         const double safety = (double)solverFlags.futureDriftEffDriftSafetyFactor;
-        *perhapsIdealFutureDrift = clamp_drift_u((unsigned)std::ceil((double)total * safety), MAX);
+        const unsigned total = clamp_drift_u(
+            (unsigned)std::max(1.0, std::floor(((double)cmd_cur / std::max(1e-9, safety)) + 0.5)), MAX);
+        const unsigned usable = choose_usable_drift_horizon(total, lag_u, MAX, true, early_drift_pressure);
+        const unsigned wait = (usable > lag_u) ? (usable - lag_u) : 0u;
         r.last_wait_cmd = wait;
         r.last_proposed = total;
+        r.last_usable = usable;
         r.next_send_step = recv + (uint64_t)wait;
         r.next_send_wait = wait;
         r.pending_send = true;
@@ -3608,6 +4170,24 @@ inline void DEMDynamicThread::calibrateParams() {
     r.last_total_time = tnow;
     r.last_debug_cum_time = r.debug_cum_time;
     const unsigned drift_total = (steps > 0) ? (unsigned)std::min<uint64_t>(steps - 1, MAX) : 0u;
+    double emergence_pressure_raw = 0.0;
+    if (r.has_last_contact_sample && steps > 0) {
+        emergence_pressure_raw =
+            contact_emergence_metric(simParams, tri_scene_flag, steps, std::max(1u, drift_total),
+                                     r.last_contact_sample_primitive, r.last_contact_sample_patch,
+                                     current_primitive_pairs, current_patch_pairs);
+    }
+    ema_asym(r.emergence_pressure_ema, r.emergence_pressure_initialized, emergence_pressure_raw,
+             drift_tuning().emergence_up_alpha, drift_tuning().emergence_down_alpha, 0.0);
+    const double emergence_pressure = r.emergence_pressure_initialized
+                                          ? std::max(emergence_pressure_raw, r.emergence_pressure_ema)
+                                          : emergence_pressure_raw;
+    const double drift_pressure =
+        tri_scene_flag ? std::max(std::max(contact_pressure, emergence_pressure), bin_pressure)
+                       : std::max(contact_pressure, emergence_pressure);
+    r.last_contact_sample_primitive = current_primitive_pairs;
+    r.last_contact_sample_patch = current_patch_pairs;
+    r.has_last_contact_sample = true;
     if (r.lag_ema_initialized || lag_steps > 0) {
         ema_asym(r.lag_ema, r.lag_ema_initialized, (double)lag_steps, 0.35, 0.10, 0.0);
     }
@@ -3617,11 +4197,21 @@ inline void DEMDynamicThread::calibrateParams() {
         lag_i = 0;
     if ((unsigned)lag_i > MAX)
         lag_i = (int)MAX;
-    const unsigned lag_u = (unsigned)lag_i;
+    const unsigned lag_sched = (unsigned)lag_i;
     const bool meas = (aut && steps > 0 && dt > 0.0 && drift_total > 0u);
     const double cost = meas ? dt / (double)steps : 0.0;
-    const unsigned dmin = std::max(1u, lag_u);
-    const double drift_floor = std::max(5.0, (double)dmin);
+    const double cost_ratio =
+        (meas && r.cost_scale_initialized) ? (cost / std::max(1e-9, r.cost_scale_ema)) : 1.0;
+    const unsigned dmin = std::max(1u, lag_sched);
+    double drift_floor = choose_drift_floor(tri_scene_flag, strong_prescribed_motion, drift_pressure, dmin);
+    // In non-strong, low-contact tri scenes, allow larger future drift to recover performance.
+    if (tri_scene_flag && !strong_prescribed_motion) {
+        if (avg_prim_contacts < 0.75 && drift_pressure < 0.58) {
+            drift_floor = std::max(drift_floor, (double)lag_sched + 4.0);
+        } else if (avg_prim_contacts < 1.5 && drift_pressure < 0.66) {
+            drift_floor = std::max(drift_floor, (double)lag_sched + 2.0);
+        }
+    }
     double drift_ref = drift_floor;
     if (meas) {
         const unsigned obs = clamp_drift_u(drift_total, MAX);
@@ -3658,32 +4248,43 @@ inline void DEMDynamicThread::calibrateParams() {
     unsigned dcur = (r.last_proposed > 0) ? clamp_drift_u(r.last_proposed, MAX) : true_cmd;
     if (dcur < dmin)
         dcur = dmin;
+    const bool strong_motion_guard = tri_scene_flag && (drift_pressure > 0.72 || emergence_pressure > 0.64);
+    const bool low_contact_guard =
+        tri_scene_flag && !strong_motion_guard && (avg_prim_contacts < 1.2) && (drift_pressure < 0.58);
     constexpr uint64_t PROBE_N = 24, ACT_N = 40;
     constexpr double MOVE_FR = 0.1, ANC_FR = 0.05, IMP_FR = 0.01, CAP_R = 1.5, LAG_M = 2.0;
     constexpr unsigned STEP = 2;
+    const uint64_t probe_n = strong_motion_guard ? 0u : PROBE_N;
+    const uint64_t act_n = strong_motion_guard ? 12u : (low_contact_guard ? 24u : ACT_N);
+    const unsigned step_limit = strong_motion_guard ? 1u : (low_contact_guard ? 3u : STEP);
+    const double cap_r = strong_motion_guard ? 1.35 : (low_contact_guard ? 1.8 : CAP_R);
     unsigned dtgt = dcur;
     if (!aut)
         dtgt = std::max(true_cmd, dmin);
     else if (r.drift_rls.initialized && n > 0) {
-        const unsigned pstep = std::max(1u, std::min(STEP, dcur / 10u));
+        const unsigned pstep = std::max(1u, std::min(step_limit, dcur / 10u));
         const unsigned dup = clamp_drift_u(std::min(MAX, dcur + pstep), MAX);
         const unsigned ddn = clamp_drift_u(std::max(dmin, (dcur > pstep) ? (dcur - pstep) : dmin), MAX);
-        if (n < PROBE_N) {
+        if (n < probe_n) {
             const unsigned phase = (unsigned)(n % 3u);
             const int dir = (((n / 3u) % 2u) == 0u) ? +1 : -1;
             if (phase == 1u)
                 dtgt = (dir > 0) ? dup : ddn;
             else if (phase == 2u)
                 dtgt = (dir > 0) ? ddn : dup;
-        } else if (n >= ACT_N) {
-            unsigned lo = (dcur > STEP) ? (dcur - STEP) : 1u;
+        } else if (n >= act_n) {
+            unsigned lo = (dcur > step_limit) ? (dcur - step_limit) : 1u;
             if (lo < dmin)
                 lo = dmin;
-            unsigned hi = std::min(MAX, dcur + STEP);
+            unsigned hi = std::min(MAX, dcur + step_limit);
             const double pen_ref = std::max(drift_floor, lag_pred * LAG_M);
-            const unsigned cap_hi = std::max(dmin, (unsigned)std::ceil(std::min(drift_ref, pen_ref) * CAP_R));
+            const unsigned cap_hi = std::max(dmin, (unsigned)std::ceil(std::min(drift_ref, pen_ref) * cap_r));
             if (hi > cap_hi)
                 hi = cap_hi;
+            if (meas) {
+                const unsigned obs_total = clamp_drift_u(std::max(1u, drift_total), MAX);
+                hi = choose_motion_total_cap(hi, obs_total, lag_sched, MAX, tri_scene_flag, drift_pressure, cost_ratio);
+            }
             if (hi < lo)
                 lo = hi;
             const double scale = r.cost_scale_initialized ? r.cost_scale_ema : std::max(1e-9, cost);
@@ -3699,10 +4300,23 @@ inline void DEMDynamicThread::calibrateParams() {
             const double inv = 1.0 / (double)std::max(1u, dcur);
             for (unsigned d = lo; d <= hi; ++d) {
                 const unsigned w = apply_wait_policy_u(clamp_wait_i((int)d - lag_i, MAX), lag_pred, ur, lr, MAX);
-                const unsigned tot = clamp_drift_u(w + lag_u, MAX);
+                const unsigned tot_raw = clamp_drift_u(w + lag_sched, MAX);
+                const unsigned tot =
+                    meas ? choose_motion_total_cap(tot_raw, clamp_drift_u(std::max(1u, drift_total), MAX), lag_sched,
+                                                   MAX, tri_scene_flag, drift_pressure, cost_ratio)
+                         : tot_raw;
                 const double y = r.drift_rls.predict(tot, drift_ref);
                 const double rel = (double)((int)tot - (int)dcur) * inv;
-                const double score = y + mp * std::abs(rel) + ap * (rel * rel);
+                double score = y + mp * std::abs(rel) + ap * (rel * rel);
+                if (meas) {
+                    const double sev = motion_guard_severity(tri_scene_flag, drift_pressure, cost_ratio);
+                    if (sev > 0.0) {
+                        const double over_obs =
+                            (double)std::max(0, (int)tot - (int)clamp_drift_u(std::max(1u, drift_total), MAX));
+                        const double over_lag = (double)std::max(0, (int)tot - (int)(lag_sched + (tri_scene_flag ? 2u : 1u)));
+                        score += scale * sev * (0.18 * over_obs + 0.08 * over_lag);
+                    }
+                }
                 if (score < best) {
                     best = score;
                     best_tot = tot;
@@ -3720,33 +4334,45 @@ inline void DEMDynamicThread::calibrateParams() {
     }
     if (aut) {
         const double cap_ref = std::max(drift_floor, lag_pred * LAG_M);
-        const unsigned cap1 = std::max(dmin, (unsigned)std::ceil(drift_ref * CAP_R));
-        const unsigned cap2 = std::max(dmin, (unsigned)std::ceil(cap_ref * CAP_R));
+        const unsigned cap1 = std::max(dmin, (unsigned)std::ceil(drift_ref * cap_r));
+        const unsigned cap2 = std::max(dmin, (unsigned)std::ceil(cap_ref * cap_r));
         const unsigned cap = std::min(cap1, cap2);
         if (dtgt > cap)
             dtgt = cap;
-        const unsigned slo = (dcur > STEP) ? (dcur - STEP) : 1u;
-        const unsigned shi = dcur + STEP;
+        const unsigned slo = (dcur > step_limit) ? (dcur - step_limit) : 1u;
+        const unsigned shi = dcur + step_limit;
         dtgt = std::clamp(dtgt, slo, shi);
     }
     dtgt = clamp_drift_u(std::max(dtgt, dmin), MAX);
-    const unsigned wait = apply_wait_policy_u(clamp_wait_i((int)dtgt - lag_i, MAX), lag_pred, ur, lr, MAX);
-    const unsigned total = clamp_drift_u(wait + lag_u, MAX);
-    r.last_wait_cmd = wait;
+    const unsigned wait_total = apply_wait_policy_u(clamp_wait_i((int)dtgt - lag_i, MAX), lag_pred, ur, lr, MAX);
+    const unsigned total_raw = clamp_drift_u(wait_total + lag_sched, MAX);
+    const unsigned total =
+        (aut && meas) ? choose_motion_total_cap(total_raw, clamp_drift_u(std::max(1u, drift_total), MAX), lag_sched,
+                                                MAX, tri_scene_flag, drift_pressure, cost_ratio)
+                      : total_raw;
+    unsigned usable = choose_usable_drift_horizon(total, lag_sched, MAX, tri_scene_flag, drift_pressure);
+    if (aut && meas) {
+        usable = std::min(usable, choose_motion_usable_cap(total, lag_sched, tri_scene_flag, drift_pressure, cost_ratio));
+    }
+    const unsigned wait_comm = (usable > lag_sched) ? (usable - lag_sched) : 0u;
+    r.last_wait_cmd = wait_comm;
     r.last_proposed = total;
+    r.last_usable = usable;
     if (aut) {
         const unsigned cmd_out = clamp_drift_u((unsigned)std::ceil((double)total * safety), MAX);
         *perhapsIdealFutureDrift = cmd_out;
     }
-    r.next_send_step = recv + (uint64_t)wait;
-    r.next_send_wait = wait;
+    r.next_send_step = recv + (uint64_t)wait_comm;
+    r.next_send_wait = wait_comm;
     r.pending_send = true;
 
     DEME_DEBUG_PRINTF(
         "[calibrateParams] recv=%llu send=%llu steps=%llu dt=%.6g cost=%.6g drift_total=%u lag=%u lag_ema=%.3g "
-        "dcur=%u dtgt=%u wait=%u next_send=%llu drift_ref=%.3g\n",
+        "dcur=%u dtgt=%u total=%u usable=%u wait_comm=%u next_send=%llu pressure=%.3g bin_pressure=%.3g "
+        "drift_ref=%.3g\n",
         (unsigned long long)recv, (unsigned long long)send, (unsigned long long)steps, dt, cost, drift_total, lag_steps,
-        r.lag_ema, dcur, dtgt, wait, (unsigned long long)r.next_send_step, drift_ref);
+        r.lag_ema, dcur, dtgt, total, usable, wait_comm, (unsigned long long)r.next_send_step, contact_pressure,
+        bin_pressure, drift_ref);
 }
 
 inline void DEMDynamicThread::ifProduceFreshThenUseItAndSendNewOrder() {
@@ -3763,20 +4389,46 @@ inline void DEMDynamicThread::ifProduceFreshThenUseItAndSendNewOrder() {
     // If a kT work order is scheduled (possibly due to kT being very fast), only send it when due.
     drainProgressEvents();
     const uint64_t now_stamp = static_cast<uint64_t>(pSchedSupport->currentStampOfDynamic.load());
-    if (reg.pending_send && now_stamp >= reg.next_send_step &&
-        !pSchedSupport->kinematicOwned_Cons2ProdBuffer_isFresh.load(std::memory_order_acquire)) {
+    if (reg.pending_send && now_stamp >= reg.next_send_step) {
         timers.GetTimer("Send to kT buffer").start();
-        determineSysVel();
         // Record the max drift value used for this work order, so the tuner can attribute the next observation.
         reg.last_sent_proposed = *perhapsIdealFutureDrift;
         reg.last_sent_true = reg.last_proposed;
         reg.last_sent_wait = reg.next_send_wait;
-        sendToTheirBuffer();
-        pSchedSupport->kinematicOwned_Cons2ProdBuffer_isFresh.store(true, std::memory_order_release);
-        pSchedSupport->schedulingStats.nKinematicUpdates++;
+        bool overwrote_pending = false;
+        if (publishKinematicWorkOrder(true, &overwrote_pending)) {
+            if (overwrote_pending) {
+                const bool tri_scene_flag = triangle_scene(simParams);
+                const double contact_pressure = contact_pressure_metric(simParams, tri_scene_flag,
+                                                                        *solverScratchSpace.numPrimitiveContacts,
+                                                                        idPrimitiveA.size(),
+                                                                        *solverScratchSpace.numContacts, idPatchA.size());
+                const double sph_bin_pressure =
+                    (simParams->errOutBinSphNum > 0)
+                        ? std::clamp((double)pSchedSupport->kinematicMaxSphInBin.load(std::memory_order_relaxed) /
+                                         (double)simParams->errOutBinSphNum,
+                                     0.0, 1.0)
+                        : 0.0;
+                const double tri_bin_pressure =
+                    (simParams->errOutBinTriNum > 0)
+                        ? std::clamp((double)pSchedSupport->kinematicMaxTriInBin.load(std::memory_order_relaxed) /
+                                         (double)simParams->errOutBinTriNum,
+                                     0.0, 1.0)
+                        : 0.0;
+                const bool strong_prescribed_motion = (solverFlags.prescribedAngVelMagnitudeHint > 20.f);
+                const double pressure =
+                    strong_prescribed_motion ? std::max(contact_pressure, std::max(sph_bin_pressure, tri_bin_pressure))
+                                             : contact_pressure;
+                reg.next_send_step = now_stamp +
+                                     std::max<uint64_t>(1u, choose_pending_overwrite_gap(
+                                                                reg.last_usable ? reg.last_usable : reg.last_proposed,
+                                                                tri_scene_flag, pressure));
+                reg.pending_send = true;
+            } else {
+                reg.pending_send = false;
+            }
+        }
         timers.GetTimer("Send to kT buffer").stop();
-        pSchedSupport->cv_KinematicCanProceed.notify_all();
-        reg.pending_send = false;
     }
 }
 
@@ -3835,17 +4487,16 @@ void DEMDynamicThread::workerThread() {
                 auto& reg = futureDriftRegulator;
                 const unsigned int MAX_DRIFT = solverFlags.upperBoundFutureDrift;
                 auto clamp_drift = [&](unsigned int v) { return std::min(std::max(1u, v), MAX_DRIFT); };
-                // Cylindrical periodic runs are sensitive to large startup margins. Clamp the very first
-                // work order drift to the same low target used by the cyl-periodic regulator.
-                if (simParams->useCylPeriodic && simParams->cylPeriodicSpan > 0.f) {
-                    constexpr unsigned int kCylPeriodicTargetTotalDrift = 2u;
+                unsigned int cmd = std::max(1u, *perhapsIdealFutureDrift);
+                if (triangle_scene(simParams)) {
+                    constexpr unsigned int kTriStartupTargetTotalDrift = 4u;
                     const double safety = static_cast<double>(solverFlags.futureDriftEffDriftSafetyFactor);
                     const unsigned int cmd_boot =
-                        clamp_drift(static_cast<unsigned int>(std::ceil(static_cast<double>(kCylPeriodicTargetTotalDrift) *
+                        clamp_drift(static_cast<unsigned int>(std::ceil(static_cast<double>(kTriStartupTargetTotalDrift) *
                                                                         safety)));
-                    *perhapsIdealFutureDrift = cmd_boot;
+                    cmd = std::min(cmd, cmd_boot);
+                    *perhapsIdealFutureDrift = cmd;
                 }
-                const unsigned int cmd = std::max(1u, *perhapsIdealFutureDrift);
                 reg.last_sent_proposed = cmd;
                 const double de =
                     static_cast<double>(cmd) / static_cast<double>(solverFlags.futureDriftEffDriftSafetyFactor);
@@ -3856,15 +4507,11 @@ void DEMDynamicThread::workerThread() {
                 if (reg.last_proposed == 0) {
                     reg.last_proposed = true_target;
                 }
+                reg.last_usable = choose_usable_drift_horizon(true_target, 0u, MAX_DRIFT, triangle_scene(simParams), 0.0);
 
-                determineSysVel();
-                sendToTheirBuffer();
+                publishKinematicWorkOrder(false);
             }
-            pSchedSupport->kinematicOwned_Cons2ProdBuffer_isFresh.store(true, std::memory_order_release);
             contactPairArr_isFresh = true;
-            pSchedSupport->schedulingStats.nKinematicUpdates++;
-            // Signal the kinematic that it has data for a new work order.
-            pSchedSupport->cv_KinematicCanProceed.notify_all();
             // Then dT will wait for kT to finish one initial run
             {
                 std::unique_lock<std::mutex> lock(pSchedSupport->dynamicCanProceed);
@@ -3898,38 +4545,43 @@ void DEMDynamicThread::workerThread() {
             // a soft/hard stale policy:
             // - soft stale: proactively request a kT update (non-blocking)
             // - hard stale: block until fresh kT produce arrives
-            if (simParams->useCylPeriodic && simParams->cylPeriodicSpan > 0.f) {
+            if (triangle_scene(simParams) || (simParams->useCylPeriodic && simParams->cylPeriodicSpan > 0.f)) {
+                const bool cyl_guard = simParams->useCylPeriodic && simParams->cylPeriodicSpan > 0.f;
                 const int64_t cur_stamp = pSchedSupport->currentStampOfDynamic.load(std::memory_order_relaxed);
                 const int64_t prod_stamp =
                     pSchedSupport->stampLastDynamicUpdateProdDate.load(std::memory_order_relaxed);
+                const int64_t prod_source = pSchedSupport->kinematicProduceSourceStamp.load(std::memory_order_relaxed);
+                const int64_t prod_usable = pSchedSupport->kinematicProduceUsableDrift.load(std::memory_order_relaxed);
+                const int64_t soft_horizon =
+                    (prod_source >= 0 && prod_usable > 0) ? (prod_source + std::max<int64_t>(1, prod_usable) - 1) : -1;
+                const int64_t total_horizon =
+                    (prod_source >= 0 && pSchedSupport->dynamicMaxFutureDrift.load(std::memory_order_relaxed) > 0)
+                        ? (prod_source + pSchedSupport->dynamicMaxFutureDrift.load(std::memory_order_relaxed))
+                        : -1;
                 const int64_t stale_lag = (prod_stamp >= 0) ? (cur_stamp - prod_stamp) : 0;
-                const bool stale_soft = (prod_stamp >= 0) && (stale_lag > 1);
-                const bool stale_hard = (prod_stamp >= 0) && (stale_lag > 2);
+                const bool stale_soft = (soft_horizon >= 0) ? (cur_stamp >= soft_horizon) : ((prod_stamp >= 0) && (stale_lag > 1));
+                const bool stale_hard = cyl_guard ? ((prod_stamp >= 0) && (stale_lag > 2))
+                                                  : ((total_horizon >= 0) && (cur_stamp > total_horizon + 1));
                 unsigned int skip_potential_total = 0u;
-                if (stale_soft && granData->ownerCylSkipPotentialTotal) {
+                if (cyl_guard && stale_soft && granData->ownerCylSkipPotentialTotal) {
                     DEME_GPU_CALL(cudaMemcpy(&skip_potential_total, granData->ownerCylSkipPotentialTotal,
                                              sizeof(unsigned int), cudaMemcpyDeviceToHost));
                 }
-                // If enough force-relevant periodic candidates were skipped while stale, force immediate resync.
-                // A small nonzero count can be benign under asynchrony; use a threshold to avoid over-reacting.
                 constexpr unsigned int kSkipPotentialHardResyncThreshold = 32u;
                 const bool stale_with_skips =
-                    stale_soft && (skip_potential_total > kSkipPotentialHardResyncThreshold);
+                    cyl_guard && stale_soft && (skip_potential_total > kSkipPotentialHardResyncThreshold);
                 if ((stale_soft || stale_with_skips) &&
                     !pSchedSupport->dynamicOwned_Prod2ConsBuffer_isFresh.load(std::memory_order_acquire)) {
                     if (!pSchedSupport->kinematicOwned_Cons2ProdBuffer_isFresh.load(std::memory_order_acquire)) {
                         auto& reg = futureDriftRegulator;
                         timers.GetTimer("Send to kT buffer").start();
-                        determineSysVel();
                         reg.last_sent_proposed = *perhapsIdealFutureDrift;
                         reg.last_sent_true = reg.last_proposed;
                         reg.last_sent_wait = 0;
-                        sendToTheirBuffer();
-                        pSchedSupport->kinematicOwned_Cons2ProdBuffer_isFresh.store(true, std::memory_order_release);
-                        pSchedSupport->schedulingStats.nKinematicUpdates++;
+                        if (publishKinematicWorkOrder(true)) {
+                            reg.pending_send = false;
+                        }
                         timers.GetTimer("Send to kT buffer").stop();
-                        pSchedSupport->cv_KinematicCanProceed.notify_all();
-                        reg.pending_send = false;
                     }
                     if (stale_hard || stale_with_skips) {
                         std::unique_lock<std::mutex> lock(pSchedSupport->dynamicCanProceed);

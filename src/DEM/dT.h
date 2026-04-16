@@ -1119,6 +1119,10 @@ class DEMDynamicThread {
     void contactPrimitivesArraysResize(size_t nContactPairs);
     // Resize mesh patch pair array based on the number of mesh-involved contact pairs
     void contactPatchArrayResize(size_t nMeshInvolvedContactPairs);
+    // Compact triangle-heavy contact storage with conservative hysteresis to stabilize VRAM across runs.
+    void compactTriangleContactStorage(size_t nPrimitivePairs, size_t nPatchPairs);
+    // Publish a dT -> kT work order under mailbox lock. Can safely refresh an unclaimed order.
+    bool publishKinematicWorkOrder(bool allow_overwrite_pending, bool* overwrote_pending = nullptr);
 
     // Deallocate everything
     void deallocateEverything();
@@ -1165,6 +1169,8 @@ class DEMDynamicThread {
 
         // Last chosen TOTAL drift target (de-headroomed).
         unsigned int last_proposed = 0;
+        // Portion of the total drift horizon that should trigger another lightweight order refresh.
+        unsigned int last_usable = 0;
         // The max drift command (with safety headroom) that was last sent to kT.
         unsigned int last_sent_proposed = 0;
         // The TRUE drift target used for the last work order (de-headroomed).
@@ -1192,6 +1198,15 @@ class DEMDynamicThread {
         bool drift_scale_initialized = false;
         double cost_scale_ema = 0.0;
         bool cost_scale_initialized = false;
+        double bin_pressure_ema = 0.0;
+        bool bin_pressure_initialized = false;
+
+        // Contact-emergence tracking: how quickly new contacts appear between kT refreshes.
+        size_t last_contact_sample_primitive = 0;
+        size_t last_contact_sample_patch = 0;
+        bool has_last_contact_sample = false;
+        double emergence_pressure_ema = 0.0;
+        bool emergence_pressure_initialized = false;
 
         void Clear() { *this = FutureDriftRegulator{}; }
     };

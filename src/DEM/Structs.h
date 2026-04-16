@@ -560,6 +560,9 @@ struct SolverFlags {
 
     // Whether there are contacts that can never be removed.
     bool hasPersistentContacts = false;
+    // Host-side hints from prescribed motions. Used to gate aggressive VRAM-protection policies.
+    float prescribedLinVelMagnitudeHint = 0.f;
+    float prescribedAngVelMagnitudeHint = 0.f;
 };
 
 class DEMMaterial {

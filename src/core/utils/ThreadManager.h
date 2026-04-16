@@ -52,6 +52,10 @@ class ThreadManager {
     std::atomic<int64_t> kinematicOrderUsableDrift;    // portion of the commanded drift horizon dT plans to consume
     std::atomic<int64_t> kinematicProduceUsableDrift;  // usable drift horizon attached to the current kT produce
     std::atomic<int64_t> kinematicMaxFutureDrift;       // kT tags this to its produce before shipping
+    // kT-side bin/candidate pressure hints for dT drift regulation.
+    std::atomic<uint64_t> kinematicMaxSphInBin;
+    std::atomic<uint64_t> kinematicMaxTriInBin;
+    std::atomic<float> kinematicAvgPrimitiveContacts;
     // Shared ghosting margin and max owner bound radius for cylindrical periodicity (kT -> dT)
     std::atomic<float> kinematicGhostMargin;
     std::atomic<float> maxOwnerBoundRadius;
@@ -93,6 +97,9 @@ class ThreadManager {
         kinematicProduceSourceStamp = -1;
         kinematicOrderUsableDrift = -1;
         kinematicProduceUsableDrift = -1;
+        kinematicMaxSphInBin = 0;
+        kinematicMaxTriInBin = 0;
+        kinematicAvgPrimitiveContacts = 0.f;
         currentStampOfDynamic = 0;
         completedStampOfDynamic = 0;
         dynamicDone = false;

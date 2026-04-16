@@ -17,6 +17,7 @@
 #include <cmath>
 #include <limits>
 #include <algorithm>
+#include <cctype>
 #include <map>
 #include <tuple>
 #include <unordered_map>
@@ -37,11 +38,51 @@ inline uint64_t makeEdgeKey(int a, int b) {
     return (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi);
 }
 
+inline bool isFormulaTokenBoundary(char c) {
+    return !(std::isalnum(static_cast<unsigned char>(c)) || c == '_');
+}
 
+inline double estimateFormulaMagnitudeHint(const std::string& expr) {
+    if (expr.empty() || expr == "none") {
+        return 0.0;
+    }
+    double max_abs = 0.0;
+    const char* begin = expr.c_str();
+    const char* p = begin;
+    while (*p) {
+        const char c = *p;
+        const bool candidate =
+            std::isdigit(static_cast<unsigned char>(c)) || c == '.' || c == '-' || c == '+';
+        if (!candidate) {
+            ++p;
+            continue;
+        }
+        if (p > begin && !isFormulaTokenBoundary(*(p - 1))) {
+            ++p;
+            continue;
+        }
+        char* end = nullptr;
+        const double v = std::strtod(p, &end);
+        if (end == p) {
+            ++p;
+            continue;
+        }
+        const char tail = *end;
+        if (tail != '\0' && !isFormulaTokenBoundary(tail)) {
+            p = end;
+            continue;
+        }
+        if (std::isfinite(v)) {
+            max_abs = std::max(max_abs, std::abs(v));
+        }
+        p = end;
+    }
+    return max_abs;
+}
 
 inline bool isSmoothFrictionProp(const std::string& prop_name) {
-    return prop_name == "mu_0" || prop_name == "mu_min" || prop_name == "mu_v_min" ||
-           prop_name == "mu_dyn" || prop_name == "mu_v_dyn";
+    return prop_name == "mu_0" || prop_name == "mu_min" || prop_name == "mu_v_min" || prop_name == "mu_dyn" ||
+           prop_name == "mu_v_dyn";
 }
 
 inline bool tryGetSmoothFrictionDiagValue(const std::unordered_map<std::string, float>& name_val_pairs,
@@ -101,6 +142,7 @@ inline const std::vector<std::pair<std::pair<unsigned int, unsigned int>, float>
     }
     return nullptr;
 }
+
 std::vector<std::array<bodyID_t, 3>> buildTriangleEdgeNeighbors(const std::vector<int3>& face_v_indices,
                                                                  const std::vector<float3>& vertices) {
     const size_t n_faces = face_v_indices.size();
@@ -1684,6 +1726,25 @@ void DEMSolver::setSolverParams() {
     // uses is DoDynamicsThenSync.
     kT->solverFlags.isAsync = !((m_suggestedFutureDrift == 0) && !auto_adjust_update_freq);
     dT->solverFlags.isAsync = !((m_suggestedFutureDrift == 0) && !auto_adjust_update_freq);
+    double max_prescribed_lin = 0.0;
+    double max_prescribed_ang = 0.0;
+    for (const auto& preInfo : m_unique_family_prescription) {
+        if (!preInfo.used) {
+            continue;
+        }
+        max_prescribed_lin = std::max(max_prescribed_lin, estimateFormulaMagnitudeHint(preInfo.linVelPre));
+        max_prescribed_lin = std::max(max_prescribed_lin, estimateFormulaMagnitudeHint(preInfo.linVelX));
+        max_prescribed_lin = std::max(max_prescribed_lin, estimateFormulaMagnitudeHint(preInfo.linVelY));
+        max_prescribed_lin = std::max(max_prescribed_lin, estimateFormulaMagnitudeHint(preInfo.linVelZ));
+        max_prescribed_ang = std::max(max_prescribed_ang, estimateFormulaMagnitudeHint(preInfo.rotVelPre));
+        max_prescribed_ang = std::max(max_prescribed_ang, estimateFormulaMagnitudeHint(preInfo.rotVelX));
+        max_prescribed_ang = std::max(max_prescribed_ang, estimateFormulaMagnitudeHint(preInfo.rotVelY));
+        max_prescribed_ang = std::max(max_prescribed_ang, estimateFormulaMagnitudeHint(preInfo.rotVelZ));
+    }
+    kT->solverFlags.prescribedLinVelMagnitudeHint = static_cast<float>(max_prescribed_lin);
+    dT->solverFlags.prescribedLinVelMagnitudeHint = static_cast<float>(max_prescribed_lin);
+    kT->solverFlags.prescribedAngVelMagnitudeHint = static_cast<float>(max_prescribed_ang);
+    dT->solverFlags.prescribedAngVelMagnitudeHint = static_cast<float>(max_prescribed_ang);
     // Ideal max drift in solverFlags may not be up-to-date, and only represents what the solver thinks it ought to be.
     // Interaction manager's copy prevails. This one is used for margin decision so should be non-negative.
     *(dT->perhapsIdealFutureDrift) = (m_suggestedFutureDrift < 0.) ? 10 : m_suggestedFutureDrift;
@@ -2644,7 +2705,8 @@ inline void DEMSolver::equipMaterials(std::unordered_map<std::string, std::strin
 
     // Keep runtime/JIT paths backward compatible with legacy "mu" definitions.
     // Some runs may still provide/set only "mu", while newer Hertzian scripts read the smooth-friction symbols.
-    if (check_exist(m_material_prop_names, std::string("mu")) || check_exist(m_pairwise_material_prop_names, std::string("mu"))) {
+    if (check_exist(m_material_prop_names, std::string("mu")) ||
+        check_exist(m_pairwise_material_prop_names, std::string("mu"))) {
         const std::array<const char*, 5> smooth_props = {"mu_0", "mu_min", "mu_v_min", "mu_dyn", "mu_v_dyn"};
         for (const auto* smooth_name : smooth_props) {
             m_material_prop_names.insert(smooth_name);
@@ -2679,6 +2741,8 @@ inline void DEMSolver::equipMaterials(std::unordered_map<std::string, std::strin
             if (check_exist(name_val_pairs, prop_name)) {
                 val = name_val_pairs.at(prop_name);
                 flags[i][i] = 1;
+                // If prop_name does not exist for this material, then if prop_name is one of the
+                // mat_prop_that_must_exist, the user should know there is trouble...
             } else if (tryGetSmoothFrictionDiagValue(name_val_pairs, prop_name, val)) {
                 flags[i][i] = 1;
             }

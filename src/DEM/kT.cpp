@@ -49,6 +49,22 @@ struct DynamicProduceReadyPayload {
     ThreadManager* sched = nullptr;
 };
 
+inline bool triangle_scene(const DEMSimParams* simParams) {
+    return simParams && simParams->nTriGM > 0;
+}
+
+inline bool triangle_scene(const DualStruct<DEMSimParams>& simParams) {
+    return triangle_scene(&(*simParams));
+}
+
+inline size_t quantized_contact_capacity(size_t n) {
+    const size_t floor_cap = 1024;
+    n = std::max(n, floor_cap);
+    const size_t padded = n + n / 8 + 64;
+    const size_t quantum = (padded < 8192) ? 256 : ((padded < 65536) ? 1024 : 4096);
+    return ((padded + quantum - 1) / quantum) * quantum;
+}
+
 inline uint32_t expandBits10(uint32_t v) {
     v &= 0x000003ffu;
     v = (v | (v << 16)) & 0x030000FFu;
@@ -186,36 +202,100 @@ void DEMKinematicThread::calibrateParams() {
     if (CDAccumTimer.QueryOn(prev_time, curr_time, stateParams.binChangeObserveSteps)) {
         // Auto-adjust bin size
         if (solverFlags.autoBinSize) {
+            const bool tri_scene = triangle_scene(simParams);
+            const float top_rate = tri_scene ? std::min(stateParams.binTopChangeRate, 0.03f)
+                                             : stateParams.binTopChangeRate;
+            const bool strong_prescribed_motion =
+                (solverFlags.prescribedAngVelMagnitudeHint > 20.f);
+            if (tri_scene && strong_prescribed_motion) {
+                // In strong prescribed-rotation tri scenes, timing-noise-driven bin adaptation causes
+                // large run-to-run variability and occasional candidate spikes. Keep bin size fixed.
+                stateParams.binCurrentChangeRate = 0.f;
+                DEME_DEBUG_PRINTF("Strong-motion tri scene: freezing adaptive bin-size updates.");
+                DEME_DEBUG_PRINTF("kT runtime per step: %.7gs", CDAccumTimer.GetPrevTime());
+                simParams.toDeviceAsync(streamInfo.stream);
+                return;
+            }
+            const float sph_bin_pressure =
+                (simParams->errOutBinSphNum > 0)
+                    ? std::clamp((float)stateParams.maxSphFoundInBin / (float)simParams->errOutBinSphNum, 0.f, 1.f)
+                    : 0.f;
+            const float tri_bin_pressure =
+                (simParams->errOutBinTriNum > 0)
+                    ? std::clamp((float)stateParams.maxTriFoundInBin / (float)simParams->errOutBinTriNum, 0.f, 1.f)
+                    : 0.f;
+            const float bin_pressure = std::max(sph_bin_pressure, tri_bin_pressure);
+            const float avg_contacts = std::max(0.f, stateParams.avgCntsPerPrimitive);
             int speed_dir = sign_func(stateParams.binCurrentChangeRate);
-            // Note the speed can be 0, yet we find performance variance. Then this is purely noise. We still wish the
-            // bin size to change in the next iteration, so we assign a direction randomly.
-            if (speed_dir == 0)
-                speed_dir = (random_zero_or_one() == 0) ? -1 : 1;
-            float speed_update;
-            if (curr_time < prev_time) {
-                // If there is improvement, then we accelerate the current change direction
-                speed_update = speed_dir * stateParams.binChangeRateAcc * stateParams.binTopChangeRate;
-            } else {
-                // If no improvement, revert the direction
-                speed_update = -speed_dir * stateParams.binChangeRateAcc * stateParams.binTopChangeRate;
+            // Keep the first direction deterministic to reduce run-to-run bin-size jitter.
+            if (speed_dir == 0) {
+                const bool high_bin_pressure =
+                    (stateParams.maxSphFoundInBin > 0.50 * simParams->errOutBinSphNum) ||
+                    (stateParams.maxTriFoundInBin > 0.50 * simParams->errOutBinTriNum);
+                speed_dir = high_bin_pressure ? -1 : 1;
             }
-            // But, if the bin size is going to get too big or too small, a penalty is enforced
-            if (stateParams.maxSphFoundInBin > stateParams.binChangeUpperSafety * simParams->errOutBinSphNum ||
-                stateParams.maxTriFoundInBin > stateParams.binChangeUpperSafety * simParams->errOutBinTriNum) {
-                // Then the size must start to decrease
-                speed_update = -1.0 * stateParams.binChangeRateAcc * stateParams.binTopChangeRate;
-            }
-            if (stateParams.numBins >
-                stateParams.binChangeLowerSafety * (double)(std::numeric_limits<binID_t>::max())) {
-                // Then size must start to increase
-                speed_update = 1.0 * stateParams.binChangeRateAcc * stateParams.binTopChangeRate;
-            }
+            const bool over_upper_safety =
+                (stateParams.maxSphFoundInBin > stateParams.binChangeUpperSafety * simParams->errOutBinSphNum) ||
+                (stateParams.maxTriFoundInBin > stateParams.binChangeUpperSafety * simParams->errOutBinTriNum);
+            const bool over_lower_safety =
+                (stateParams.numBins > stateParams.binChangeLowerSafety * (double)(std::numeric_limits<binID_t>::max()));
+            if (tri_scene) {
+                // Pressure/contact-band control for tri scenes keeps behavior deterministic across runs.
+                const float prev_rate = stateParams.binCurrentChangeRate;
+                float target_rate = 0.f;
 
-            // Acc is done. Now apply it to bin size change speed
-            stateParams.binCurrentChangeRate += speed_update;
-            // But, the speed must fall in range
-            stateParams.binCurrentChangeRate = clampBetween(
-                stateParams.binCurrentChangeRate, -stateParams.binTopChangeRate, stateParams.binTopChangeRate);
+                if (over_upper_safety) {
+                    target_rate = -top_rate;
+                } else if (over_lower_safety) {
+                    target_rate = (bin_pressure < 0.38f && avg_contacts < 0.8f) ? (0.35f * top_rate) : 0.f;
+                } else {
+                    const float high_band = (avg_contacts > 2.5f) ? 0.58f : 0.64f;
+                    const float low_band = (avg_contacts < 0.9f) ? 0.42f : 0.34f;
+                    if (bin_pressure > high_band) {
+                        const float sev = std::clamp((bin_pressure - high_band) / std::max(1e-6f, 1.f - high_band), 0.f, 1.f);
+                        target_rate = -top_rate * (0.30f + 0.70f * sev);
+                    } else if (bin_pressure < low_band && avg_contacts < 1.8f) {
+                        const float sev = std::clamp((low_band - bin_pressure) / std::max(1e-6f, low_band), 0.f, 1.f);
+                        target_rate = top_rate * (0.08f + 0.32f * sev);
+                    } else {
+                        target_rate = 0.f;
+                    }
+                }
+
+                // If contacts are already dense, don't let bin growth push false candidates.
+                if (avg_contacts > 3.5f) {
+                    target_rate = std::min(target_rate, 0.f);
+                }
+
+                // Slew-limit updates to avoid one-observation jumps.
+                const float max_delta = std::max(0.0005f, stateParams.binChangeRateAcc * top_rate);
+                const float lo = prev_rate - max_delta;
+                const float hi = prev_rate + max_delta;
+                stateParams.binCurrentChangeRate = std::clamp(target_rate, lo, hi);
+                stateParams.binCurrentChangeRate = clampBetween(stateParams.binCurrentChangeRate, -top_rate, top_rate);
+            } else {
+                float speed_update;
+                if (curr_time < prev_time) {
+                    // If there is improvement, then we accelerate the current change direction
+                    speed_update = speed_dir * stateParams.binChangeRateAcc * top_rate;
+                } else {
+                    // If no improvement, revert the direction
+                    speed_update = -speed_dir * stateParams.binChangeRateAcc * top_rate;
+                }
+                // But, if the bin size is going to get too big or too small, a penalty is enforced
+                if (over_upper_safety) {
+                    // Then the size must start to decrease
+                    speed_update = -1.0f * stateParams.binChangeRateAcc * top_rate;
+                }
+                if (over_lower_safety) {
+                    // Then size must start to increase
+                    speed_update = 1.0f * stateParams.binChangeRateAcc * top_rate;
+                }
+                // Acc is done. Now apply it to bin size change speed
+                stateParams.binCurrentChangeRate += speed_update;
+                // But, the speed must fall in range
+                stateParams.binCurrentChangeRate = clampBetween(stateParams.binCurrentChangeRate, -top_rate, top_rate);
+            }
 
             // Change bin size
             if (stateParams.binCurrentChangeRate > 0) {
@@ -546,9 +626,11 @@ inline void DEMKinematicThread::sendToTheirBuffer() {
         return !(env[0] == '0' && env[1] == '\0');
     }();
 
-    size_t resize_prim = nPrimitive;
-    size_t resize_patch = nPatch;
-    if (same_dev && allow_output_swap) {
+    const bool tri_scene_flag = triangle_scene(simParams);
+
+    size_t resize_prim = tri_scene_flag ? quantized_contact_capacity(std::max<size_t>(nPrimitive, 1)) : nPrimitive;
+    size_t resize_patch = tri_scene_flag ? quantized_contact_capacity(std::max<size_t>(nPatch, 1)) : nPatch;
+    if (same_dev && allow_output_swap && !tri_scene_flag) {
         resize_prim = DEME_MAX(resize_prim, idPrimitiveA.size());
         resize_prim = DEME_MAX(resize_prim, idPrimitiveB.size());
         resize_prim = DEME_MAX(resize_prim, contactTypePrimitive.size());
@@ -583,7 +665,7 @@ inline void DEMKinematicThread::sendToTheirBuffer() {
 
     bool output_swapped = false;
 #ifndef DEME_USE_MANAGED_ARRAYS
-    if (same_dev && allow_output_swap) {
+    if (same_dev && allow_output_swap && !tri_scene_flag) {
         output_swapped = swap_device_buffer(idPrimitiveA, dT->idPrimitiveA_buffer[write_idx]);
         output_swapped = swap_device_buffer(idPrimitiveB, dT->idPrimitiveB_buffer[write_idx]) && output_swapped;
         output_swapped =
@@ -742,6 +824,10 @@ void DEMKinematicThread::workerThread() {
                              contactPatchIsland, previous_contactPatchIsland, typeStartCountPatchMap, geomToPatchMap,
                              streamInfo.stream, solverScratchSpace, timers, stateParams);
             CDAccumTimer.End();
+            pSchedSupport->kinematicMaxSphInBin.store((uint64_t)stateParams.maxSphFoundInBin, std::memory_order_relaxed);
+            pSchedSupport->kinematicMaxTriInBin.store((uint64_t)stateParams.maxTriFoundInBin, std::memory_order_relaxed);
+            pSchedSupport->kinematicAvgPrimitiveContacts.store(stateParams.avgCntsPerPrimitive,
+                                                               std::memory_order_relaxed);
 
             timers.GetTimer("Send to dT buffer").start();
             {
