@@ -40,19 +40,25 @@ if (overlapDepth > 0) {
     const float mass_eff = (AOwnerMass * BOwnerMass) / (AOwnerMass + BOwnerMass);
 
     // Contact radius:
-    // - sphere/analytical and sphere/sphere contacts: classic Hertz a = sqrt(R_eff * delta)
-    // - sphere/triangle contacts: ALSO use Hertz with R_eff = sphere radius (triangle treated as locally flat)
-    //   This avoids patch-size dependence when one smooth contact spans multiple mesh triangles.
-    // - triangle/triangle (and other triangle-involved contacts without a sphere): fall back to area-based proxy.
+    // - sphere/triangle contacts: area-based partial-contact radius with ideal-sphere correction.
+    //   Full patch recovers Hertz exactly, while edge/corner truncation still reduces force via overlapArea.
+    //   Implemented as a_area * rsqrt(2 - d / R), i.e. no expensive division in the hot path if invR is known.
+    // - triangle/triangle and other non-spherical triangle contacts: area-based proxy.
+    // - everything else: classic Hertz with R_eff.-based proxy.
     const bool tri_involved = (AType == deme::GEO_T_TRIANGLE) || (BType == deme::GEO_T_TRIANGLE);
     float cnt_rad;
     if (tri_involved) {
+        const float area_radius = sqrtf(fmaxf(overlapArea, 0.f) * deme::INV_PI);
         if constexpr (AType == deme::GEO_T_SPHERE && BType == deme::GEO_T_TRIANGLE) {
-            cnt_rad = sqrtf(overlapDepth * ARadius);
+            const float effective_radius = ARadius;
+            const float depth_over_R = fminf(fmaxf(overlapDepth / effective_radius, 0.f), 1.f);
+            cnt_rad = area_radius * rsqrtf(2.f - depth_over_R);
         } else if constexpr (BType == deme::GEO_T_SPHERE && AType == deme::GEO_T_TRIANGLE) {
-            cnt_rad = sqrtf(overlapDepth * BRadius);
+            const float effective_radius = BRadius;
+            const float depth_over_R = fminf(fmaxf(overlapDepth / effective_radius, 0.f), 1.f);
+            cnt_rad = area_radius * rsqrtf(2.f - depth_over_R);
         } else {
-            cnt_rad = sqrtf(overlapArea / deme::PI);
+            cnt_rad = area_radius;
         }
     } else {
         const float effective_radius =

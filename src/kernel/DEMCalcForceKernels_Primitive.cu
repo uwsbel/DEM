@@ -1109,6 +1109,7 @@ __device__ __forceinline__ void calculatePrimitiveContactForces_impl(deme::DEMSi
             (ContactType_candidate != deme::NOT_A_CONTACT) && (!discardGhostGhost) && (!cylPeriodicSkipPair) &&
             (!ownerBoundReject);
 
+#if _forceModelHasTangentialHistory_
         // Rotate history (base-wedge -> active image) only when this contact is active.
         if (activeForThisStep && cylHistShift != 0) {
             const float sin_fwd = (cylHistShift < 0) ? -simParams->cylPeriodicSinSpan : simParams->cylPeriodicSinSpan;
@@ -1118,6 +1119,7 @@ __device__ __forceinline__ void calculatePrimitiveContactForces_impl(deme::DEMSi
             delta_tan_y = dt.y;
             delta_tan_z = dt.z;
         }
+#endif
 
         // Force model execution (or skip for inactive periodic candidate)
         if (activeForThisStep) {
@@ -1186,6 +1188,7 @@ __device__ __forceinline__ void calculatePrimitiveContactForces_impl(deme::DEMSi
 
         // Updated contact wildcards need to be write back to global mem. It is here because contact wildcard may need
         // to be destroyed for non-contact, so it has to go last.
+#if _forceModelHasTangentialHistory_
         // Rotate history back to base-wedge frame before writing to global memory.
         if (activeForThisStep && cylHistShift != 0) {
             const float sin_inv = (cylHistShift < 0) ? simParams->cylPeriodicSinSpan : -simParams->cylPeriodicSinSpan;
@@ -1195,6 +1198,7 @@ __device__ __forceinline__ void calculatePrimitiveContactForces_impl(deme::DEMSi
             delta_tan_y = dt.y;
             delta_tan_z = dt.z;
         }
+#endif
 
         _forceModelContactWildcardWrite_;
     } else {  // If this is the kernel for a mesh-related contact, another follow-up kernel is needed to compute force

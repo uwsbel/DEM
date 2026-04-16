@@ -110,18 +110,23 @@ if (physical_contact || wet_bridge_live) {
         delta_max = fmaxf(delta_max, overlapDepth);
 
         // Contact radius:
-        // - sphere/triangle contacts: classic Hertz with R_eff = sphere radius (triangle treated as locally flat).
+        // - sphere/triangle contacts: area-based partial-contact radius with ideal-sphere correction.
+        //   Full patch recovers Hertz exactly, while edge/corner truncation still reduces force via overlapArea.
+        //   Implemented as a_area * rsqrt(2 - d / R), i.e. no expensive division in the hot path if invR is known.
         // - triangle/triangle and other non-spherical triangle contacts: area-based proxy.
         // - everything else: classic Hertz with R_eff.
         if (tri_involved) {
+            const float area_radius = sqrtf(fmaxf(overlapArea, 0.f) * deme::INV_PI);
             if constexpr (AType == deme::GEO_T_SPHERE && BType == deme::GEO_T_TRIANGLE) {
                 effective_radius = ARadius;
-                contact_radius = sqrtf(overlapDepth * effective_radius);
+                const float depth_over_R = fminf(fmaxf(overlapDepth / effective_radius, 0.f), 1.f);
+                contact_radius = area_radius * rsqrtf(2.f - depth_over_R);
             } else if constexpr (BType == deme::GEO_T_SPHERE && AType == deme::GEO_T_TRIANGLE) {
                 effective_radius = BRadius;
-                contact_radius = sqrtf(overlapDepth * effective_radius);
+                const float depth_over_R = fminf(fmaxf(overlapDepth / effective_radius, 0.f), 1.f);
+                contact_radius = area_radius * rsqrtf(2.f - depth_over_R);
             } else {
-                contact_radius = sqrtf(overlapArea / deme::PI);
+                contact_radius = area_radius;
             }
         } else {
             effective_radius = (BType == deme::GEO_T_ANALYTICAL) ? ARadius : (ARadius * BRadius) / (ARadius + BRadius);

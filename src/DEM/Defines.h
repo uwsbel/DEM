@@ -49,6 +49,7 @@ constexpr float FOUR_OVER_THREE = 4. / 3.;
 constexpr float FIVE_OVER_THREE = 5. / 3.;
 constexpr float PI = 3.1415926535897932385f;
 constexpr float PI_SQUARED = 9.869604401089358f;
+constexpr float INV_PI = 0.3183098861837906f;
 constexpr float TWO_TIMES_SQRT_FIVE_OVER_THREE = 2.58198889747161f;  // 2. * std::sqrt(5. / 3.)
 constexpr float TWO_TIMES_SQRT_FIVE_OVER_SIX = 1.825741858350554f;   // 2. * std::sqrt(5. / 6.)
 

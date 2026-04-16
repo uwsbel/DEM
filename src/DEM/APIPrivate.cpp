@@ -2302,6 +2302,10 @@ inline void DEMSolver::equipForceModel(std::unordered_map<std::string, std::stri
     strMap["_forceModelGeoWildcardAcqForBSph_;"] = geo_wc_acquisition_B_sph;
     strMap["_forceModelGeoWildcardAcqForBMeshPatch_;"] = geo_wc_acquisition_B_patch;
     strMap["_forceModelGeoWildcardAcqForBAnal_;"] = geo_wc_acquisition_B_anal;
+    const bool has_delta_tan_triplet = contact_wildcard_names.count("delta_tan_x") &&
+                                       contact_wildcard_names.count("delta_tan_y") &&
+                                       contact_wildcard_names.count("delta_tan_z");
+    strMap["_forceModelHasTangentialHistory_"] = has_delta_tan_triplet ? "1" : "0";
 
     // This should be empty as of now...
     strMap["_forceModelOwnerWildcardWrite_;"] = owner_geo_wildcard_write_back;
