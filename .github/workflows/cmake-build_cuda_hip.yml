@@ -1,0 +1,172 @@
+name: CMake CUDA/HIP compile matrix
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  detect:
+    runs-on: ubuntu-24.04
+    outputs:
+      has_hip: ${{ steps.detect.outputs.has_hip }}
+      has_cuda_backend: ${{ steps.detect.outputs.has_cuda_backend }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          has_hip=false
+          has_cuda_backend=false
+
+          if grep -R -n -E 'DEME_GPU_BACKEND|USE_HIP|LANGUAGES[[:space:]]+.*HIP|CMAKE_HIP_ARCHITECTURES|find_package\(.*HIP|project\(.*HIP|hipcc|ROCM_PATH' CMakeLists.txt cmake src >/dev/null 2>&1; then
+            has_hip=true
+          fi
+
+          if grep -R -n -E 'LANGUAGES[[:space:]]+.*CUDA|enable_language\(CUDA\)|find_package\(CUDAToolkit|CMAKE_CUDA_ARCHITECTURES|CUDA_ARCHITECTURES|nvcc' CMakeLists.txt cmake src >/dev/null 2>&1; then
+            has_cuda_backend=true
+          fi
+
+          echo "has_hip=$has_hip" >> "$GITHUB_OUTPUT"
+          echo "has_cuda_backend=$has_cuda_backend" >> "$GITHUB_OUTPUT"
+
+  cuda-build:
+    name: CUDA ${{ matrix.cuda }}
+    needs: detect
+    if: needs.detect.outputs.has_cuda_backend == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda: '12.8.1'
+            image: 'nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04'
+          - cuda: '13.2.0'
+            image: 'nvidia/cuda:13.2.0-cudnn-devel-ubuntu24.04'
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends             build-essential             cmake             ninja-build             git             pkg-config
+
+      - name: Show toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          nvcc --version
+          cmake --version
+
+      - name: Configure
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build             -G Ninja             -DCMAKE_BUILD_TYPE=${BUILD_TYPE}             -DDEME_GPU_BACKEND=CUDA
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build build --parallel
+
+  hip-build:
+    name: ROCm ${{ matrix.rocm }} / ${{ matrix.arch }}
+    needs: detect
+    if: needs.detect.outputs.has_hip == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # CDNA / HPC
+          - rocm: '7.2'
+            image: 'rocm/dev-ubuntu-24.04:7.2-complete'
+            arch: 'gfx90a'
+          - rocm: '7.2'
+            image: 'rocm/dev-ubuntu-24.04:7.2-complete'
+            arch: 'gfx942'
+          - rocm: '7.2.1'
+            image: 'rocm/dev-ubuntu-24.04:7.2.1-complete'
+            arch: 'gfx90a'
+          - rocm: '7.2.1'
+            image: 'rocm/dev-ubuntu-24.04:7.2.1-complete'
+            arch: 'gfx942'
+
+          # RDNA3 / workstation + newer Radeon
+          - rocm: '7.2'
+            image: 'rocm/dev-ubuntu-24.04:7.2-complete'
+            arch: 'gfx1100'
+          - rocm: '7.2'
+            image: 'rocm/dev-ubuntu-24.04:7.2-complete'
+            arch: 'gfx1101'
+          - rocm: '7.2'
+            image: 'rocm/dev-ubuntu-24.04:7.2-complete'
+            arch: 'gfx1102'
+          - rocm: '7.2'
+            image: 'rocm/dev-ubuntu-24.04:7.2-complete'
+            arch: 'gfx1151'
+          - rocm: '7.2.1'
+            image: 'rocm/dev-ubuntu-24.04:7.2.1-complete'
+            arch: 'gfx1100'
+          - rocm: '7.2.1'
+            image: 'rocm/dev-ubuntu-24.04:7.2.1-complete'
+            arch: 'gfx1101'
+          - rocm: '7.2.1'
+            image: 'rocm/dev-ubuntu-24.04:7.2.1-complete'
+            arch: 'gfx1102'
+          - rocm: '7.2.1'
+            image: 'rocm/dev-ubuntu-24.04:7.2.1-complete'
+            arch: 'gfx1151'
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends             build-essential             cmake             ninja-build             git             pkg-config
+
+      - name: Show toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          /opt/rocm/bin/hipcc --version || hipcc --version
+          cmake --version
+
+      - name: Configure
+        shell: bash
+        env:
+          ROCM_PATH: /opt/rocm
+        run: |
+          set -euo pipefail
+          cmake -S . -B build             -G Ninja             -DCMAKE_BUILD_TYPE=${BUILD_TYPE}             -DDEME_GPU_BACKEND=HIP             -DDEME_ROCM_ROOT=/opt/rocm             -DDEME_HIP_ARCH=${{ matrix.arch }}             -DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm             -DCMAKE_HIP_PLATFORM=amd
+
+      - name: Build
+        shell: bash
+        env:
+          ROCM_PATH: /opt/rocm
+        run: |
+          set -euo pipefail
+          cmake --build build --parallel
