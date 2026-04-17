@@ -1950,6 +1950,203 @@ if (simParams->nBigMeshOwners > 0) {
                 }
             }
 
+            // Build per-side island labels as well. For triangle-triangle contacts we only merge primitives into the
+            // same patch if they are connected on both contacting surfaces. This avoids over-merging distinct local
+            // contact lobes that merely share connectivity on one side.
+            bodyID_t* contactIslandLabelA =
+                (bodyID_t*)scratchPad.allocateTempVector("contactIslandLabelA", numTotalCnts * sizeof(bodyID_t));
+            bodyID_t* contactIslandLabelB =
+                (bodyID_t*)scratchPad.allocateTempVector("contactIslandLabelB", numTotalCnts * sizeof(bodyID_t));
+
+            auto computeSideIslandLabels = [&](int sideA,
+                                               const std::string& sidePrimitiveName,
+                                               const std::string& sideIsTriName,
+                                               const std::string& activeTriKeysAllName,
+                                               const std::string& activeTriKeysName,
+                                               const std::string& numActiveTriKeysName,
+                                               const std::string& activeTriKeysSortedName,
+                                               const std::string& activeTriKeysUniqueName,
+                                               const std::string& numUniqueActiveTriName,
+                                               const std::string& activeTriLabelsAName,
+                                               const std::string& activeTriLabelsBName,
+                                               const std::string& groupActiveCountName,
+                                               const std::string& groupActiveStartName,
+                                               const std::string& activeTriNeighborPosName,
+                                               const std::string& activeTriLabelChangedName,
+                                               bodyID_t* outLabels) {
+                bodyID_t* sidePrimitive =
+                    (bodyID_t*)scratchPad.allocateTempVector(sidePrimitiveName, numTotalCnts * sizeof(bodyID_t));
+                notStupidBool_t* sideIsTri =
+                    (notStupidBool_t*)scratchPad.allocateTempVector(sideIsTriName, numTotalCnts * sizeof(notStupidBool_t));
+                if (blocks_needed_for_patch_ids > 0) {
+                    extractSidePrimitiveAndTriFlag<<<dim3(blocks_needed_for_patch_ids),
+                                                     dim3(DEME_MAX_THREADS_PER_BLOCK), 0, this_stream>>>(
+                        granData->idPrimitiveA, granData->idPrimitiveB, granData->contactTypePrimitive, sidePrimitive,
+                        sideIsTri, numTotalCnts, sideA);
+                }
+
+                uint64_t* activeTriKeysAll =
+                    (uint64_t*)scratchPad.allocateTempVector(activeTriKeysAllName, numTotalCnts * sizeof(uint64_t));
+                if (blocks_needed_for_patch_ids > 0) {
+                    buildActiveTriKeys<<<dim3(blocks_needed_for_patch_ids), dim3(DEME_MAX_THREADS_PER_BLOCK), 0,
+                                         this_stream>>>(groupIndex, sidePrimitive, sideIsTri, activeTriKeysAll,
+                                                        sideIsTri, numTotalCnts);
+                }
+
+                uint64_t* activeTriKeys =
+                    (uint64_t*)scratchPad.allocateTempVector(activeTriKeysName, numTotalCnts * sizeof(uint64_t));
+                scratchPad.allocateDualStruct(numActiveTriKeysName);
+                cubDEMSelectFlagged<uint64_t, notStupidBool_t>(activeTriKeysAll, activeTriKeys, sideIsTri,
+                                                               scratchPad.getDualStructDevice(numActiveTriKeysName),
+                                                               numTotalCnts, this_stream, scratchPad);
+                scratchPad.syncDualStructDeviceToHost(numActiveTriKeysName);
+                size_t numActiveTriKeys_side = *scratchPad.getDualStructHost(numActiveTriKeysName);
+
+                uint64_t* activeTriKeysUnique_side = nullptr;
+                bodyID_t* finalActiveLabels_side = nullptr;
+                contactPairs_t* groupActiveCount_side = nullptr;
+                contactPairs_t* groupActiveStart_side = nullptr;
+                size_t numUniqueActiveTri_side = 0;
+
+                if (numActiveTriKeys_side > 0) {
+                    uint64_t* activeTriKeys_sorted_side = (uint64_t*)scratchPad.allocateTempVector(
+                        activeTriKeysSortedName, numActiveTriKeys_side * sizeof(uint64_t));
+                    cubDEMSortKeys<uint64_t>(activeTriKeys, activeTriKeys_sorted_side, numActiveTriKeys_side,
+                                             this_stream, scratchPad);
+
+                    activeTriKeysUnique_side = (uint64_t*)scratchPad.allocateTempVector(
+                        activeTriKeysUniqueName, numActiveTriKeys_side * sizeof(uint64_t));
+                    scratchPad.allocateDualStruct(numUniqueActiveTriName);
+                    cubDEMUnique<uint64_t>(activeTriKeys_sorted_side, activeTriKeysUnique_side,
+                                           scratchPad.getDualStructDevice(numUniqueActiveTriName),
+                                           numActiveTriKeys_side, this_stream, scratchPad);
+                    scratchPad.syncDualStructDeviceToHost(numUniqueActiveTriName);
+                    numUniqueActiveTri_side = *scratchPad.getDualStructHost(numUniqueActiveTriName);
+
+                    if (numUniqueActiveTri_side > 0) {
+                        bodyID_t* activeLabelsA_side = (bodyID_t*)scratchPad.allocateTempVector(
+                            activeTriLabelsAName, numUniqueActiveTri_side * sizeof(bodyID_t));
+                        bodyID_t* activeLabelsB_side = (bodyID_t*)scratchPad.allocateTempVector(
+                            activeTriLabelsBName, numUniqueActiveTri_side * sizeof(bodyID_t));
+                        size_t blocks_needed_active_side =
+                            (numUniqueActiveTri_side + DEME_MAX_THREADS_PER_BLOCK - 1) / DEME_MAX_THREADS_PER_BLOCK;
+                        initActiveTriLabels<<<dim3(blocks_needed_active_side), dim3(DEME_MAX_THREADS_PER_BLOCK), 0,
+                                             this_stream>>>(activeTriKeysUnique_side, activeLabelsA_side,
+                                                            numUniqueActiveTri_side);
+                        initActiveTriLabels<<<dim3(blocks_needed_active_side), dim3(DEME_MAX_THREADS_PER_BLOCK), 0,
+                                             this_stream>>>(activeTriKeysUnique_side, activeLabelsB_side,
+                                                            numUniqueActiveTri_side);
+
+                        groupActiveCount_side = (contactPairs_t*)scratchPad.allocateTempVector(
+                            groupActiveCountName, numGroups * sizeof(contactPairs_t));
+                        DEME_GPU_CALL(cudaMemsetAsync(groupActiveCount_side, 0, numGroups * sizeof(contactPairs_t),
+                                                      this_stream));
+                        countActiveTriPerGroup<<<dim3(blocks_needed_active_side), dim3(DEME_MAX_THREADS_PER_BLOCK), 0,
+                                                 this_stream>>>(activeTriKeysUnique_side, groupActiveCount_side,
+                                                                numUniqueActiveTri_side);
+
+                        groupActiveStart_side = (contactPairs_t*)scratchPad.allocateTempVector(
+                            groupActiveStartName, numGroups * sizeof(contactPairs_t));
+                        if (numGroups > 0) {
+                            cubDEMPrefixScan<contactPairs_t, contactPairs_t>(groupActiveCount_side,
+                                                                             groupActiveStart_side, numGroups,
+                                                                             this_stream, scratchPad);
+                        }
+
+                        contactPairs_t* activeTriNeighborPos_side = (contactPairs_t*)scratchPad.allocateTempVector(
+                            activeTriNeighborPosName, numUniqueActiveTri_side * 3 * sizeof(contactPairs_t));
+                        buildActiveTriNeighborPos<<<dim3(blocks_needed_active_side),
+                                                    dim3(DEME_MAX_THREADS_PER_BLOCK), 0, this_stream>>>(
+                            activeTriKeysUnique_side, groupActiveStart_side, groupActiveCount_side,
+                            granData->triNeighborIndex, granData->triNeighbor1, granData->triNeighbor2,
+                            granData->triNeighbor3, activeTriNeighborPos_side, numUniqueActiveTri_side);
+
+                        const int kCheckEvery_side = 4;
+                        int maxIters_side = (int)numUniqueActiveTri_side;
+                        scratchPad.allocateDualArray(activeTriLabelChangedName, sizeof(contactPairs_t));
+                        auto* changedHostRaw_side = scratchPad.getDualArrayHost(activeTriLabelChangedName);
+                        auto* changedDevRaw_side = scratchPad.getDualArrayDevice(activeTriLabelChangedName);
+                        contactPairs_t* changedDev_side = reinterpret_cast<contactPairs_t*>(changedDevRaw_side);
+
+                        bodyID_t* labelsIn_side = activeLabelsA_side;
+                        bodyID_t* labelsOut_side = activeLabelsB_side;
+                        int iter_side = 0;
+                        while (iter_side < maxIters_side) {
+                            int remaining_side = maxIters_side - iter_side;
+                            int batch_side = remaining_side < kCheckEvery_side ? remaining_side : kCheckEvery_side;
+                            for (int b = 0; b < batch_side - 1; ++b) {
+                                propagateActiveTriLabelsFromNeighborPos<<<dim3(blocks_needed_active_side),
+                                                                          dim3(DEME_MAX_THREADS_PER_BLOCK), 0,
+                                                                          this_stream>>>(labelsIn_side, labelsOut_side,
+                                                                                         activeTriNeighborPos_side,
+                                                                                         nullptr,
+                                                                                         numUniqueActiveTri_side);
+                                bodyID_t* tmp_side = labelsIn_side;
+                                labelsIn_side = labelsOut_side;
+                                labelsOut_side = tmp_side;
+                                ++iter_side;
+                            }
+                            DEME_GPU_CALL(cudaMemsetAsync(changedDev_side, 0, sizeof(contactPairs_t), this_stream));
+                            propagateActiveTriLabelsFromNeighborPos<<<dim3(blocks_needed_active_side),
+                                                                      dim3(DEME_MAX_THREADS_PER_BLOCK), 0,
+                                                                      this_stream>>>(labelsIn_side, labelsOut_side,
+                                                                                     activeTriNeighborPos_side,
+                                                                                     changedDev_side,
+                                                                                     numUniqueActiveTri_side);
+                            bodyID_t* tmp_side = labelsIn_side;
+                            labelsIn_side = labelsOut_side;
+                            labelsOut_side = tmp_side;
+                            ++iter_side;
+
+                            scratchPad.syncDualArrayDeviceToHost(activeTriLabelChangedName);
+                            const contactPairs_t changed_side = *reinterpret_cast<contactPairs_t*>(changedHostRaw_side);
+                            if (changed_side == 0) {
+                                break;
+                            }
+                        }
+                        finalActiveLabels_side = labelsIn_side;
+                    }
+                }
+
+                if (numUniqueActiveTri_side > 0) {
+                    size_t blocks_needed_labels_side =
+                        (numTotalCnts + DEME_MAX_THREADS_PER_BLOCK - 1) / DEME_MAX_THREADS_PER_BLOCK;
+                    assignContactIslandLabel<<<dim3(blocks_needed_labels_side), dim3(DEME_MAX_THREADS_PER_BLOCK), 0,
+                                               this_stream>>>(groupIndex, sidePrimitive, sideIsTri,
+                                                              activeTriKeysUnique_side, finalActiveLabels_side,
+                                                              groupActiveStart_side, groupActiveCount_side, outLabels,
+                                                              numTotalCnts);
+                } else {
+                    size_t blocks_needed_labels_side =
+                        (numTotalCnts + DEME_MAX_THREADS_PER_BLOCK - 1) / DEME_MAX_THREADS_PER_BLOCK;
+                    if (blocks_needed_labels_side > 0) {
+                        copyBodyIDArray<<<dim3(blocks_needed_labels_side), dim3(DEME_MAX_THREADS_PER_BLOCK), 0,
+                                            this_stream>>>(sidePrimitive, outLabels, numTotalCnts);
+                    }
+                }
+            };
+
+            computeSideIslandLabels(1, "sidePrimitiveA", "sideIsTriA", "activeTriKeysAllA", "activeTriKeysA",
+                                    "numActiveTriKeysA", "activeTriKeys_sorted_A", "activeTriKeys_unique_A",
+                                    "numUniqueActiveTriA", "activeTriLabelsA_A", "activeTriLabelsB_A",
+                                    "groupActiveCountA2", "groupActiveStartA2", "activeTriNeighborPosA",
+                                    "activeTriLabelChangedA", contactIslandLabelA);
+            computeSideIslandLabels(0, "sidePrimitiveB", "sideIsTriB", "activeTriKeysAllB", "activeTriKeysB",
+                                    "numActiveTriKeysB", "activeTriKeys_sorted_B", "activeTriKeys_unique_B",
+                                    "numUniqueActiveTriB", "activeTriLabelsA_B", "activeTriLabelsB_B",
+                                    "groupActiveCountB2", "groupActiveStartB2", "activeTriNeighborPosB",
+                                    "activeTriLabelChangedB", contactIslandLabelB);
+
+            // Build winner-invariant persistent island labels for history continuity.
+            bodyID_t* islandPersistLabel =
+                (bodyID_t*)scratchPad.allocateTempVector("islandPersistLabel", numTotalCnts * sizeof(bodyID_t));
+            if (blocks_needed_for_patch_ids > 0) {
+                buildPersistentIslandLabel<<<dim3(blocks_needed_for_patch_ids), dim3(DEME_MAX_THREADS_PER_BLOCK), 0,
+                                             this_stream>>>(granData->contactTypePrimitive, contactIslandLabel,
+                                                            contactIslandLabelA, contactIslandLabelB,
+                                                            islandPersistLabel, numTotalCnts);
+            }
+
             // Build composite key parts (primary + secondary) for island grouping.
             uint64_t* islandKeyHi =
                 (uint64_t*)scratchPad.allocateTempVector("islandKeyHi", numTotalCnts * sizeof(uint64_t));
@@ -1958,7 +2155,7 @@ if (simParams->nBigMeshOwners > 0) {
             if (blocks_needed_for_patch_ids > 0) {
                 buildIslandCompositeKeyParts<<<dim3(blocks_needed_for_patch_ids), dim3(DEME_MAX_THREADS_PER_BLOCK), 0,
                                                this_stream>>>(contactPatchPairs, granData->contactTypePrimitive,
-                                                              contactIslandLabel, islandKeyHi, islandKeyLo,
+                                                              islandPersistLabel, islandKeyHi, islandKeyLo,
                                                               numTotalCnts);
             }
 
@@ -2018,7 +2215,7 @@ if (simParams->nBigMeshOwners > 0) {
             if (blocks_needed_for_patch_ids > 0) {
                 gatherByIndex<bodyID_t>
                     <<<dim3(blocks_needed_for_patch_ids), dim3(DEME_MAX_THREADS_PER_BLOCK), 0, this_stream>>>(
-                        contactIslandLabel, contactIslandLabel_sorted, island_sort_indices, numTotalCnts);
+                        islandPersistLabel, contactIslandLabel_sorted, island_sort_indices, numTotalCnts);
             }
 
             DEME_GPU_CALL(cudaMemcpyAsync(granData->idPrimitiveA, idA_sorted, total_ids_bytes,
@@ -2171,6 +2368,37 @@ if (simParams->nBigMeshOwners > 0) {
                 scratchPad.finishUsingTempVector("groupActiveStart");
             }
             scratchPad.finishUsingTempVector("contactIslandLabel");
+            scratchPad.finishUsingTempVector("contactIslandLabelA");
+            scratchPad.finishUsingTempVector("contactIslandLabelB");
+            scratchPad.finishUsingTempVector("sidePrimitiveA");
+            scratchPad.finishUsingTempVector("sidePrimitiveB");
+            scratchPad.finishUsingTempVector("sideIsTriA");
+            scratchPad.finishUsingTempVector("sideIsTriB");
+            scratchPad.finishUsingTempVector("activeTriKeysAllA");
+            scratchPad.finishUsingTempVector("activeTriKeysAllB");
+            scratchPad.finishUsingTempVector("activeTriKeysA");
+            scratchPad.finishUsingTempVector("activeTriKeysB");
+            scratchPad.finishUsingDualStruct("numActiveTriKeysA");
+            scratchPad.finishUsingDualStruct("numActiveTriKeysB");
+            scratchPad.finishUsingTempVector("activeTriKeys_sorted_A");
+            scratchPad.finishUsingTempVector("activeTriKeys_sorted_B");
+            scratchPad.finishUsingTempVector("activeTriKeys_unique_A");
+            scratchPad.finishUsingTempVector("activeTriKeys_unique_B");
+            scratchPad.finishUsingDualStruct("numUniqueActiveTriA");
+            scratchPad.finishUsingDualStruct("numUniqueActiveTriB");
+            scratchPad.finishUsingTempVector("activeTriLabelsA_A");
+            scratchPad.finishUsingTempVector("activeTriLabelsA_B");
+            scratchPad.finishUsingTempVector("activeTriLabelsB_A");
+            scratchPad.finishUsingTempVector("activeTriLabelsB_B");
+            scratchPad.finishUsingTempVector("groupActiveCountA2");
+            scratchPad.finishUsingTempVector("groupActiveCountB2");
+            scratchPad.finishUsingTempVector("groupActiveStartA2");
+            scratchPad.finishUsingTempVector("groupActiveStartB2");
+            scratchPad.finishUsingTempVector("activeTriNeighborPosA");
+            scratchPad.finishUsingTempVector("activeTriNeighborPosB");
+            scratchPad.finishUsingDualArray("activeTriLabelChangedA");
+            scratchPad.finishUsingDualArray("activeTriLabelChangedB");
+            scratchPad.finishUsingTempVector("islandPersistLabel");
             scratchPad.finishUsingTempVector("islandKeyHi");
             scratchPad.finishUsingTempVector("islandKeyLo");
             scratchPad.finishUsingTempVector("islandKeyLo_sorted");
@@ -2253,11 +2481,30 @@ if (simParams->nBigMeshOwners > 0) {
                         granData->contactMapping, curr_start, curr_count);
                 } else {
                     // Both steps have contacts of this type - perform mapping
+                    static const bool sph_tri_history_fallback = []() {
+                        if (const char* s = std::getenv("DEME_SPH_TRI_HISTORY_FALLBACK")) {
+                            if (std::strcmp(s, "") == 0) {
+                                return true;
+                            }
+                            const std::string v(s);
+                            if (v == "0" || v == "false" || v == "FALSE" || v == "off" || v == "no") {
+                                return false;
+                            }
+                            return true;
+                        }
+                        return true;
+                    }();
+                    const bool allow_label_fallback = (thisType == TRIANGLE_TRIANGLE_CONTACT) ||
+                                                      (thisType == SPHERE_TRIANGLE_CONTACT && sph_tri_history_fallback);
+                    const bool allow_island_fallback =
+                        (thisType == SPHERE_TRIANGLE_CONTACT && sph_tri_history_fallback);
+                    const bool allow_rank_clamp = (thisType == SPHERE_TRIANGLE_CONTACT && sph_tri_history_fallback);
                     buildPatchContactMappingForType<<<dim3(blocks_needed), dim3(DEME_MAX_THREADS_PER_BLOCK), 0,
                                                       this_stream>>>(
                         granData->idPatchA, granData->idPatchB, granData->contactPatchIsland,
                         granData->previous_idPatchA, granData->previous_idPatchB, granData->previous_contactPatchIsland,
-                        granData->contactMapping, curr_start, curr_count, prev_start, prev_count);
+                        granData->contactMapping, allow_label_fallback, allow_island_fallback, allow_rank_clamp,
+                        curr_start, curr_count, prev_start, prev_count);
                 }
             }
 

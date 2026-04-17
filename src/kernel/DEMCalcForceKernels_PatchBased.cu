@@ -699,7 +699,6 @@ __device__ __forceinline__ void calculatePatchContactForces_impl(deme::DEMSimPar
             atomicAdd(granData->ownerCylSkipPotentialTotal, 1u);
         }
     }
-    const deme::contact_t ContactType_prev = ContactType;
     const bool activeForThisStep =
         (ContactType_candidate != deme::NOT_A_CONTACT) && !discardGhostGhost && !cylPeriodicSkipPair &&
         !ownerBoundReject;
@@ -729,18 +728,13 @@ __device__ __forceinline__ void calculatePatchContactForces_impl(deme::DEMSimPar
         torque_only_force = make_float3(0.f, 0.f, 0.f);
         locCPA = make_float3(0.f, 0.f, 0.f);
         locCPB = make_float3(0.f, 0.f, 0.f);
-        // For seam-branch mismatches, keep history (freeze) to avoid artificial de-sticking.
-        // But if this candidate is geometrically invalid by owner bound rejection, destroy history.
+        // If this candidate is geometrically invalid by owner bound rejection, destroy history.
         if (simParams->useCylPeriodic && simParams->cylPeriodicSpan > 0.f &&
             ownerBoundReject && ContactType_candidate != deme::NOT_A_CONTACT && !discardGhostGhost) {
             _forceModelContactWildcardDestroy_;
         }
-        // True non-contacts still destroy history, but keep history across transient mesh misses.
-        const bool transientMeshMiss =
-            (ContactType_candidate == deme::NOT_A_CONTACT) &&
-            (ContactType_prev == deme::TRIANGLE_TRIANGLE_CONTACT || ContactType_prev == deme::SPHERE_TRIANGLE_CONTACT ||
-             ContactType_prev == deme::TRIANGLE_ANALYTICAL_CONTACT);
-        if ((ContactType_candidate == deme::NOT_A_CONTACT || discardGhostGhost) && !transientMeshMiss) {
+        // Tangential history is only meaningful while contact exists; clear it on non-contact.
+        if (ContactType_candidate == deme::NOT_A_CONTACT || discardGhostGhost) {
             _forceModelContactWildcardDestroy_;
         }
     }

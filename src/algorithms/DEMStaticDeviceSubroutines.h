@@ -206,28 +206,123 @@ void normalizeAndScatterVotedNormals(float3* votedWeightedNormals,
                                      contactPairs_t count,
                                      cudaStream_t& this_stream);
 
+// Prepare tri-tri primitive normals with deterministic sign alignment per primitive (A->B centroid direction),
+// so patch-level reductions do not cancel equivalent opposing normals.
+void prepareTriTriNormalsForPatchVote(const DEMSimParams* simParams,
+                                      DEMDataDT* granData,
+                                      float3* orientedNormals,
+                                      contactPairs_t startOffset,
+                                      contactPairs_t count,
+                                      cudaStream_t& this_stream);
+
 // Patch-level accumulator used to fuse multiple ReduceByKey passes.
 //
 // The reduction operator is component-wise associative (sum + max), therefore it can safely be used
 // with CUB ReduceByKey.
-struct PatchContactAccum {
-    double sumProjArea;        ///< Sum of projected contact areas (per patch)
-    double maxProjPen;         ///< Max projected penetration (per patch)
-    double sumWeight;          ///< Sum of weights w = projectedPenetration * projectedArea (per patch)
-    double3 sumWeightedCP;     ///< Sum of (contactPoint * w) (per patch)
-    double3 sumAreaWeightedCP; ///< Sum of (contactPoint * projectedArea), for near-zero penetration fallback
 
+
+// Each positive-penetration primitive contributes one raw witness point (from pass 1) and one
+// primitive normal. The patch reduction fits a best plane to the witness points and uses the
+// normal sum only for orientation and the non-planar line-constrained branch.
+struct TriTriPlaneFitAccum {
+    double weightSum;
+    double sumPx;
+    double sumPy;
+    double sumPz;
+    double sumPxx;
+    double sumPxy;
+    double sumPxz;
+    double sumPyy;
+    double sumPyz;
+    double sumPzz;
+    double sumNx;
+    double sumNy;
+    double sumNz;
+    unsigned int count;
+
+    __host__ __device__ __forceinline__ TriTriPlaneFitAccum operator+(const TriTriPlaneFitAccum& other) const {
+        TriTriPlaneFitAccum out;
+        out.weightSum = weightSum + other.weightSum;
+        out.sumPx = sumPx + other.sumPx;
+        out.sumPy = sumPy + other.sumPy;
+        out.sumPz = sumPz + other.sumPz;
+        out.sumPxx = sumPxx + other.sumPxx;
+        out.sumPxy = sumPxy + other.sumPxy;
+        out.sumPxz = sumPxz + other.sumPxz;
+        out.sumPyy = sumPyy + other.sumPyy;
+        out.sumPyz = sumPyz + other.sumPyz;
+        out.sumPzz = sumPzz + other.sumPzz;
+        out.sumNx = sumNx + other.sumNx;
+        out.sumNy = sumNy + other.sumNy;
+        out.sumNz = sumNz + other.sumNz;
+        out.count = count + other.count;
+        return out;
+    }
+};
+
+void prepareTriTriPlaneFitAccumulators(DEMDataDT* granData,
+                                       TriTriPlaneFitAccum* accumulators,
+                                       contactPairs_t startOffset,
+                                       contactPairs_t count,
+                                       cudaStream_t& this_stream);
+
+void finalizeTriTriPatchNormalsFromPlaneFit(const TriTriPlaneFitAccum* patchAccumulators,
+                                            float3* patchNormals,
+                                            contactPairs_t count,
+                                            cudaStream_t& this_stream);
+
+// Compact scalar-only tri-tri patch accumulator used after stage-1 reconstruction.
+//
+// Only the positive-area path is reduced here. Zero-area fallback keeps the original code path
+// (max-negative penetration primitive -> normal/penetration/contact-point fallback), which keeps
+// the semantics easy to verify and the ReduceByKey payload minimal.
+struct TriTriLiteAccum {
+    double sumProjArea;
+    double maxPositivePen;
+    double sumAreaWeightedCPx;
+    double sumAreaWeightedCPy;
+    double sumAreaWeightedCPz;
+
+    __host__ __device__ __forceinline__ TriTriLiteAccum operator+(const TriTriLiteAccum& other) const {
+        TriTriLiteAccum out;
+        out.sumProjArea = sumProjArea + other.sumProjArea;
+        out.maxPositivePen = (maxPositivePen > other.maxPositivePen) ? maxPositivePen : other.maxPositivePen;
+        out.sumAreaWeightedCPx = sumAreaWeightedCPx + other.sumAreaWeightedCPx;
+        out.sumAreaWeightedCPy = sumAreaWeightedCPy + other.sumAreaWeightedCPy;
+        out.sumAreaWeightedCPz = sumAreaWeightedCPz + other.sumAreaWeightedCPz;
+        return out;
+    }
+};
+struct PatchContactAccum {
+    double sumProjArea;        ///< Sum of projected contact areas (per contact island)
+    double maxProjPen;         ///< Max projected penetration (per contact island)
+    double3 cpAtMaxPen;        ///< Contact point of primitive that owns max penetration
+    float3 normalAtMaxPen;      ///< Primitive normal that owns max penetration
+    double3 sumAreaWeightedCP;  ///< Sum of (contactPoint * projectedArea)
+    double minSpanU;           ///< Min patch contact-point coordinate on tangent axis U (tri-tri only)
+    double maxSpanU;           ///< Max patch contact-point coordinate on tangent axis U (tri-tri only)
+    double minSpanV;           ///< Min patch contact-point coordinate on tangent axis V (tri-tri only)
+    double maxSpanV;           ///< Max patch contact-point coordinate on tangent axis V (tri-tri only)
+    unsigned int triTriCount;  
     __host__ __device__ __forceinline__ PatchContactAccum operator+(const PatchContactAccum& other) const {
         PatchContactAccum out;
         out.sumProjArea = sumProjArea + other.sumProjArea;
         out.maxProjPen = (maxProjPen > other.maxProjPen) ? maxProjPen : other.maxProjPen;
-        out.sumWeight = sumWeight + other.sumWeight;
-        out.sumWeightedCP = make_double3(sumWeightedCP.x + other.sumWeightedCP.x,
-                                         sumWeightedCP.y + other.sumWeightedCP.y,
-                                         sumWeightedCP.z + other.sumWeightedCP.z);
+        if (other.maxProjPen > maxProjPen) {
+            out.cpAtMaxPen = other.cpAtMaxPen;
+            out.normalAtMaxPen = other.normalAtMaxPen;
+        } else {
+            out.cpAtMaxPen = cpAtMaxPen;
+            out.normalAtMaxPen = normalAtMaxPen;
+        }
         out.sumAreaWeightedCP = make_double3(sumAreaWeightedCP.x + other.sumAreaWeightedCP.x,
                                              sumAreaWeightedCP.y + other.sumAreaWeightedCP.y,
                                              sumAreaWeightedCP.z + other.sumAreaWeightedCP.z);
+        out.minSpanU = (minSpanU < other.minSpanU) ? minSpanU : other.minSpanU;
+        out.maxSpanU = (maxSpanU > other.maxSpanU) ? maxSpanU : other.maxSpanU;
+        out.minSpanV = (minSpanV < other.minSpanV) ? minSpanV : other.minSpanV;
+        out.maxSpanV = (maxSpanV > other.maxSpanV) ? maxSpanV : other.maxSpanV;
+        out.triTriCount = triTriCount + other.triTriCount;
         return out;
     }
 };
@@ -239,13 +334,48 @@ struct PatchContactAccum {
 //   - sumWeightedCP: weighted contact point contribution
 //   - sumAreaWeightedCP: area-weighted CP contribution (fallback when sumWeight ~ 0)
 void computePatchContactAccumulators(DEMDataDT* granData,
-                                     const float3* votedNormals,
                                      const contactPairs_t* keys,
                                      PatchContactAccum* accumulators,
                                      contactPairs_t startOffsetPrimitive,
-                                     contactPairs_t startOffsetPatch,
                                      contactPairs_t count,
                                      cudaStream_t& this_stream);
+
+// Extract selected scalar/vector fields from per-primitive PatchContactAccum for robust per-field reductions.
+void extractPrimitivePatchAccumFields(const PatchContactAccum* primitiveAccumulators,
+                                      double* projectedAreas,
+                                      double* projectedPenetrations,
+                                      double3* areaWeightedContactPoints,
+                                      contactPairs_t count,
+                                      cudaStream_t& this_stream);
+
+// Tri-tri stage-1 reconstruction using patch-voted normals.
+// Also prepares the compact per-primitive accumulator consumed by the single ReduceByKey.
+// If the reconstructed area is <= 0, the primitive is marked NOT_A_CONTACT and the original
+// contact-point fallback already stored in granData->contactTorque_convToForce is preserved.
+void recomputeTriTriAreaAndPrepareLiteAccumulators(const DEMSimParams* simParams,
+                                                   DEMDataDT* granData,
+                                                   const contactPairs_t* keys,
+                                                   const float3* patchNormals,
+                                                   TriTriLiteAccum* accumulators,
+                                                   contactPairs_t startOffsetPrimitive,
+                                                   contactPairs_t startOffsetPatch,
+                                                   contactPairs_t countPatch,
+                                                   contactPairs_t countPrimitive,
+                                                   cudaStream_t& this_stream);
+
+// Finalize tri-tri patch results directly from the reduced TriTriLiteAccum array, with the same
+// zero-area fallback path as the original implementation.
+void finalizeTriTriLitePatchResults(const TriTriLiteAccum* patchAccumulators,
+                                    const float3* patchNormals,
+                                    const float3* zeroAreaNormals,
+                                    const double* zeroAreaPenetrations,
+                                    const double3* zeroAreaContactPoints,
+                                    double* finalAreas,
+                                    float3* finalNormals,
+                                    double* finalPenetrations,
+                                    double3* finalContactPoints,
+                                    contactPairs_t count,
+                                    cudaStream_t& this_stream);
 
 // Finalizes patch results by combining patch-accumulator voting with zero-area / SAT-fail fallback.
 //
@@ -262,20 +392,6 @@ void finalizePatchResultsFromAccumulators(const PatchContactAccum* patchAccumula
                                           double3* finalContactPoints,
                                           contactPairs_t count,
                                           cudaStream_t& this_stream);
-
-// Computes projected penetration and area for each primitive contact
-// Both the penetration and area are projected onto the voted normal
-// If the projected penetration becomes negative, both are set to 0
-void computeWeightedUsefulPenetration(DEMDataDT* granData,
-                                      float3* votedNormals,
-                                      contactPairs_t* keys,
-                                      double* areas,
-                                      double* projectedPenetrations,
-                                      double* projectedAreas,
-                                      contactPairs_t startOffsetPrimitive,
-                                      contactPairs_t startOffsetPatch,
-                                      contactPairs_t count,
-                                      cudaStream_t& this_stream);
 
 // Extracts primitive penetrations from contactPointGeometryA for max-reduce operation
 void extractPrimitivePenetrations(DEMDataDT* granData,
@@ -294,6 +410,7 @@ void findMaxPenetrationPrimitiveForZeroAreaPatches(DEMDataDT* granData,
                                                    contactPairs_t* keys,
                                                    contactPairs_t startOffsetPrimitive,
                                                    contactPairs_t startOffsetPatch,
+                                                   contactPairs_t countPatch,
                                                    contactPairs_t countPrimitive,
                                                    cudaStream_t& this_stream);
 
@@ -320,17 +437,6 @@ void finalizePatchContactPoints(double* totalAreas,
                                 contactPairs_t count,
                                 cudaStream_t& this_stream);
 
-// Computes weighted contact points for each primitive contact
-// The weight is: projected_penetration * projected_area
-void computeWeightedContactPoints(DEMDataDT* granData,
-                                  double3* weightedContactPoints,
-                                  double* weights,
-                                  double* projectedPenetrations,
-                                  double* projectedAreas,
-                                  contactPairs_t startOffsetPrimitive,
-                                  contactPairs_t count,
-                                  cudaStream_t& this_stream);
-
 // Computes final contact points per patch by dividing by total weight
 // If total weight is 0, contact point is set to (0,0,0)
 void computeFinalContactPointsPerPatch(double3* totalWeightedContactPoints,
@@ -356,11 +462,12 @@ void accumulateTrianglePVFromPatchContacts(DEMSimParams* simParams,
                                            DEMDataDT* granData,
                                            const contactPairs_t* keys,
                                            const PatchContactAccum* primitiveAccumulators,
-                                           const PatchContactAccum* patchAccumulators,
+                                           const double* finalPatchAreas,
                                            const float* patchNormalForce,
                                            const float* patchSlipSpeed,
                                            contactPairs_t startOffsetPrimitive,
                                            contactPairs_t startOffsetPatch,
+                                           contactPairs_t countPatch,
                                            contactPairs_t countPrimitive,
                                            const int* triGlobalToLocal,
                                            float* triAccumP,
@@ -380,6 +487,7 @@ void rearrangeContactWildcards(DEMDataDT* granData,
                                float* wildcard,
                                notStupidBool_t* sentry,
                                unsigned int nWildcards,
+                               size_t nPrevContactPairs,
                                size_t nContactPairs,
                                cudaStream_t& this_stream);
 void markAliveContacts(float* wildcard, notStupidBool_t* sentry, size_t nContactPairs, cudaStream_t& this_stream);

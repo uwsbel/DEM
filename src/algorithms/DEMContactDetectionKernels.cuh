@@ -539,6 +539,28 @@ __global__ void selectWinnerPrimitive(const contactPairs_t* groupIndex,
     }
 }
 
+
+
+// Extract a specific side's primitive ID and whether that side is a triangle.
+// sideA != 0 selects primitive A / typeA, otherwise primitive B / typeB.
+__global__ void extractSidePrimitiveAndTriFlag(const bodyID_t* idA,
+                                               const bodyID_t* idB,
+                                               const contact_t* contactType,
+                                               bodyID_t* sidePrimitive,
+                                               notStupidBool_t* sideIsTri,
+                                               size_t n,
+                                               int sideA) {
+    contactPairs_t myID = blockIdx.x * blockDim.x + threadIdx.x;
+    if (myID < n) {
+        const contact_t ctype = contactType[myID];
+        const geoType_t sideType = sideA ? decodeTypeA<contact_t, geoType_t>(ctype)
+                                         : decodeTypeB<contact_t, geoType_t>(ctype);
+        // Contact IDs may carry periodic ghost bits; strip them before any indexing/use as primitive IDs.
+        sidePrimitive[myID] = (sideA ? idA[myID] : idB[myID]) & deme::CYL_PERIODIC_SPHERE_ID_MASK;
+        sideIsTri[myID] = (sideType == GEO_T_TRIANGLE) ? 1 : 0;
+    }
+}
+
 // Build active triangle keys for compacting (groupIndex, triID).
 __global__ void buildActiveTriKeys(const contactPairs_t* groupIndex,
                                    const bodyID_t* winnerID,
@@ -797,6 +819,36 @@ __global__ void copyBodyIDArray(const bodyID_t* in, bodyID_t* out, size_t n) {
     }
 }
 
+// Build a winner-invariant persistent island label.
+// For tri-tri contacts we combine side-A and side-B labels deterministically so winner-side
+// switches do not reset history. For other contact types we keep the winner-derived label.
+__global__ void buildPersistentIslandLabel(const contact_t* contactTypes,
+                                           const bodyID_t* winnerLabels,
+                                           const bodyID_t* sideLabelsA,
+                                           const bodyID_t* sideLabelsB,
+                                           bodyID_t* outLabels,
+                                           size_t n) {
+    contactPairs_t myID = blockIdx.x * blockDim.x + threadIdx.x;
+    if (myID < n) {
+        if (contactTypes[myID] == TRIANGLE_TRIANGLE_CONTACT) {
+            const bodyID_t a = sideLabelsA[myID];
+            const bodyID_t b = sideLabelsB[myID];
+            const uint64_t lo = static_cast<uint64_t>((a <= b) ? a : b);
+            const uint64_t hi = static_cast<uint64_t>((a <= b) ? b : a);
+            // 64->32 mix, deterministic and cheap on GPU.
+            uint64_t x = (hi << 32) | lo;
+            x ^= x >> 33;
+            x *= 0xff51afd7ed558ccdULL;
+            x ^= x >> 33;
+            x *= 0xc4ceb9fe1a85ec53ULL;
+            x ^= x >> 33;
+            outLabels[myID] = static_cast<bodyID_t>(x & 0xffffffffULL);
+        } else {
+            outLabels[myID] = winnerLabels[myID];
+        }
+    }
+}
+
 // Build composite key parts (contactType + patchA, patchB + label) for island grouping.
 __global__ void buildIslandCompositeKeyParts(const patchIDPair_t* patchPairs,
                                              const contact_t* contactTypes,
@@ -915,6 +967,9 @@ __global__ void buildPatchContactMappingForType(bodyID_t* curr_idPatchA,
                                                 bodyID_t* prev_idPatchB,
                                                 bodyID_t* prev_patchIsland,
                                                 contactPairs_t* contactMapping,
+                                                bool allow_label_fallback,
+                                                bool allow_island_fallback,
+                                                bool allow_rank_clamp,
                                                 contactPairs_t curr_start,
                                                 contactPairs_t curr_count,
                                                 contactPairs_t prev_start,
@@ -961,94 +1016,176 @@ __global__ void buildPatchContactMappingForType(bodyID_t* curr_idPatchA,
             }
         }
 
+        // If a patch-pair run collapses from many previous contacts to a single current contact,
+        // preserve continuity by selecting a stable representative (rank 0 in the pair run),
+        // instead of binding to a potentially oscillating island label branch.
+        if (my_partner == NULL_MAPPING_PARTNER && allow_island_fallback) {
+            contactPairs_t prev_pair_lo = 0;
+            contactPairs_t prev_pair_hi = prev_count;
+            while (prev_pair_lo < prev_pair_hi) {
+                contactPairs_t mid = prev_pair_lo + (prev_pair_hi - prev_pair_lo) / 2;
+                contactPairs_t prev_idx = prev_start + mid;
+                const bodyID_t prev_A = prev_idPatchA[prev_idx];
+                const bodyID_t prev_B = prev_idPatchB[prev_idx];
+                if (prev_A < curr_A || (prev_A == curr_A && prev_B < curr_B)) {
+                    prev_pair_lo = mid + 1;
+                } else {
+                    prev_pair_hi = mid;
+                }
+            }
+
+            contactPairs_t prev_pair_end = prev_pair_lo;
+            while (prev_pair_end < prev_count) {
+                const contactPairs_t prev_idx = prev_start + prev_pair_end;
+                if (prev_idPatchA[prev_idx] == curr_A && prev_idPatchB[prev_idx] == curr_B) {
+                    prev_pair_end++;
+                } else {
+                    break;
+                }
+            }
+
+            contactPairs_t curr_pair_lo = 0;
+            contactPairs_t curr_pair_hi = curr_count;
+            while (curr_pair_lo < curr_pair_hi) {
+                contactPairs_t mid = curr_pair_lo + (curr_pair_hi - curr_pair_lo) / 2;
+                contactPairs_t curr_mid_idx = curr_start + mid;
+                const bodyID_t mid_A = curr_idPatchA[curr_mid_idx];
+                const bodyID_t mid_B = curr_idPatchB[curr_mid_idx];
+                if (mid_A < curr_A || (mid_A == curr_A && mid_B < curr_B)) {
+                    curr_pair_lo = mid + 1;
+                } else {
+                    curr_pair_hi = mid;
+                }
+            }
+
+            contactPairs_t curr_pair_end = curr_pair_lo;
+            while (curr_pair_end < curr_count) {
+                const contactPairs_t curr_end_idx = curr_start + curr_pair_end;
+                if (curr_idPatchA[curr_end_idx] == curr_A && curr_idPatchB[curr_end_idx] == curr_B) {
+                    curr_pair_end++;
+                } else {
+                    break;
+                }
+            }
+
+            const contactPairs_t prev_pair_count = prev_pair_end - prev_pair_lo;
+            const contactPairs_t curr_pair_count = curr_pair_end - curr_pair_lo;
+            if (curr_pair_count == 1 && prev_pair_count > 0) {
+                if (allow_rank_clamp) {
+                    // For sph-tri, a deterministic representative avoids intermittent
+                    // history resets from transient over-splitting.
+                    my_partner = prev_start + prev_pair_lo;
+                } else {
+                    // For tri-tri, keep label-nearest representative to preserve
+                    // smoother continuity in grazing transitions.
+                    contactPairs_t best_local = prev_pair_lo;
+                    bodyID_t best_dist = (bodyID_t)(-1);
+                    for (contactPairs_t k = prev_pair_lo; k < prev_pair_end; k++) {
+                        const contactPairs_t prev_idx = prev_start + k;
+                        const bodyID_t prev_L = prev_patchIsland[prev_idx];
+                        const bodyID_t d = (prev_L > curr_L) ? (prev_L - curr_L) : (curr_L - prev_L);
+                        if (d < best_dist) {
+                            best_dist = d;
+                            best_local = k;
+                        }
+                    }
+                    my_partner = prev_start + best_local;
+                }
+            }
+        }
+
+        // Optional fallback for tri-tri history continuity:
+        // If island labels churn, preserve continuity by matching within the (A,B) run using stable ordinal rank.
+        // This is more robust than requiring label equality and avoids history holes on seam/island relabeling.
+        if (my_partner == NULL_MAPPING_PARTNER && allow_label_fallback) {
+            // Locate [prev_pair_lo, prev_pair_hi) range for (curr_A, curr_B) in previous segment.
+            contactPairs_t prev_pair_lo = 0;
+            contactPairs_t prev_pair_hi = prev_count;
+            while (prev_pair_lo < prev_pair_hi) {
+                contactPairs_t mid = prev_pair_lo + (prev_pair_hi - prev_pair_lo) / 2;
+                contactPairs_t prev_idx = prev_start + mid;
+                const bodyID_t prev_A = prev_idPatchA[prev_idx];
+                const bodyID_t prev_B = prev_idPatchB[prev_idx];
+                if (prev_A < curr_A || (prev_A == curr_A && prev_B < curr_B)) {
+                    prev_pair_lo = mid + 1;
+                } else {
+                    prev_pair_hi = mid;
+                }
+            }
+
+            contactPairs_t prev_pair_end = prev_pair_lo;
+            while (prev_pair_end < prev_count) {
+                const contactPairs_t prev_idx = prev_start + prev_pair_end;
+                if (prev_idPatchA[prev_idx] == curr_A && prev_idPatchB[prev_idx] == curr_B) {
+                    prev_pair_end++;
+                } else {
+                    break;
+                }
+            }
+
+            const contactPairs_t prev_pair_count = prev_pair_end - prev_pair_lo;
+            if (prev_pair_count > 0) {
+                // Prefer label-nearest partner in the previous (A,B) run.
+                // This is more stable than rank mapping when run order jitters.
+                contactPairs_t best_local = prev_pair_lo;
+                bodyID_t best_dist = (bodyID_t)(-1);
+                for (contactPairs_t k = prev_pair_lo; k < prev_pair_end; k++) {
+                    const contactPairs_t prev_idx = prev_start + k;
+                    const bodyID_t prev_L = prev_patchIsland[prev_idx];
+                    const bodyID_t d = (prev_L > curr_L) ? (prev_L - curr_L) : (curr_L - prev_L);
+                    if (d < best_dist) {
+                        best_dist = d;
+                        best_local = k;
+                    }
+                }
+                my_partner = prev_start + best_local;
+            }
+        }
+
+        // Secondary tri-tri/sph-tri continuity fallback:
+        // if patch-pair mapping fails due support-triangle switches, preserve history by
+        // island-label stable rank within the contact-type segment.
+        if (my_partner == NULL_MAPPING_PARTNER && allow_island_fallback) {
+            contactPairs_t curr_island_rank = 0;
+            for (contactPairs_t k = 0; k < myID; k++) {
+                const contactPairs_t curr_k_idx = curr_start + k;
+                if (curr_patchIsland[curr_k_idx] == curr_L) {
+                    curr_island_rank++;
+                }
+            }
+
+            contactPairs_t prev_island_seen = 0;
+            for (contactPairs_t k = 0; k < prev_count; k++) {
+                const contactPairs_t prev_k_idx = prev_start + k;
+                if (prev_patchIsland[prev_k_idx] == curr_L) {
+                    if (prev_island_seen == curr_island_rank) {
+                        my_partner = prev_k_idx;
+                        break;
+                    }
+                    prev_island_seen++;
+                }
+            }
+        }
+
+        // Final continuity guard: if patch-pair based matching still fails (e.g., transient
+        // pair-key jitter), keep tangential history by taking the label-nearest contact in
+        // the same type segment.
+        if (my_partner == NULL_MAPPING_PARTNER && allow_label_fallback && prev_count > 0) {
+            contactPairs_t best_local = 0;
+            bodyID_t best_dist = (bodyID_t)(-1);
+            for (contactPairs_t k = 0; k < prev_count; k++) {
+                const contactPairs_t prev_idx = prev_start + k;
+                const bodyID_t prev_L = prev_patchIsland[prev_idx];
+                const bodyID_t d = (prev_L > curr_L) ? (prev_L - curr_L) : (curr_L - prev_L);
+                if (d < best_dist) {
+                    best_dist = d;
+                    best_local = k;
+                }
+            }
+            my_partner = prev_start + best_local;
+        }
+
         contactMapping[curr_idx] = my_partner;
-    }
-}
-
-// Build patch-based contact mapping between current and previous patch contact arrays.
-// Both arrays are sorted by contact type, then by combined patch ID pair within each type.
-// For each current contact, we use binary search to find the matching contact in the previous array.
-__global__ void buildPatchContactMapping(bodyID_t* curr_idPatchA,
-                                         bodyID_t* curr_idPatchB,
-                                         bodyID_t* curr_patchIsland,
-                                         contact_t* curr_contactTypePatch,
-                                         bodyID_t* prev_idPatchA,
-                                         bodyID_t* prev_idPatchB,
-                                         bodyID_t* prev_patchIsland,
-                                         contact_t* previous_contactTypePatch,
-                                         contactPairs_t* contactMapping,
-                                         size_t numCurrContacts,
-                                         size_t numPrevContacts) {
-    contactPairs_t myID = blockIdx.x * blockDim.x + threadIdx.x;
-    if (myID < numCurrContacts) {
-        bodyID_t curr_A = curr_idPatchA[myID];
-        bodyID_t curr_B = curr_idPatchB[myID];
-        bodyID_t curr_L = curr_patchIsland[myID];
-        contact_t curr_type = curr_contactTypePatch[myID];
-
-        // Default: no match found
-        contactPairs_t my_partner = NULL_MAPPING_PARTNER;
-
-        // Find the segment in the previous array with the same contact type
-        // Since arrays are sorted by type first, we can find the type segment bounds using binary search
-
-        // Find the lower bound (first element with type >= curr_type)
-        size_t left = 0;
-        size_t right = numPrevContacts;
-        while (left < right) {
-            size_t mid = left + (right - left) / 2;
-            if (previous_contactTypePatch[mid] < curr_type) {
-                left = mid + 1;
-            } else {
-                right = mid;
-            }
-        }
-        size_t type_start = left;
-
-        // Find the upper bound (first element with type > curr_type)
-        // Note: we intentionally reuse 'left' from the lower_bound result (= type_start)
-        // since we know upper_bound >= lower_bound, this is an optimization
-        right = numPrevContacts;
-        while (left < right) {
-            size_t mid = left + (right - left) / 2;
-            if (previous_contactTypePatch[mid] <= curr_type) {
-                left = mid + 1;
-            } else {
-                right = mid;
-            }
-        }
-        size_t type_end = left;
-
-        // Within this type segment, use binary search to find the matching A/B/label triple
-        // The segment is sorted by patch pair then island label.
-        left = type_start;
-        right = type_end;
-        while (left < right) {
-            size_t mid = left + (right - left) / 2;
-            bodyID_t prev_A = prev_idPatchA[mid];
-            bodyID_t prev_B = prev_idPatchB[mid];
-            bodyID_t prev_L = prev_patchIsland[mid];
-
-            // Compare (A, B) pairs lexicographically
-            // Since they're sorted by patch ID pair where smaller ID is in high bits
-            if (prev_A < curr_A || (prev_A == curr_A && (prev_B < curr_B || (prev_B == curr_B && prev_L < curr_L)))) {
-                left = mid + 1;
-            } else {
-                right = mid;
-            }
-        }
-
-        // Check if we found a match at position left
-        if (left < type_end) {
-            bodyID_t prev_A = prev_idPatchA[left];
-            bodyID_t prev_B = prev_idPatchB[left];
-            bodyID_t prev_L = prev_patchIsland[left];
-            if (prev_A == curr_A && prev_B == curr_B && prev_L == curr_L) {
-                my_partner = left;
-            }
-        }
-
-        contactMapping[myID] = my_partner;
     }
 }
 

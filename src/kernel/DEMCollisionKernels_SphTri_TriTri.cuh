@@ -4,7 +4,7 @@
 #define DEME_COLLI_KERNELS_ST_TT_CUH
 
 #include <DEM/Defines.h>
-#include <DEMHelperKernels.cuh>
+#include <kernel/DEMHelperKernels.cuh>
 
 // ------------------------------------------------------------------
 // Helpers
@@ -944,14 +944,14 @@ A return value of "true" signals collision.
 */
 template <typename T1, typename T2>
 __device__ __forceinline__ bool checkTriSphereOverlap(const T1& A,           ///< First vertex of the triangle
-                                                      const T1& B,           ///< Second vertex of the triangle
-                                                      const T1& C,           ///< Third vertex of the triangle
-                                                      const T1& sphere_pos,  ///< Location of the center of the sphere
-                                                      const T2 radius,       ///< Sphere radius
-                                                      T1& normal,            ///< contact normal
-                                                      T2& depth,             ///< penetration (positive if in contact)
-                                                      T2& overlapArea,       ///< overlap area
-                                                      T1& pt1                ///< contact point on triangle
+                                      const T1& B,           ///< Second vertex of the triangle
+                                      const T1& C,           ///< Third vertex of the triangle
+                                      const T1& sphere_pos,  ///< Location of the center of the sphere
+                                      const T2 radius,       ///< Sphere radius
+                                      T1& normal,            ///< contact normal
+                                      T2& depth,             ///< penetration (positive if in contact)
+                                      T2& overlapArea,       ///< overlap area
+                                      T1& pt1                ///< contact point on triangle
 ) {
     T1 faceLoc;
     snap_to_face<T1, T2>(A, B, C, sphere_pos, faceLoc);
@@ -992,7 +992,7 @@ __device__ __forceinline__ bool checkTriSphereOverlap(const T1& A,           ///
     const T2 signed_h = dot(sphere_pos - A, face_n);
     const T2 abs_h = absT(signed_h);
     if (abs_h >= radius) {
-        overlapArea = (T2)0;
+    overlapArea = (T2)0;
         return true;
     }
 
@@ -1052,8 +1052,8 @@ __device__ bool checkTriSphereOverlap_directional(const T1& A,           ///< Fi
     const T2 depth_face = radius - h;
 
     if (!on_edge) {
-        depth = depth_face;
-        normal = face_n;
+            depth = depth_face;
+            normal = face_n;
     } else {
         // Edge/vertex witness:
         // - Outside the oriented face plane (h >= 0): use geometric closest-point contact.
@@ -1442,9 +1442,13 @@ __device__ __forceinline__ bool checkTriangleTriangleSAT(
 }
 
 
-// ------------------------------------------------------------------
-// Start of the final tri-tri overlap calculation functions
-// ------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////
+// Tri-Tri narrow contact calculation
+// Main functions:
+// - Penetration depth, normal
+// - area and contact point
+// - Same for shell special case (TODO)
+////////////////////////////////////////////////////////////////////////////////
 template <typename V, typename S>
 __device__ __forceinline__ S local_length_scale6(const V& A0, const V& A1, const V& A2,
                                                  const V& B0, const V& B1, const V& B2) {
@@ -1501,6 +1505,84 @@ __device__ __forceinline__ bool aabb_overlap6(const V& A0, const V& A1, const V&
     return true;
 }
 
+template <typename T1, typename T2>
+__device__ __forceinline__ T1 fallback_pair_normal_b2a(const T1& A0, const T1& A1, const T1& A2,
+                                                       const T1& B0, const T1& B1, const T1& B2,
+                                                       const T1& hint) {
+    const T1 centDir = (A0 + A1 + A2 - B0 - B1 - B2) / (T2)3;
+    const T2 centLen2 = dot(centDir, centDir);
+    if (centLen2 > (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT)) {
+        return centDir * ((T2)1 / sqrt(centLen2));
+    }
+    const T2 hintLen2 = dot(hint, hint);
+    if (hintLen2 > (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT)) {
+        return hint * ((T2)1 / sqrt(hintLen2));
+    }
+    return make_zero3<T1>();
+}
+
+template <typename T1, typename T2>
+__device__ __forceinline__ T1 choose_contact_normal_b2a(const T1& nAUnit,
+                                                        const T1& nBUnit,
+                                                        T2 penA,
+                                                        T2 penB,
+                                                        T2 tieTol,
+                                                        const T1& A0,
+                                                        const T1& A1,
+                                                        const T1& A2,
+                                                        const T1& B0,
+                                                        const T1& B1,
+                                                        const T1& B2) {
+    const T2 penScale = max2((T2)1, max2(absT(penA), absT(penB)));
+    tieTol = max2(tieTol, rel_len_tol<T2>() * penScale);
+    T1 normal;
+    T1 cA = (T2)-1 * nAUnit;
+    T1 cB = nBUnit;
+    const T1 centDir = (A0 + A1 + A2 - B0 - B1 - B2) / (T2)3;
+    const T2 eA0 = dot(A1 - A0, A1 - A0);
+    const T2 eA1 = dot(A2 - A1, A2 - A1);
+    const T2 eA2 = dot(A0 - A2, A0 - A2);
+    const T2 eB0 = dot(B1 - B0, B1 - B0);
+    const T2 eB1 = dot(B2 - B1, B2 - B1);
+    const T2 eB2 = dot(B0 - B2, B0 - B2);
+    const T2 charLen2 = max2((T2)1e-24, max2(max2(eA0, eA1), max2(max2(eA2, eB0), max2(eB1, eB2))));
+    const T2 centDir2 = dot(centDir, centDir);
+    // Only trust centroid-based orientation if the centroid baseline is strong
+    // relative to local triangle scale. A weaker threshold lets near-coincident
+    // triangle pairs inject frame-to-frame normal sign flips.
+    const bool centDirReliable = centDir2 > ((T2)1e-4 * charLen2);
+    if (centDirReliable) {
+        if (dot(cA, centDir) < (T2)0) {
+            cA = (T2)-1 * cA;
+        }
+        if (dot(cB, centDir) < (T2)0) {
+            cB = (T2)-1 * cB;
+        }
+    } else {
+        // If centroid direction is numerically weak, avoid using it as orientation reference.
+        // Keep candidates in the same hemisphere to prevent random frame-to-frame sign flips.
+        if (dot(cA, cB) < (T2)0) {
+            cB = (T2)-1 * cB;
+        }
+    }
+    if (absT(penA - penB) <= tieTol) {
+        // Near-equal projected depths: blend oriented candidates to avoid hard branch switching.
+        normal = cA + cB;
+        const T2 n2 = dot(normal, normal);
+        if (n2 > (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT)) {
+            normal = normal * ((T2)1 / sqrt(n2));
+        } else {
+            normal = fallback_pair_normal_b2a<T1, T2>(A0, A1, A2, B0, B1, B2, cA);
+        }
+    } else {
+        normal = (penA < penB) ? cA : cB;
+    }
+    if (centDirReliable && dot(normal, centDir) < (T2)0) {
+        normal = (T2)-1 * normal;
+    }
+    return normal;
+}
+
 template <typename V, typename S>
 __device__ __forceinline__ int dominant_axis(const V& v) {
     const S ax = absT((S)v.x), ay = absT((S)v.y), az = absT((S)v.z);
@@ -1537,10 +1619,9 @@ __device__ __forceinline__ bool seg_seg_2d(S ax, S ay, S bx, S by,
     const S o3 = orient2d(cx, cy, dx, dy, ax, ay);
     const S o4 = orient2d(cx, cy, dx, dy, bx, by);
 
-    const bool straddle1 = (o1 > orientTol && o2 < -orientTol) || (o1 < -orientTol && o2 > orientTol);
-    const bool straddle2 = (o3 > orientTol && o4 < -orientTol) || (o3 < -orientTol && o4 > orientTol);
-    if (straddle1 && straddle2) return true;
-
+    const bool proper = ((o1 > orientTol && o2 < -orientTol) || (o1 < -orientTol && o2 > orientTol)) &&
+                        ((o3 > orientTol && o4 < -orientTol) || (o3 < -orientTol && o4 > orientTol));
+    if (proper) return true;
     if (on_segment_2d(ax, ay, bx, by, cx, cy, orientTol, coordTol)) return true;
     if (on_segment_2d(ax, ay, bx, by, dx, dy, orientTol, coordTol)) return true;
     if (on_segment_2d(cx, cy, dx, dy, ax, ay, orientTol, coordTol)) return true;
@@ -1553,29 +1634,29 @@ __device__ __forceinline__ bool point_in_tri_2d(S px, S py,
                                                 S ax, S ay,
                                                 S bx, S by,
                                                 S cx, S cy,
-                                                S orientTol) {
+                                                S eps) {
     const S o0 = orient2d(ax, ay, bx, by, px, py);
     const S o1 = orient2d(bx, by, cx, cy, px, py);
     const S o2 = orient2d(cx, cy, ax, ay, px, py);
-    const bool hasNeg = (o0 < -orientTol) || (o1 < -orientTol) || (o2 < -orientTol);
-    const bool hasPos = (o0 > orientTol) || (o1 > orientTol) || (o2 > orientTol);
-    return !(hasNeg && hasPos);
+    const bool nonneg = (o0 >= -eps) && (o1 >= -eps) && (o2 >= -eps);
+    const bool nonpos = (o0 <=  eps) && (o1 <=  eps) && (o2 <=  eps);
+    return nonneg || nonpos;
 }
 
 template <typename V, typename S>
 __device__ __forceinline__ bool coplanar_tri_tri(const V& N,
                                                  const V& A0, const V& A1, const V& A2,
                                                  const V& B0, const V& B1, const V& B2,
-                                                 S orientTol,
-                                                 S coordTol) {
+                                                 const S orientTol,
+                                                 const S coordTol) {
     const S nx = absT((S)N.x), ny = absT((S)N.y), nz = absT((S)N.z);
     int i0, i1;
     if (nx > ny) {
         if (nx > nz) { i0 = 1; i1 = 2; }
         else         { i0 = 0; i1 = 1; }
     } else {
-        if (ny > nz) { i0 = 0; i1 = 2; }
-        else         { i0 = 0; i1 = 1; }
+        if (nz > ny) { i0 = 0; i1 = 1; }
+        else         { i0 = 0; i1 = 2; }
     }
 
     const S a0x = coord_axis<V,S>(A0, i0), a0y = coord_axis<V,S>(A0, i1);
@@ -1600,26 +1681,596 @@ __device__ __forceinline__ bool coplanar_tri_tri(const V& N,
     return false;
 }
 
+template <typename T1, typename T2>
+__device__ __forceinline__ T1 midpoint_on_plane_plane_line(const T1& n1u,
+                                                           T2 d1,
+                                                           const T1& n2u,
+                                                           T2 d2,
+                                                           const T1& D,
+                                                           int axis,
+                                                           T2 axisMid) {
+    const T2 D2 = dot(D, D);
+    if (D2 <= (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT)) {
+        return make_zero3<T1>();
+    }
+    const T1 linePoint = (cross(n2u, D) * d1 + cross(D, n1u) * d2) * ((T2)1 / D2);
+    const T2 Daxis = coord_axis<T1, T2>(D, axis);
+    if (absT(Daxis) <= (T2)1e-30) {
+        return linePoint;
+    }
+    const T2 lineAxis = coord_axis<T1, T2>(linePoint, axis);
+    const T2 t = (axisMid - lineAxis) / Daxis;
+    return linePoint + D * t;
+}
+
+template <typename T1, typename T2>
+__device__ __forceinline__ T1 coplanar_patch_witness_point(const T1& A0,
+                                                           const T1& A1,
+                                                           const T1& A2,
+                                                           const T1& B0,
+                                                           const T1& B1,
+                                                           const T1& B2,
+                                                           const T1& planePoint,
+                                                           const T1& planeNormalUnit) {
+    T1 mid = (A0 + A1 + A2 + B0 + B1 + B2) * ((T2)1 / (T2)6);
+    const T2 off = dot(planeNormalUnit, mid - planePoint);
+    mid = mid - planeNormalUnit * off;
+    return mid;
+}
+
 template <typename S>
 __device__ __forceinline__ int interval_from_plane_hits(S p0, S p1, S p2,
                                                         S d0, S d1, S d2,
                                                         S hits[6], S tol) {
     int n = 0;
-    if (absT(d0) <= tol) hits[n++] = p0;
+    auto push_unique = [&](S v) {
+        for (int i = 0; i < n; ++i) {
+            if (absT(hits[i] - v) <= tol) {
+                return;
+            }
+        }
+        if (n < 6) {
+            hits[n++] = v;
+        }
+    };
+    if (absT(d0) <= tol) push_unique(p0);
     if (absT(d1) <= tol) {
-        bool dup = false;
-        for (int i = 0; i < n; ++i) dup = dup || (absT(hits[i] - p1) <= tol);
-        if (!dup) hits[n++] = p1;
+        push_unique(p1);
     }
     if (absT(d2) <= tol) {
-        bool dup = false;
-        for (int i = 0; i < n; ++i) dup = dup || (absT(hits[i] - p2) <= tol);
-        if (!dup) hits[n++] = p2;
+        push_unique(p2);
     }
-    if ((d0 > tol && d1 < -tol) || (d0 < -tol && d1 > tol)) hits[n++] = p0 + (p1 - p0) * (d0 / (d0 - d1));
-    if ((d1 > tol && d2 < -tol) || (d1 < -tol && d2 > tol)) hits[n++] = p1 + (p2 - p1) * (d1 / (d1 - d2));
-    if ((d2 > tol && d0 < -tol) || (d2 < -tol && d0 > tol)) hits[n++] = p2 + (p0 - p2) * (d2 / (d2 - d0));
+    if ((d0 > tol && d1 < -tol) || (d0 < -tol && d1 > tol)) push_unique(p0 + (p1 - p0) * (d0 / (d0 - d1)));
+    if ((d1 > tol && d2 < -tol) || (d1 < -tol && d2 > tol)) push_unique(p1 + (p2 - p1) * (d1 / (d1 - d2)));
+    if ((d2 > tol && d0 < -tol) || (d2 < -tol && d0 > tol)) push_unique(p2 + (p0 - p2) * (d2 / (d2 - d0)));
     return n;
+}
+
+template <typename T1, typename T2>
+__device__ __forceinline__ int section_interval_on_plane(const T1& V0,
+                                                         const T1& V1,
+                                                         const T1& V2,
+                                                         const T1& planePoint,
+                                                         const T1& planeNormalUnit,
+                                                         const T1& sectionDirUnit,
+                                                         T2& outMin,
+                                                         T2& outMax,
+                                                         const T2 tol) {
+    const T2 d0 = dot(planeNormalUnit, V0 - planePoint);
+    const T2 d1 = dot(planeNormalUnit, V1 - planePoint);
+    const T2 d2 = dot(planeNormalUnit, V2 - planePoint);
+
+    const T2 p0 = dot(V0 - planePoint, sectionDirUnit);
+    const T2 p1 = dot(V1 - planePoint, sectionDirUnit);
+    const T2 p2 = dot(V2 - planePoint, sectionDirUnit);
+
+    T2 hits[6];
+    const int n = interval_from_plane_hits<T2>(p0, p1, p2, d0, d1, d2, hits, tol);
+    if (n <= 0) {
+        return 0;
+    }
+
+    outMin = hits[0];
+    outMax = hits[0];
+    for (int i = 1; i < n; ++i) {
+        outMin = min2(outMin, hits[i]);
+        outMax = max2(outMax, hits[i]);
+    }
+    return n;
+}
+
+template <typename T1, typename T2>
+__device__ __forceinline__ bool tri_tri_local_section_depth(const T1& A0,
+                                                            const T1& A1,
+                                                            const T1& A2,
+                                                            const T1& B0,
+                                                            const T1& B1,
+                                                            const T1& B2,
+                                                            const T1& n1u,
+                                                            const T1& n2u,
+                                                            const T1& lineDirUnit,
+                                                            const T1& linePoint,
+                                                            const T2 lineTol,
+                                                            T2& localPenA,
+                                                            T2& localPenB,
+                                                            T2& secLenA,
+                                                            T2& secLenB) {
+    localPenA = (T2)0;
+    localPenB = (T2)0;
+    secLenA = (T2)0;
+    secLenB = (T2)0;
+
+    const T1 tARaw = cross(lineDirUnit, n1u);
+    const T1 tBRaw = cross(lineDirUnit, n2u);
+    const T2 tALen2 = dot(tARaw, tARaw);
+    const T2 tBLen2 = dot(tBRaw, tBRaw);
+    if (tALen2 <= (T2)1e-30 || tBLen2 <= (T2)1e-30) {
+        return false;
+    }
+    const T1 tA = tARaw * ((T2)1 / sqrt(tALen2));
+    const T1 tB = tBRaw * ((T2)1 / sqrt(tBLen2));
+
+    T2 aMin = (T2)0, aMax = (T2)0;
+    T2 bMin = (T2)0, bMax = (T2)0;
+    const int na = section_interval_on_plane<T1, T2>(A0, A1, A2, linePoint, lineDirUnit, tA, aMin, aMax, lineTol);
+    const int nb = section_interval_on_plane<T1, T2>(B0, B1, B2, linePoint, lineDirUnit, tB, bMin, bMax, lineTol);
+    if (na <= 0 || nb <= 0) {
+        return false;
+    }
+
+    secLenA = max2((T2)0, aMax - aMin);
+    secLenB = max2((T2)0, bMax - bMin);
+
+    const T1 bEnd0 = linePoint + tB * bMin;
+    const T1 bEnd1 = linePoint + tB * bMax;
+    const T2 dB0 = dot(n1u, bEnd0 - A0);
+    const T2 dB1 = dot(n1u, bEnd1 - A0);
+    localPenA = max2((T2)0, max2(-dB0, -dB1));
+
+    const T1 aEnd0 = linePoint + tA * aMin;
+    const T1 aEnd1 = linePoint + tA * aMax;
+    const T2 dA0 = dot(n2u, aEnd0 - B0);
+    const T2 dA1 = dot(n2u, aEnd1 - B0);
+    localPenB = max2((T2)0, max2(-dA0, -dA1));
+
+    return true;
+}
+// ------------------------------------------------------------------
+// Robust tri-tri overlap check with signed depth output.
+// - return value: geometric overlap / touching
+// - depth: positive penetration, zero for touching, negative separation
+// ------------------------------------------------------------------
+template <typename V, typename S>
+__device__ __forceinline__ bool point_in_tri_on_plane(const V& p,
+                                                      const V& a,
+                                                      const V& b,
+                                                      const V& c,
+                                                      const V& n,
+                                                      S eps) {
+    const int drop = dominant_axis<V, S>(n);
+    int i0 = (drop == 0) ? 1 : 0;
+    int i1 = (drop == 2) ? 1 : 2;
+    if (drop == 1) i1 = 2;
+    return point_in_tri_2d<S>(coord_axis<V, S>(p, i0), coord_axis<V, S>(p, i1),
+                              coord_axis<V, S>(a, i0), coord_axis<V, S>(a, i1),
+                              coord_axis<V, S>(b, i0), coord_axis<V, S>(b, i1),
+                              coord_axis<V, S>(c, i0), coord_axis<V, S>(c, i1),
+                              eps);
+}
+
+template <typename V, typename S>
+__device__ __forceinline__ bool coplanar_segment_triangle_hit(const V& p0,
+                                                              const V& p1,
+                                                              const V& a,
+                                                              const V& b,
+                                                              const V& c,
+                                                              const V& n,
+                                                              S orientTol,
+                                                              S coordTol,
+                                                              V* witness) {
+    const int drop = dominant_axis<V, S>(n);
+    int i0 = (drop == 0) ? 1 : 0;
+    int i1 = (drop == 2) ? 1 : 2;
+    if (drop == 1) i1 = 2;
+
+    const S p0x = coord_axis<V, S>(p0, i0), p0y = coord_axis<V, S>(p0, i1);
+    const S p1x = coord_axis<V, S>(p1, i0), p1y = coord_axis<V, S>(p1, i1);
+    const S ax = coord_axis<V, S>(a, i0), ay = coord_axis<V, S>(a, i1);
+    const S bx = coord_axis<V, S>(b, i0), by = coord_axis<V, S>(b, i1);
+    const S cx = coord_axis<V, S>(c, i0), cy = coord_axis<V, S>(c, i1);
+
+    if (point_in_tri_2d<S>(p0x, p0y, ax, ay, bx, by, cx, cy, orientTol)) {
+        if (witness) *witness = p0;
+        return true;
+    }
+    if (point_in_tri_2d<S>(p1x, p1y, ax, ay, bx, by, cx, cy, orientTol)) {
+        if (witness) *witness = p1;
+        return true;
+    }
+    if (seg_seg_2d<S>(p0x, p0y, p1x, p1y, ax, ay, bx, by, orientTol, coordTol) ||
+        seg_seg_2d<S>(p0x, p0y, p1x, p1y, bx, by, cx, cy, orientTol, coordTol) ||
+        seg_seg_2d<S>(p0x, p0y, p1x, p1y, cx, cy, ax, ay, orientTol, coordTol)) {
+        if (witness) *witness = (p0 + p1) * ((S)0.5);
+        return true;
+    }
+    return false;
+}
+
+template <typename V, typename S>
+__device__ __forceinline__ bool segment_triangle_hit(const V& p0,
+                                                     const V& p1,
+                                                     const V& a,
+                                                     const V& b,
+                                                     const V& c,
+                                                     const V& n,
+                                                     S planeTol,
+                                                     S orientTol,
+                                                     S coordTol,
+                                                     V* witness) {
+    const S d0 = dot(n, p0 - a);
+    const S d1 = dot(n, p1 - a);
+    if ((d0 > planeTol && d1 > planeTol) || (d0 < -planeTol && d1 < -planeTol)) {
+        return false;
+    }
+
+    const bool p0_on = absT(d0) <= planeTol;
+    const bool p1_on = absT(d1) <= planeTol;
+
+    if (p0_on && point_in_tri_on_plane<V, S>(p0, a, b, c, n, orientTol)) {
+        if (witness) *witness = p0;
+        return true;
+    }
+    if (p1_on && point_in_tri_on_plane<V, S>(p1, a, b, c, n, orientTol)) {
+        if (witness) *witness = p1;
+        return true;
+    }
+    if (p0_on && p1_on) {
+        return coplanar_segment_triangle_hit<V, S>(p0, p1, a, b, c, n, orientTol, coordTol, witness);
+    }
+
+    const S denom = d0 - d1;
+    if (absT(denom) <= planeTol) {
+        return false;
+    }
+
+    const S t = d0 / denom;
+    // Numerical robustness near endpoint grazing:
+    // allow a small interval slack, then clamp before constructing witness point.
+    const S tTol = (S)1e-6;
+    if (t < (S)0 - tTol || t > (S)1 + tTol) {
+        return false;
+    }
+
+    const S tc = (t < (S)0) ? (S)0 : ((t > (S)1) ? (S)1 : t);
+    const V p = p0 + (p1 - p0) * tc;
+    if (point_in_tri_on_plane<V, S>(p, a, b, c, n, orientTol)) {
+        if (witness) *witness = p;
+        return true;
+    }
+    return false;
+}
+
+template <typename T1, typename T2>
+__device__ __forceinline__ void tri_tri_set_separation_result(const T1& A0,
+                                                              const T1& A1,
+                                                              const T1& A2,
+                                                              const T1& B0,
+                                                              const T1& B1,
+                                                              const T1& B2,
+                                                              const T1& hint,
+                                                              T1& normal,
+                                                              T2& depth,
+                                                              T1& witnessPoint) {
+    T1 cA, cB;
+    const T2 dist = closestPtTriTriDistance<T1, T2>(A0, A1, A2, B0, B1, B2, cA, cB);
+    depth = -dist;
+    witnessPoint = (cA + cB) * ((T2)0.5);
+    const T1 sepVec = cA - cB;
+    const T2 sepLen2 = dot(sepVec, sepVec);
+    if (sepLen2 > (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT)) {
+        normal = sepVec * ((T2)1 / sqrt(sepLen2));
+    } else {
+        normal = fallback_pair_normal_b2a<T1, T2>(A0, A1, A2, B0, B1, B2, hint);
+    }
+}
+
+template <typename T1, typename T2>
+__device__ __forceinline__ bool checkTriangleTriangleOverlap(
+    const T1& A0,
+    const T1& A1,
+    const T1& A2,
+    const T1& B0,
+    const T1& B1,
+    const T1& B2,
+    T1& normal,
+    T2& depth,
+    T1& witnessPoint) {
+
+    normal = make_zero3<T1>();
+    witnessPoint = make_zero3<T1>();
+    depth = (T2)0;
+
+    const T2 geomScale    = local_length_scale6<T1, T2>(A0, A1, A2, B0, B1, B2);
+    const T2 lenTol       = rel_len_tol<T2>() * geomScale;
+    const T2 geoTol       = max2((T2)3e-5 * geomScale, (T2)16 * lenTol);
+    const T2 aabbEps      = geoTol;
+    const T2 angTol       = rel_ang_tol<T2>();
+    const T2 coordTol     = geoTol;
+    const T2 orientTol    = geoTol * geomScale;
+
+    if (!aabb_overlap6<T1, T2>(A0, A1, A2, B0, B1, B2, aabbEps)) {
+        tri_tri_set_separation_result<T1, T2>(A0, A1, A2, B0, B1, B2, make_zero3<T1>(), normal, depth, witnessPoint);
+        return false;
+    }
+
+    const T1 E1 = A1 - A0;
+    const T1 E2 = A2 - A0;
+    const T1 F1 = B1 - B0;
+    const T1 F2 = B2 - B0;
+    const T1 N1 = cross(E1, E2);
+    const T1 N2 = cross(F1, F2);
+
+    const T2 n1Len2 = dot(N1, N1);
+    const T2 n2Len2 = dot(N2, N2);
+    if (n1Len2 <= (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT) ||
+        n2Len2 <= (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT)) {
+        tri_tri_set_separation_result<T1, T2>(A0, A1, A2, B0, B1, B2, N1, normal, depth, witnessPoint);
+        return false;
+    }
+
+    const T2 n1Len = sqrt(n1Len2);
+    const T2 n2Len = sqrt(n2Len2);
+    const T1 n1u = N1 * ((T2)1 / n1Len);
+    const T1 n2u = N2 * ((T2)1 / n2Len);
+
+    const T2 sideTol = max2((T2)8 * lenTol, geoTol);
+    const T2 du0 = dot(N1, B0 - A0) / n1Len;
+    const T2 du1 = dot(N1, B1 - A0) / n1Len;
+    const T2 du2 = dot(N1, B2 - A0) / n1Len;
+    const bool sideRejectN1 =
+        ((du0 > sideTol && du1 > sideTol && du2 > sideTol) ||
+         (du0 < -sideTol && du1 < -sideTol && du2 < -sideTol));
+
+    const T2 dv0 = dot(N2, A0 - B0) / n2Len;
+    const T2 dv1 = dot(N2, A1 - B0) / n2Len;
+    const T2 dv2 = dot(N2, A2 - B0) / n2Len;
+    const bool sideRejectN2 =
+        ((dv0 > sideTol && dv1 > sideTol && dv2 > sideTol) ||
+         (dv0 < -sideTol && dv1 < -sideTol && dv2 < -sideTol));
+
+    if (sideRejectN1 || sideRejectN2) {
+        tri_tri_set_separation_result<T1, T2>(A0, A1, A2, B0, B1, B2, n1u, normal, depth, witnessPoint);
+        return false;
+    }
+
+    const T2 penA = max2((T2)0, max2(-du0, max2(-du1, -du2)));
+    const T2 penB = max2((T2)0, max2(-dv0, max2(-dv1, -dv2)));
+    const T2 minDu = tmin3(du0, du1, du2);
+    const T2 maxDu = tmax3(du0, du1, du2);
+    const T2 minDv = tmin3(dv0, dv1, dv2);
+    const T2 maxDv = tmax3(dv0, dv1, dv2);
+    // Penetration depth of the signed interval against the zero plane, with one-sided support:
+    // - all negative:  depth = -max (closest point to plane)
+    // - all positive:  depth = 0
+    // - straddling:    depth = min(max, -min)
+    const T2 penAInterval = (maxDu <= (T2)0) ? max2((T2)0, -maxDu)
+                                              : ((minDu >= (T2)0) ? (T2)0 : min2(max2((T2)0, maxDu), max2((T2)0, -minDu)));
+    const T2 penBInterval = (maxDv <= (T2)0) ? max2((T2)0, -maxDv)
+                                              : ((minDv >= (T2)0) ? (T2)0 : min2(max2((T2)0, maxDv), max2((T2)0, -minDv)));
+    const T2 penTieTol = max2((T2)4 * lenTol, (T2)0.01 * min2(penA, penB));
+
+    const T1 D = cross(n1u, n2u);
+    if (dot(D, D) <= (T2)(angTol * angTol)) {
+        const T2 maxAbsDu = max2(absT(du0), max2(absT(du1), absT(du2)));
+        const T2 maxAbsDv = max2(absT(dv0), max2(absT(dv1), absT(dv2)));
+        const T2 coplanarPlaneTol = max2((T2)4 * lenTol, (T2)0.5 * geoTol);
+        if (maxAbsDu > coplanarPlaneTol || maxAbsDv > coplanarPlaneTol) {
+            tri_tri_set_separation_result<T1, T2>(A0, A1, A2, B0, B1, B2, n1u, normal, depth, witnessPoint);
+            return false;
+        }
+        const bool hit = coplanar_tri_tri<T1, T2>(N1, A0, A1, A2, B0, B1, B2, orientTol, coordTol);
+        if (!hit) {
+            tri_tri_set_separation_result<T1, T2>(A0, A1, A2, B0, B1, B2, n1u, normal, depth, witnessPoint);
+            return false;
+        }
+        depth = min2(penA, penB);
+        normal = choose_contact_normal_b2a<T1, T2>(n1u, n2u, penA, penB, penTieTol, A0, A1, A2, B0, B1, B2);
+        witnessPoint = coplanar_patch_witness_point<T1, T2>(A0, A1, A2, B0, B1, B2, A0, n1u);
+        return true;
+    }
+
+    const T2 planeTolA = geoTol * n1Len;
+    const T2 planeTolB = geoTol * n2Len;
+
+    const T2 lineLen = sqrt(dot(D, D));
+    const T1 lineDirUnit = D * ((T2)1 / lineLen);
+    const T1 centroid6 = (A0 + A1 + A2 + B0 + B1 + B2) * ((T2)1 / (T2)6);
+    const int lineAxis = dominant_axis<T1, T2>(D);
+    const T2 lineAxisMid = coord_axis<T1, T2>(centroid6, lineAxis);
+    const T2 planeConstA = dot(n1u, A0);
+    const T2 planeConstB = dot(n2u, B0);
+    const T1 linePoint = midpoint_on_plane_plane_line<T1, T2>(n1u, planeConstA, n2u, planeConstB, D, lineAxis, lineAxisMid);
+    const T2 lineTol = max2((T2)4 * lenTol, (T2)0.25 * geoTol);
+    T2 lineAMin = (T2)0, lineAMax = (T2)0, lineBMin = (T2)0, lineBMax = (T2)0;
+    T1 lineWitness = linePoint;
+    auto tri_plane_interval_on_line = [&](const T1& V0, const T1& V1, const T1& V2,
+                                          const T1& planePoint, const T1& planeNormalUnit,
+                                          T2& outMin, T2& outMax) {
+        const T2 p0 = dot(V0 - linePoint, lineDirUnit);
+        const T2 p1 = dot(V1 - linePoint, lineDirUnit);
+        const T2 p2 = dot(V2 - linePoint, lineDirUnit);
+        const T2 d0 = dot(planeNormalUnit, V0 - planePoint);
+        const T2 d1 = dot(planeNormalUnit, V1 - planePoint);
+        const T2 d2 = dot(planeNormalUnit, V2 - planePoint);
+        T2 hits[6];
+        const int n = interval_from_plane_hits<T2>(p0, p1, p2, d0, d1, d2, hits, lineTol);
+        if (n <= 0) {
+            return false;
+        }
+        outMin = hits[0];
+        outMax = hits[0];
+        for (int i = 1; i < n; ++i) {
+            outMin = min2(outMin, hits[i]);
+            outMax = max2(outMax, hits[i]);
+        }
+        return true;
+    };
+    const bool haveLineA = tri_plane_interval_on_line(A0, A1, A2, B0, n2u, lineAMin, lineAMax);
+    const bool haveLineB = tri_plane_interval_on_line(B0, B1, B2, A0, n1u, lineBMin, lineBMax);
+    const bool haveLineIntervals = haveLineA && haveLineB;
+    T2 lineOverlap = (T2)-DEME_HUGE_FLOAT;
+    if (haveLineIntervals) {
+        const T2 lineLo = max2(lineAMin, lineBMin);
+        const T2 lineHi = min2(lineAMax, lineBMax);
+        lineOverlap = lineHi - lineLo;
+        lineWitness = linePoint + lineDirUnit * ((T2)0.5 * (lineLo + lineHi));
+    }
+
+    T1 witness = make_zero3<T1>();
+    T1 witnessAcc = make_zero3<T1>();
+    unsigned int witnessCount = 0u;
+    T1 w0 = make_zero3<T1>();
+    T1 w1 = make_zero3<T1>();
+    T1 w2 = make_zero3<T1>();
+    T1 w3 = make_zero3<T1>();
+    T1 w4 = make_zero3<T1>();
+    T1 w5 = make_zero3<T1>();
+    const bool h0 = segment_triangle_hit<T1, T2>(A0, A1, B0, B1, B2, N2, planeTolB, orientTol, coordTol, &w0);
+    const bool h1 = segment_triangle_hit<T1, T2>(A1, A2, B0, B1, B2, N2, planeTolB, orientTol, coordTol, &w1);
+    const bool h2 = segment_triangle_hit<T1, T2>(A2, A0, B0, B1, B2, N2, planeTolB, orientTol, coordTol, &w2);
+    const bool h3 = segment_triangle_hit<T1, T2>(B0, B1, A0, A1, A2, N1, planeTolA, orientTol, coordTol, &w3);
+    const bool h4 = segment_triangle_hit<T1, T2>(B1, B2, A0, A1, A2, N1, planeTolA, orientTol, coordTol, &w4);
+    const bool h5 = segment_triangle_hit<T1, T2>(B2, B0, A0, A1, A2, N1, planeTolA, orientTol, coordTol, &w5);
+    if (h0) {
+        witnessAcc = witnessAcc + w0;
+        witnessCount++;
+    }
+    if (h1) {
+        witnessAcc = witnessAcc + w1;
+        witnessCount++;
+    }
+    if (h2) {
+        witnessAcc = witnessAcc + w2;
+        witnessCount++;
+    }
+    if (h3) {
+        witnessAcc = witnessAcc + w3;
+        witnessCount++;
+    }
+    if (h4) {
+        witnessAcc = witnessAcc + w4;
+        witnessCount++;
+    }
+    if (h5) {
+        witnessAcc = witnessAcc + w5;
+        witnessCount++;
+    }
+    if (witnessCount > 0u) {
+        witness = witnessAcc * ((T2)1 / (T2)witnessCount);
+    }
+    const unsigned int hitMask = (h0 ? 1u : 0u) | (h1 ? 2u : 0u) | (h2 ? 4u : 0u) |
+                                 (h3 ? 8u : 0u) | (h4 ? 16u : 0u) | (h5 ? 32u : 0u);
+    const bool hit = (hitMask != 0u);
+
+    if (!hit) {
+        const T2 depthVertex = min2(penA, penB);
+        const T2 penGuardTol = max2((T2)10 * lenTol, (T2)5e-5 * geomScale);
+        if (haveLineIntervals && lineOverlap >= -lineTol && depthVertex > penGuardTol) {
+            depth = depthVertex;
+            normal = choose_contact_normal_b2a<T1, T2>(n1u, n2u, penA, penB, penTieTol, A0, A1, A2, B0, B1, B2);
+            witnessPoint = lineWitness;
+            return true;
+        }
+        tri_tri_set_separation_result<T1, T2>(A0, A1, A2, B0, B1, B2, n1u, normal, depth, witnessPoint);
+        return false;
+    }
+
+    const T2 depthVertex = min2(penA, penB);
+    const T2 depthInterval = min2(penAInterval, penBInterval);
+    const unsigned int hitCount = (h0 ? 1u : 0u) + (h1 ? 1u : 0u) + (h2 ? 1u : 0u) +
+                                  (h3 ? 1u : 0u) + (h4 ? 1u : 0u) + (h5 ? 1u : 0u);
+    const T2 nDotAbs = absT(dot(n1u, n2u));
+    bool asymIntervalRegime = false;
+    if (haveLineIntervals && lineOverlap < -lineTol) {
+        tri_tri_set_separation_result<T1, T2>(A0, A1, A2, B0, B1, B2, n1u, normal, depth, witnessPoint);
+        return false;
+    }
+    if (false && hitCount <= 1u && nDotAbs < (T2)0.7 && depthInterval > (T2)4 * lenTol) {
+        // Low-support, highly oblique hits are prone to false positive intersections where
+        // projected interval depth is large but true closest-triangle separation is finite.
+        tri_tri_set_separation_result<T1, T2>(A0, A1, A2, B0, B1, B2, n1u, normal, depth, witnessPoint);
+        const T2 sepDist = -depth;
+        const T2 sepTol = max2((T2)20 * lenTol, (T2)3e-5 * geomScale);
+        if (sepDist > sepTol && sepDist > (T2)0.2 * depthInterval) {
+            return false;
+        }
+    }
+
+    if (false && hitCount <= 2u && nDotAbs < (T2)0.25 && depthInterval > (T2)4 * lenTol) {
+        // For very oblique two-hit configurations, only keep contact if closest-distance is
+        // truly near-zero. This removes spurious edge-edge intersections without touching
+        // trihedral tip cases (which run at substantially larger nDotAbs).
+        tri_tri_set_separation_result<T1, T2>(A0, A1, A2, B0, B1, B2, n1u, normal, depth, witnessPoint);
+        const T2 sepDist = -depth;
+        const T2 sepTolOblique = max2((T2)20 * lenTol, (T2)2e-4 * geomScale);
+        if (sepDist > sepTolOblique) {
+            return false;
+        }
+    }
+    if (false && hitCount <= 2u && nDotAbs < (T2)0.7 && depthInterval > (T2)4 * lenTol) {
+        // Additional asymmetric-interval guard:
+        // if one side interval collapses relative to the other, keep the contact only when
+        // closest-triangle distance confirms near-touch.
+        const T2 intervalMin = min2(penAInterval, penBInterval);
+        const T2 intervalMax = max2(penAInterval, penBInterval);
+        if (intervalMax > (T2)4 * lenTol && intervalMin < (T2)0.35 * intervalMax) {
+            asymIntervalRegime = true;
+            tri_tri_set_separation_result<T1, T2>(A0, A1, A2, B0, B1, B2, n1u, normal, depth, witnessPoint);
+            const T2 sepDist = -depth;
+            const T2 sepTolAsym = max2((T2)20 * lenTol, (T2)2e-4 * geomScale);
+            if (sepDist > sepTolAsym && sepDist > (T2)0.15 * intervalMax) {
+                return false;
+            }
+        }
+    }
+    if (false && hitCount > 2u && hitCount <= 4u && nDotAbs < (T2)0.25 && depthInterval > (T2)4 * lenTol) {
+        // Core false-positive regime seen in ResponseAngleMesh:
+        // edge/face hit combinations can report robust interval depth while a direct closest-
+        // triangle query still indicates finite separation. Reject those inconsistent contacts.
+        tri_tri_set_separation_result<T1, T2>(A0, A1, A2, B0, B1, B2, n1u, normal, depth, witnessPoint);
+        const T2 sepDist = -depth;
+        const T2 sepTolOblique34 = max2((T2)20 * lenTol, (T2)1.5e-4 * geomScale);
+        if (sepDist > sepTolOblique34 && sepDist > (T2)0.55 * depthInterval) {
+            return false;
+        }
+    }
+    // Robust non-coplanar depth:
+    // Avoid interval->vertex discontinuities when one projected interval collapses to zero.
+    const T2 intervalTol = (T2)4 * lenTol;
+    const bool hasPenAInterval = penAInterval > intervalTol;
+    const bool hasPenBInterval = penBInterval > intervalTol;
+    T2 depthIntervalRobust = (T2)0;
+    if (hasPenAInterval && hasPenBInterval) {
+        depthIntervalRobust = min2(penAInterval, penBInterval);
+    } else if (hasPenAInterval) {
+        depthIntervalRobust = penAInterval;
+    } else if (hasPenBInterval) {
+        depthIntervalRobust = penBInterval;
+    }
+
+    // For non-coplanar overlap, the physically relevant thickness is the smallest one-sided
+    // support penetration of either triangle against the opposite plane. The projected
+    // interval depth can collapse when the line-of-intersection cross section becomes short,
+    // which introduces branch-dependent underestimation and frame-to-frame jumps. Keep the
+    // face-support depth as the contact depth; it stays continuous through grazing/seam cases.
+    (void)asymIntervalRegime;
+    (void)depthIntervalRobust;
+    (void)intervalTol;
+    depth = depthVertex;
+
+    normal = choose_contact_normal_b2a<T1, T2>(n1u, n2u, penA, penB, penTieTol, A0, A1, A2, B0, B1, B2);
+    witnessPoint = haveLineIntervals ? lineWitness : witness;
+    return true;
 }
 
 template <typename T1, typename T2>
@@ -1630,7 +2281,7 @@ __device__ __forceinline__ T1 make_vec3(T2 x, T2 y, T2 z) {
 template <typename T1, typename T2>
 __device__ __forceinline__ void build_plane_basis_from_normal(const T1& n, T1& u, T1& v) {
     const T1 a = (absT((T2)n.x) > (T2)0.70710678) ? make_vec3<T1,T2>((T2)0, (T2)1, (T2)0)
-                                                  : make_vec3<T1,T2>((T2)1, (T2)0, (T2)0);
+                                                : make_vec3<T1,T2>((T2)1, (T2)0, (T2)0);
     u = normalize(cross(a, n));
     v = cross(n, u);
 }
@@ -1670,9 +2321,9 @@ __device__ __forceinline__ T1 interp_plane_hit(const T1& S0, const T1& S1, T2 d0
 
 template <typename T1, typename T2>
 __device__ __forceinline__ int clip_triangle_by_plane_keep_negative(const T1& T0, const T1& T1v, const T1& T2v,
-                                                                    const T1& planeP, const T1& planeN,
-                                                                    T2 eps,
-                                                                    T1 outPoly[4]) {
+                                                                   const T1& planeP, const T1& planeN,
+                                                                   T2 eps,
+                                                                   T1 outPoly[4]) {
     T1 inPoly[4];
     inPoly[0] = T0; inPoly[1] = T1v; inPoly[2] = T2v;
     int inCount = 3;
@@ -1846,18 +2497,16 @@ __device__ __forceinline__ bool polygon_area_centroid_2d(const T2 px[8], const T
     cy = my * inv;
     return true;
 }
-
 // ------------------------------------------------------------------
 // Tri-Tri pair contact area and point alongside contact island normal
 // clipped submerged polygon against submerged polygon
 // ------------------------------------------------------------------
 template <typename T1, typename T2>
-__device__ __forceinline__ bool area_cp_along_normal(const T1& A0, const T1& A1, const T1& A2,
-                                                     const T1& B0, const T1& B1, const T1& B2,
-                                                     T1 nCommon,
-                                                     T2& projArea,
-                                                     T1& contactPoint) {
-    projArea = (T2)0;
+__device__ __forceinline__ T2 area_cp_along_normal(const T1& A0, const T1& A1, const T1& A2,
+                                                   const T1& B0, const T1& B1, const T1& B2,
+                                                   T1 nCommon,
+                                                   T1& contactPoint) {
+    T2 projArea = (T2)0;
     contactPoint = make_zero3<T1>();
 
     const T2 geomScale = local_length_scale6<T1,T2>(A0,A1,A2,B0,B1,B2);
@@ -1865,7 +2514,7 @@ __device__ __forceinline__ bool area_cp_along_normal(const T1& A0, const T1& A1,
     const T2 eps2d = planeEps;
 
     const T2 nLen2 = dot(nCommon, nCommon);
-    if (nLen2 <= (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT)) return false;
+    if (nLen2 <= (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT)) return (T2)0;
     nCommon = nCommon * ((T2)1 / sqrt(nLen2));
 
     const T1 nA = cross(A1 - A0, A2 - A0);
@@ -1874,13 +2523,13 @@ __device__ __forceinline__ bool area_cp_along_normal(const T1& A0, const T1& A1,
     const T2 nBLen2 = dot(nB, nB);
     if (nALen2 <= (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT) ||
         nBLen2 <= (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT)) {
-        return false;
+        return (T2)0;
     }
 
     T1 aPen3[4], bPen3[4];
     int nAPen = clip_triangle_by_plane_keep_negative<T1,T2>(A0, A1, A2, B0, nB, planeEps, aPen3);
     int nBPen = clip_triangle_by_plane_keep_negative<T1,T2>(B0, B1, B2, A0, nA, planeEps, bPen3);
-    if (nAPen < 3 || nBPen < 3) return false;
+    if (nAPen < 3 || nBPen < 3) return (T2)0;
 
     T1 u, v;
     build_plane_basis_from_normal<T1,T2>(nCommon, u, v);
@@ -1889,18 +2538,18 @@ __device__ __forceinline__ bool area_cp_along_normal(const T1& A0, const T1& A1,
     T2 aX[8], aY[8], bX[8], bY[8];
     nAPen = project_poly_3d_to_2d<T1,T2>(aPen3, nAPen, O, u, v, aX, aY, eps2d);
     nBPen = project_poly_3d_to_2d<T1,T2>(bPen3, nBPen, O, u, v, bX, bY, eps2d);
-    if (nAPen < 3 || nBPen < 3) return false;
+    if (nAPen < 3 || nBPen < 3) return (T2)0;
 
     T2 outX[8], outY[8];
     const int nPoly = clip_convex_poly_2d<T2>(bX, bY, nBPen, aX, aY, nAPen, outX, outY, eps2d);
-    if (nPoly < 3) return false;
+    if (nPoly < 3) return (T2)0;
 
     T2 cx, cy;
-    if (!polygon_area_centroid_2d<T2>(outX, outY, nPoly, projArea, cx, cy)) return false;
+    if (!polygon_area_centroid_2d<T2>(outX, outY, nPoly, projArea, cx, cy)) return (T2)0;
 
     const T2 denA = dot(nA, nCommon);
     const T2 denB = dot(nB, nCommon);
-    if (absT(denA) <= (T2)DEME_TINY_FLOAT || absT(denB) <= (T2)DEME_TINY_FLOAT) return false;
+    if (absT(denA) <= (T2)DEME_TINY_FLOAT || absT(denB) <= (T2)DEME_TINY_FLOAT) return (T2)0;
 
     const T2 cA = dot(nA, A0 - O);
     const T2 cB = dot(nB, B0 - O);
@@ -1911,253 +2560,110 @@ __device__ __forceinline__ bool area_cp_along_normal(const T1& A0, const T1& A1,
     const T2 wB = (cB - alphaB * cx - betaB * cy) / denB;
 
     contactPoint = O + u * cx + v * cy + nCommon * ((wA + wB) * (T2)0.5);
-    return true;
+    return projArea;
 }
 
-// ------------------------------------------------------------------
-// Moeller inspired tri-tri penetration test
-// ------------------------------------------------------------------
-template <typename T1, typename T2>
-__device__ __forceinline__ bool checkTriangleTriangleOverlap(
-    const T1& A0,
-    const T1& A1,
-    const T1& A2,
-    const T1& B0,
-    const T1& B1,
-    const T1& B2,
-    T2& depth) {
 
-    const T2 geomScale    = local_length_scale6<T1,T2>(A0,A1,A2,B0,B1,B2);
-    const T2 lenTol       = rel_len_tol<T2>() * geomScale;
-    const T2 aabbEps      = lenTol;
-    const T2 planeTol     = lenTol;
-    const T2 lineTol      = lenTol;
-    const T2 copOrientTol = lenTol * lenTol;
-    const T2 copCoordTol  = lenTol;
-    const T2 angTol       = rel_ang_tol<T2>();
+inline __device__ bool calcTriPlaneShellOverlap(const double3& A,
+                                                const double3& B,
+                                                const double3& C,
+                                                const double3& planePoint,
+                                                const float3& planeNormal,
+                                                const double shellHalf,
+                                                double3& contactPnt,
+                                                float3& contactNormal,
+                                                double& overlapDepth,
+                                                double& overlapArea) {
+    const double3* tri[] = {&A, &B, &C};
+    const double3 planeNormalD = to_real3<float3, double3>(planeNormal);
 
-    if (!aabb_overlap6<T1,T2>(A0,A1,A2,B0,B1,B2,aabbEps)) {
-        const T2 minAx = tmin3((T2)A0.x, (T2)A1.x, (T2)A2.x), maxAx = tmax3((T2)A0.x, (T2)A1.x, (T2)A2.x);
-        const T2 minAy = tmin3((T2)A0.y, (T2)A1.y, (T2)A2.y), maxAy = tmax3((T2)A0.y, (T2)A1.y, (T2)A2.y);
-        const T2 minAz = tmin3((T2)A0.z, (T2)A1.z, (T2)A2.z), maxAz = tmax3((T2)A0.z, (T2)A1.z, (T2)A2.z);
-        const T2 minBx = tmin3((T2)B0.x, (T2)B1.x, (T2)B2.x), maxBx = tmax3((T2)B0.x, (T2)B1.x, (T2)B2.x);
-        const T2 minBy = tmin3((T2)B0.y, (T2)B1.y, (T2)B2.y), maxBy = tmax3((T2)B0.y, (T2)B1.y, (T2)B2.y);
-        const T2 minBz = tmin3((T2)B0.z, (T2)B1.z, (T2)B2.z), maxBz = tmax3((T2)B0.z, (T2)B1.z, (T2)B2.z);
-        const T2 sepX = max2((T2)0, max2(minBx - maxAx, minAx - maxBx));
-        const T2 sepY = max2((T2)0, max2(minBy - maxAy, minAy - maxBy));
-        const T2 sepZ = max2((T2)0, max2(minBz - maxAz, minAz - maxBz));
-        depth = -max2(sepX, max2(sepY, sepZ));
-        return false;
+    double d[3];
+    double dmin = DEME_HUGE_FLOAT;
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        d[i] = planeSignedDistance<double>(*tri[i], planePoint, planeNormal) - shellHalf;
+        if (d[i] < dmin) {
+            dmin = d[i];
+        }
     }
 
-    const T1 E1 = A1 - A0;
-    const T1 E2 = A2 - A0;
-    const T1 F1 = B1 - B0;
-    const T1 F2 = B2 - B0;
-    const T1 N1 = cross(E1, E2);
-    const T1 N2 = cross(F1, F2);
+    double3 poly[4];
+    int nNode = 0;
+    bool hasIntersection = false;
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        const int j = (i + 1) % 3;
+        const bool in_i = (d[i] < 0.0);
+        const bool in_j = (d[j] < 0.0);
 
-    const T2 n1Len2 = dot(N1, N1);
-    const T2 n2Len2 = dot(N2, N2);
-    if (n1Len2 <= (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT) ||
-        n2Len2 <= (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT)) {
-        return false;
-    }
-    const T2 invN1 = (T2)1 / sqrt(n1Len2);
-    const T2 invN2 = (T2)1 / sqrt(n2Len2);
-
-    const T2 du0 = (T2)dot(N1, B0 - A0) * invN1;
-    const T2 du1 = (T2)dot(N1, B1 - A0) * invN1;
-    const T2 du2 = (T2)dot(N1, B2 - A0) * invN1;
-    const bool sideRejectN1 =
-        ((du0 > planeTol && du1 > planeTol && du2 > planeTol) ||
-         (du0 < -planeTol && du1 < -planeTol && du2 < -planeTol));
-
-    const T2 dv0 = (T2)dot(N2, A0 - B0) * invN2;
-    const T2 dv1 = (T2)dot(N2, A1 - B0) * invN2;
-    const T2 dv2 = (T2)dot(N2, A2 - B0) * invN2;
-    const bool sideRejectN2 =
-        ((dv0 > planeTol && dv1 > planeTol && dv2 > planeTol) ||
-         (dv0 < -planeTol && dv1 < -planeTol && dv2 < -planeTol));
-
-    if (sideRejectN1 || sideRejectN2) {
-        T2 sep = (T2)0;
-        if (sideRejectN1) {
-            if (du0 > planeTol && du1 > planeTol && du2 > planeTol) {
-                sep = max2(sep, tmin3(du0, du1, du2));
-            } else if (du0 < -planeTol && du1 < -planeTol && du2 < -planeTol) {
-                sep = max2(sep, tmin3(-du0, -du1, -du2));
+        if (in_i ^ in_j) {
+            const double denom = d[i] - d[j];
+            if (fabs(denom) > 1e-30) {
+                const double t = d[i] / denom;
+                const double3 inter = *tri[i] + (*tri[j] - *tri[i]) * t;
+                if (in_i) {
+                    const double3 projectedNode = *tri[i] - d[i] * planeNormalD;
+                    poly[nNode++] = projectedNode;
+                }
+                poly[nNode++] = inter;
+                hasIntersection = true;
             }
         }
-        if (sideRejectN2) {
-            if (dv0 > planeTol && dv1 > planeTol && dv2 > planeTol) {
-                sep = max2(sep, tmin3(dv0, dv1, dv2));
-            } else if (dv0 < -planeTol && dv1 < -planeTol && dv2 < -planeTol) {
-                sep = max2(sep, tmin3(-dv0, -dv1, -dv2));
+    }
+
+    if (!hasIntersection) {
+        bool allBelow = true;
+#pragma unroll
+        for (int i = 0; i < 3; ++i) {
+            if (d[i] >= 0.0) {
+                allBelow = false;
+                break;
             }
         }
-        depth = -sep;
-        return false;
-    }
-
-    const T2 penA = max2((T2)0, max2(-du0, max2(-du1, -du2)));
-    const T2 penB = max2((T2)0, max2(-dv0, max2(-dv1, -dv2)));
-    const T1 n1u = N1 * invN1;
-    const T1 n2u = N2 * invN2;
-
-    const T1 D = cross(n1u, n2u);
-    if (dot(D, D) <= (T2)(angTol * angTol)) {
-        const bool hit = coplanar_tri_tri<T1,T2>(N1, A0,A1,A2, B0,B1,B2, copOrientTol, copCoordTol);
-        if (hit) {
-            depth = min2(penA, penB);
-            if (depth > lineTol) {
-                return true;
+        if (allBelow) {
+#pragma unroll
+            for (int i = 0; i < 3; ++i) {
+                const double3 projectedNode = *tri[i] - d[i] * planeNormalD;
+                poly[nNode++] = projectedNode;
             }
-        }
-        if (depth > (T2)0) {
-            depth = -depth;
-        }
-        return false;
-    }
-
-    const int axis = dominant_axis<T1,T2>(D);
-    const T2 ap0 = coord_axis<T1,T2>(A0, axis);
-    const T2 ap1 = coord_axis<T1,T2>(A1, axis);
-    const T2 ap2 = coord_axis<T1,T2>(A2, axis);
-    const T2 bp0 = coord_axis<T1,T2>(B0, axis);
-    const T2 bp1 = coord_axis<T1,T2>(B1, axis);
-    const T2 bp2 = coord_axis<T1,T2>(B2, axis);
-
-    T2 ia[6], ib[6];
-    const int na = interval_from_plane_hits<T2>(ap0, ap1, ap2, dv0, dv1, dv2, ia, lineTol);
-    const int nb = interval_from_plane_hits<T2>(bp0, bp1, bp2, du0, du1, du2, ib, lineTol);
-
-    if (na == 0 || nb == 0) {
-        const bool hit = coplanar_tri_tri<T1,T2>(N1, A0,A1,A2, B0,B1,B2, copOrientTol, copCoordTol);
-        if (hit) {
-            depth = min2(penA, penB);
-            if (depth > lineTol) {
-                return true;
-            }
-        }
-        if (depth > (T2)0) {
-            depth = -depth;
-        }
-        return false;
-    }
-
-    T2 a0 = ia[0], a1 = ia[0];
-    for (int i = 1; i < na; ++i) {
-        a0 = min2(a0, ia[i]);
-        a1 = max2(a1, ia[i]);
-    }
-    T2 b0 = ib[0], b1 = ib[0];
-    for (int i = 1; i < nb; ++i) {
-        b0 = min2(b0, ib[i]);
-        b1 = max2(b1, ib[i]);
-    }
-    sort2(a0, a1);
-    sort2(b0, b1);
-    if (a1 < b0 - lineTol || b1 < a0 - lineTol) {
-        const T2 sep = max2(b0 - a1, a0 - b1);
-        depth = -sep;
-        return false;
-    }
-    depth = min2(penA, penB);
-    if (depth > lineTol) {
-        return true;
-    }
-    if (depth > (T2)0) {
-        depth = -depth;
-    }
-    return false;
-}
-
-/// Triangle-triangle contact detection with split pipeline:
-/// 1. overlap + depth via replacement checkTriangleTriangleOverlap(..., depth)
-/// 2. normal selection/orientation (B->A)
-/// 3. separate area/contact-point reconstruction via area_cp_along_normal
-template <typename T1, typename T2>
-__device__ bool checkTriangleTriangleOverlap(
-    const T1& A1,
-    const T1& B1,
-    const T1& C1,
-    const T1& A2,
-    const T1& B2,
-    const T1& C2,
-    T1& normal,
-    T2& depth,
-    T2& projectedArea,
-    T1& point) {
-
-
-
-    projectedArea = (T2)0;
-    point = make_zero3<T1>();
-    normal = make_zero3<T1>();
-    depth = (T2)0;
-
-    const bool hit = checkTriangleTriangleOverlap<T1, T2>(A1, B1, C1, A2, B2, C2, depth);
-
-    if (!hit) {
-        const T1 centA = (A1 + B1 + C1) / (T2)3;
-        const T1 centB = (A2 + B2 + C2) / (T2)3;
-        const T1 sep = centA - centB;
-        const T2 sepLen2 = dot(sep, sep);
-
-        if (sepLen2 > (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT)) {
-            const T2 sepLen = sqrt(sepLen2);
-            normal = sep / sepLen;
-            point = (centA + centB) * (T2)0.5;
-            if (!(depth < (T2)0))
-                depth = -sepLen;
-        } else {
-            const T1 nAraw = cross(B1 - A1, C1 - A1);
-            const T2 nArawLen2 = dot(nAraw, nAraw);
-            if (nArawLen2 > (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT)) {
-                normal = nAraw * ((T2)1 / sqrt(nArawLen2));
-            }
-            point = centA;
-            if (!(depth < (T2)0))
-                depth = -(T2)DEME_TINY_FLOAT;
-        }
-        projectedArea = (T2)0;
-        return false;
-    }
-
-    const T1 nAraw = cross(B1 - A1, C1 - A1);
-    const T1 nBraw = cross(B2 - A2, C2 - A2);
-    const T2 nALen2 = dot(nAraw, nAraw);
-    const T2 nBLen2 = dot(nBraw, nBraw);
-    if (nALen2 <= (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT) ||
-        nBLen2 <= (T2)(DEME_TINY_FLOAT * DEME_TINY_FLOAT)) {
-        return false;
-    }
-
-    const T1 nA = nAraw * ((T2)1 / sqrt(nALen2));
-    const T1 nB = nBraw * ((T2)1 / sqrt(nBLen2));
-    const T2 penA = max2((T2)0, max2(-(T2)dot(nA, A2 - A1), max2(-(T2)dot(nA, B2 - A1), -(T2)dot(nA, C2 - A1))));
-    const T2 penB = max2((T2)0, max2(-(T2)dot(nB, A1 - A2), max2(-(T2)dot(nB, B1 - A2), -(T2)dot(nB, C1 - A2))));
-
-    normal = (penA <= penB) ? ((T2)-1 * nA) : nB;
-
-    depth = min2(penA, penB);
-
-    const bool area_ok = area_cp_along_normal<T1, T2>(A1, B1, C1, A2, B2, C2, normal, projectedArea, point);
-    if (!area_ok) {
-        projectedArea = (T2)0;
-        T1 closestA, closestB;
-        const T2 sep_dist = closestPtTriTriDistance<T1, T2>(A1, B1, C1, A2, B2, C2, closestA, closestB);
-        if (sep_dist >= (T2)0 && sep_dist < (T2)DEME_HUGE_FLOAT) {
-            point = (closestA + closestB) * (T2)0.5;
-        } else {
-            const T1 centA = (A1 + B1 + C1) / (T2)3;
-            const T1 centB = (A2 + B2 + C2) / (T2)3;
-            point = (centA + centB) * (T2)0.5;
+            hasIntersection = true;
         }
     }
 
-    return true;
+    double3 centroid = make_double3(0.0, 0.0, 0.0);
+    if (hasIntersection) {
+        for (int i = 0; i < nNode; ++i) {
+            centroid = centroid + poly[i];
+        }
+        centroid = centroid / static_cast<double>(nNode);
+    } else {
+#pragma unroll
+        for (int i = 0; i < 3; ++i) {
+            centroid = centroid + *tri[i];
+        }
+        centroid = centroid / 3.0;
+    }
+
+    overlapDepth = -dmin;
+    const bool inContact = (overlapDepth >= 0.0);
+    const double3 projection = centroid - planeSignedDistance<double>(centroid, planePoint, planeNormal) * planeNormalD;
+
+    float overlap_area_f = 0.0f;
+    if (hasIntersection && nNode >= 3) {
+        const float3 centroid_f = to_float3(centroid);
+        for (int i = 0; i < nNode; ++i) {
+            const float3 v1 = to_float3(poly[i]) - centroid_f;
+            const float3 v2 = to_float3(poly[(i + 1) % nNode]) - centroid_f;
+            const float3 crossProd = cross(v1, v2);
+            overlap_area_f += sqrtf(dot(crossProd, crossProd));
+        }
+        overlap_area_f *= 0.5f;
+    }
+    overlapArea = static_cast<double>(overlap_area_f);
+
+    contactPnt = projection - (overlapDepth * 0.5) * planeNormalD;
+    contactNormal = planeNormal;
+    return inContact;
 }
 
 #endif

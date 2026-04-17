@@ -744,7 +744,7 @@ __device__ __forceinline__ void calculatePrimitiveContactForces_impl(deme::DEMSi
             // of a thin mesh.
             bool in_contact =
                 checkTriSphereOverlap<double3, double>(triBNode1, triBNode2, triBNode3, bodyAPos, shellInflatedRadius,
-                                                       contact_normal, overlapDepth, overlapArea, contactPnt);
+                                                                    contact_normal, overlapDepth, overlapArea, contactPnt);
             B2A = to_float3(contact_normal);
 
             // If the solver says in contact, we do not question it
@@ -758,9 +758,9 @@ __device__ __forceinline__ void calculatePrimitiveContactForces_impl(deme::DEMSi
         } else if constexpr (AType == deme::GEO_T_TRIANGLE) {
             // Triangle--triangle contact, a bit more complex...
             double3 contact_normal;
-            bool in_contact = checkTriangleTriangleOverlap<double3, double>(triANode1, triANode2, triANode3, triBNode1,
-                                                                            triBNode2, triBNode3, contact_normal,
-                                                                            overlapDepth, overlapArea, contactPnt);
+            bool in_contact = checkTriangleTriangleOverlap<double3, double>(triANode1, triANode2, triANode3,
+                                                                            triBNode1, triBNode2, triBNode3,
+                                                                            contact_normal, overlapDepth, contactPnt);
             bool shell_contact_candidate = false;
             B2A = to_float3(contact_normal);
             if (in_contact) {
@@ -770,7 +770,7 @@ __device__ __forceinline__ void calculatePrimitiveContactForces_impl(deme::DEMSi
                 // use closest feature distance and a shell-thickness skin model to obtain a stable normal/depth.
                 double3 closestA, closestB;
                 const double sep_dist = closestPtTriTriDistance<double3, double>(triANode1, triANode2, triANode3, triBNode1,
-                                                                                  triBNode2, triBNode3, closestA, closestB);
+                                                                    triBNode2, triBNode3, closestA, closestB);
                 if (isfinite(sep_dist)) {
                     const double3 sep_vec = closestA - closestB;
                     const double sep2 = dot(sep_vec, sep_vec);
@@ -778,7 +778,7 @@ __device__ __forceinline__ void calculatePrimitiveContactForces_impl(deme::DEMSi
                         B2A = to_float3(sep_vec / sqrt(sep2));
                     }
                     overlapDepth = shellDepthAdd - sep_dist;
-                    contactPnt = (closestA + closestB) * 0.5;
+                                        contactPnt = (closestA + closestB) * 0.5;
                     if (overlapDepth > 0.0) {
                         shell_contact_candidate = true;
                         // Non-zero area regularization for shell-edge/vertex contacts (important for Hertzian variants).
@@ -792,19 +792,14 @@ __device__ __forceinline__ void calculatePrimitiveContactForces_impl(deme::DEMSi
                 }
             }
 
-            // Remove opposite-side false pairings without using center-direction heuristics.
-            if ((in_contact || shell_contact_candidate) &&
-                rejectTriTriSameSidedPair(triANode1, triANode2, triANode3, triBNode1, triBNode2, triBNode3, B2A)) {
-                in_contact = false;
-                shell_contact_candidate = false;
-                overlapDepth = -DEME_HUGE_FLOAT;
-                overlapArea = 0.0;
-            }
+            bool same_sided_rejected = false;
+            // checkTriangleTriangleOverlap() already performs an internal same-sided rejection with
+            // pair-local geometric tolerances. Avoid a second independent cull here, which can drop
+            // valid dynamic contacts and introduce force discontinuities.
+
 
             // Fix ContactType if needed
-            // If the solver says in contact, we do not question it
-            if (!in_contact) {
-                // Then, if we have extra margin, we check that if the distance is within the extra margin
+            if (!(in_contact || shell_contact_candidate)) {
                 if (overlapDepth <= -extraMarginSize) {
                     ContactType = deme::NOT_A_CONTACT;
                 }
@@ -815,9 +810,6 @@ __device__ __forceinline__ void calculatePrimitiveContactForces_impl(deme::DEMSi
         deme::objID_t analyticalID = granData->idPrimitiveB[myPrimitiveContactID];
         deme::bodyID_t myOwner = objOwner[analyticalID];
         ownerB = myOwner;
-        // For analytical entity, its patch ID is just its own component ID (but myPatchID is hardly used in this
-        // analytical case)
-        deme::bodyID_t myPatchID = analyticalID;
         // If B is analytical entity, its owner, relative location, material info is jitified.
         bodyBMatType = objMaterial[analyticalID];
         BOwnerMass = objMass[analyticalID];
@@ -1005,11 +997,40 @@ __device__ __forceinline__ void calculatePrimitiveContactForces_impl(deme::DEMSi
                 ContactType = deme::NOT_A_CONTACT;
             }
         } else if constexpr (AType == deme::GEO_T_TRIANGLE) {
-            calcTriEntityOverlap<double3, double>(triANode1, triANode2, triANode3, objType[analyticalID], bodyBPos,
-                                                  bodyBRot, objSize1[analyticalID], objSize2[analyticalID],
-                                                  objSize3[analyticalID], objNormal[analyticalID], contactPnt, B2A,
-                                                  overlapDepth, overlapArea);
-            overlapDepth += static_cast<double>(ownerShellHalfThickness(simParams, granData, ownerA));
+            const double shellHalfA = static_cast<double>(ownerShellHalfThickness(simParams, granData, ownerA));
+            bool usedShellAwareTriAnal = false;
+
+            if (shellHalfA > DEME_TINY_FLOAT) {
+                switch (objType[analyticalID]) {
+                    case deme::ANAL_OBJ_TYPE_PLANE:
+                        usedShellAwareTriAnal = true;
+                        calcTriPlaneShellOverlap(triANode1, triANode2, triANode3, bodyBPos, bodyBRot, shellHalfA,
+                                                 contactPnt, B2A, overlapDepth, overlapArea);
+                        break;
+                    case deme::ANAL_OBJ_TYPE_PLANAR_CYL: {
+                        const double3 triCentroid = triangleCentroid<double3>(triANode1, triANode2, triANode3);
+                        double3 plane_point;
+                        float3 plane_normal;
+                        if (planar_cyl_plane_from_ref(triCentroid, bodyBPos, bodyBRot, objSize1[analyticalID],
+                                                      objNormal[analyticalID], plane_point, plane_normal)) {
+                            usedShellAwareTriAnal = true;
+                            calcTriPlaneShellOverlap(triANode1, triANode2, triANode3, plane_point, plane_normal,
+                                                     shellHalfA, contactPnt, B2A, overlapDepth, overlapArea);
+                        }
+                        break;
+                    }
+                    default:
+                        break;
+                }
+            }
+
+            if (!usedShellAwareTriAnal) {
+                calcTriEntityOverlap<double3, double>(triANode1, triANode2, triANode3, objType[analyticalID], bodyBPos,
+                                                      bodyBRot, objSize1[analyticalID], objSize2[analyticalID],
+                                                      objSize3[analyticalID], objNormal[analyticalID], contactPnt, B2A,
+                                                      overlapDepth, overlapArea);
+                overlapDepth += shellHalfA;
+            }
             // Fix ContactType if needed
             if (overlapDepth <= -extraMarginSize) {
                 ContactType = deme::NOT_A_CONTACT;
@@ -1258,8 +1279,12 @@ __device__ __forceinline__ void calculatePrimitiveContactForces_impl(deme::DEMSi
         // Store contact area (double) in contactPointGeometryB (float3)
         // If this is not a contact, we store 0.0 in the area, so it has no voting power in the next kernels. Note the
         // NOT_A_CONTACT control flow here and in the next few kernels is integrated in areas.
-        granData->contactPointGeometryB[myPrimitiveContactID] =
-            doubleToFloat3Storage((ContactType == deme::NOT_A_CONTACT || overlapArea <= 0.0) ? 0.0 : overlapArea);
+        if (ContactType == deme::TRIANGLE_TRIANGLE_CONTACT) {
+            granData->contactPointGeometryB[myPrimitiveContactID] = doubleToFloat3Storage(0.0);
+        } else {
+            granData->contactPointGeometryB[myPrimitiveContactID] =
+                doubleToFloat3Storage((ContactType == deme::NOT_A_CONTACT || overlapArea <= 0.0) ? 0.0 : overlapArea);
+        }
         // Store contact point (cast from double3 to float3). Could make the following check, but hopefully it's not
         // necessary. if (!isfinite(contactPnt.x) || !isfinite(contactPnt.y) || !isfinite(contactPnt.z)) {
         //     DEME_ABORT_KERNEL(

@@ -3500,6 +3500,7 @@ inline void DEMDynamicThread::migrateEnduringContacts() {
 
     // Rearrange contact histories based on kT instruction
     rearrangeContactWildcards(&granData, newWildcards[0], contactSentry, simParams->nContactWildcards,
+                              *solverScratchSpace.numPrevContacts,
                               *solverScratchSpace.numContacts, streamInfo.stream);
 
     // Take a look, does the sentry indicate that there is an `alive' contact got lost?
@@ -3648,113 +3649,153 @@ inline void DEMDynamicThread::dispatchPatchBasedForceCorrections(
                 solverScratchSpace.allocateDualStruct("numUniqueKeys");
                 size_t* numUniqueKeys = solverScratchSpace.getDualStructDevice("numUniqueKeys");
 
-                // Step 1: Prepare weighted normals for voting.
-                // Note: the validated legacy semantics uses area weighting.
-                float3* weightedNormals =
-                    (float3*)solverScratchSpace.allocateTempVector("weightedNormals", countPrimitive * sizeof(float3));
-                prepareWeightedNormalsForVoting(&granData, weightedNormals, startOffsetPrimitive, countPrimitive,
-                                                streamInfo.stream);
+                float3* triTriPatchVotedNormals = nullptr;
+                PatchContactAccum* primitivePatchAccumulators = nullptr;
+                PatchContactAccum* patchContactAccumulators = nullptr;
+                TriTriLiteAccum* primitiveTriTriLiteAccumulators = nullptr;
+                TriTriLiteAccum* patchTriTriLiteAccumulators = nullptr;
 
-                // Step 2: Reduce-by-key for weighted normals (sum)
-                // The number of patch pairs (unique keys) is expected to be countPatch.
-                // Using countPatch here saves scratch memory without changing semantics.
-                float3* votedWeightedNormals = (float3*)solverScratchSpace.allocateTempVector(
-                    "votedWeightedNormals", countPatch * sizeof(float3));
-                cubSumReduceByKey<contactPairs_t, float3>(keys, uniqueKeys, weightedNormals, votedWeightedNormals,
-                                                          numUniqueKeys, countPrimitive, streamInfo.stream,
-                                                          solverScratchSpace);
-                solverScratchSpace.finishUsingTempVector("weightedNormals");
+                if (contact_type == TRIANGLE_TRIANGLE_CONTACT && countPatch > 0) {
+                    triTriPatchVotedNormals = (float3*)solverScratchSpace.allocateTempVector(
+                        "triTriPatchVotedNormals", countPatch * sizeof(float3));
 
-                // Optional debug-only safety check (removed from release path for full GPU orientation).
-                DEME_DEBUG_EXEC({
-                    solverScratchSpace.syncDualStructDeviceToHost("numUniqueKeys");
-                    size_t numUniqueKeysHost = *(solverScratchSpace.getDualStructHost("numUniqueKeys"));
-                    if (numUniqueKeysHost != countPatch) {
-                        DEME_ERROR(
-                            "Patch-based contact voting produced %zu unique patch pairs, but expected %zu pairs for "
-                            "contact type %d!",
-                            numUniqueKeysHost, countPatch, contact_type);
-                    }
-                });
+                    // Stage 0: fit a common contact plane to the raw primitive witness points produced in pass 1.
+                    // Pass 1 stays fast (Moller-style overlap + depth + normal), but each surviving tri-tri primitive
+                    // now also contributes one cheap witness point on its local contact plane. Those points are reduced
+                    // patch-wise here and used to compute a stable patch normal.
+                    TriTriPlaneFitAccum* primitiveTriTriPlaneFitAccumulators =
+                        (TriTriPlaneFitAccum*)solverScratchSpace.allocateTempVector(
+                            "primitiveTriTriPlaneFitAccumulators", countPrimitive * sizeof(TriTriPlaneFitAccum));
+                    prepareTriTriPlaneFitAccumulators(&granData, primitiveTriTriPlaneFitAccumulators,
+                                                      startOffsetPrimitive, countPrimitive, streamInfo.stream);
+                    TriTriPlaneFitAccum* patchTriTriPlaneFitAccumulators =
+                        (TriTriPlaneFitAccum*)solverScratchSpace.allocateTempVector(
+                            "patchTriTriPlaneFitAccumulators", countPatch * sizeof(TriTriPlaneFitAccum));
+                    cubSumReduceByKey<contactPairs_t, TriTriPlaneFitAccum>(
+                        keys, uniqueKeys, primitiveTriTriPlaneFitAccumulators, patchTriTriPlaneFitAccumulators,
+                        numUniqueKeys, countPrimitive, streamInfo.stream, solverScratchSpace);
+                    finalizeTriTriPatchNormalsFromPlaneFit(patchTriTriPlaneFitAccumulators,
+                                                           triTriPatchVotedNormals,
+                                                           countPatch,
+                                                           streamInfo.stream);
+                    solverScratchSpace.finishUsingTempVector("primitiveTriTriPlaneFitAccumulators");
+                    solverScratchSpace.finishUsingTempVector("patchTriTriPlaneFitAccumulators");
 
-                // Step 3: Normalize voted normals.
-                float3* votedNormals =
-                    (float3*)solverScratchSpace.allocateTempVector("votedNormals", countPatch * sizeof(float3));
-                normalizeAndScatterVotedNormals(votedWeightedNormals, votedNormals, countPatch, streamInfo.stream);
-                solverScratchSpace.finishUsingTempVector("votedWeightedNormals");
-
-                // Step 4: Compute per-primitive patch accumulators (projected area, max projected penetration,
-                // and weighted contact-point sums) in one pass.
-                PatchContactAccum* primitivePatchAccumulators = (PatchContactAccum*)solverScratchSpace.allocateTempVector(
-                    "primitivePatchAccumulators", countPrimitive * sizeof(PatchContactAccum));
-                computePatchContactAccumulators(&granData, votedNormals, keys, primitivePatchAccumulators,
-                                                startOffsetPrimitive, startOffsetPatch, countPrimitive,
-                                                streamInfo.stream);
-
-                // Step 5: Reduce-by-key accumulators to patch level (sum + max).
-                PatchContactAccum* patchContactAccumulators = (PatchContactAccum*)solverScratchSpace.allocateTempVector(
-                    "patchContactAccumulators", countPatch * sizeof(PatchContactAccum));
-                cubSumReduceByKey<contactPairs_t, PatchContactAccum>(
-                    keys, uniqueKeys, primitivePatchAccumulators, patchContactAccumulators, numUniqueKeys, countPrimitive,
-                    streamInfo.stream, solverScratchSpace);
-
-                // Step 6: Handle zero-area patches (all primitive areas are 0)
-                // For these patches, we need to find the max penetration primitive and use its normal/penetration
-
-                // 6a: Extract primitive penetrations for max-reduce
-                double* primitivePenetrations = (double*)solverScratchSpace.allocateTempVector(
-                    "primitivePenetrations", countPrimitive * sizeof(double));
-                extractPrimitivePenetrations(&granData, primitivePenetrations, startOffsetPrimitive, countPrimitive,
-                                             streamInfo.stream);
-
-                // 6b: Max-negative-reduce-by-key to get max negative penetration per patch
-                // This finds the largest negative value (smallest absolute value among negatives)
-                // Positive values are treated as very negative to indicate invalid/non-physical state
-                double* maxPenetrations =
-                    (double*)solverScratchSpace.allocateTempVector("maxPenetrations", countPatch * sizeof(double));
-                cubMaxNegativeReduceByKey<contactPairs_t, double>(keys, uniqueKeys, primitivePenetrations,
-                                                                  maxPenetrations, numUniqueKeys, countPrimitive,
-                                                                  streamInfo.stream, solverScratchSpace);
-                solverScratchSpace.finishUsingTempVector("primitivePenetrations");
-
-                // 6c: Find max-penetration primitives for zero-area patches and extract their normals, penetrations,
-                // and contact points
-                float3* zeroAreaNormals =
-                    (float3*)solverScratchSpace.allocateTempVector("zeroAreaNormals", countPatch * sizeof(float3));
-                double* zeroAreaPenetrations =
-                    (double*)solverScratchSpace.allocateTempVector("zeroAreaPenetrations", countPatch * sizeof(double));
-                double3* zeroAreaContactPoints = (double3*)solverScratchSpace.allocateTempVector(
-                    "zeroAreaContactPoints", countPatch * sizeof(double3));
-                findMaxPenetrationPrimitiveForZeroAreaPatches(
-                    &granData, maxPenetrations, zeroAreaNormals, zeroAreaPenetrations, zeroAreaContactPoints, keys,
-                    startOffsetPrimitive, startOffsetPatch, countPrimitive, streamInfo.stream);
-                solverScratchSpace.finishUsingTempVector("maxPenetrations");
-
-                // Step 7: Finalize patch results by combining voting with zero-area handling.
-                // If patch-based projected area is 0 (or this patch pair consists of no SAT pair), meaning no physical
-                // contact, we use the fallback estimations (zeroArea*) of CP, penetration and areas.
+                    // Stage 1: reconstruct primitive tri-tri area / CP in the common patch frame and
+                    // directly emit the compact per-primitive accumulator used by the single ReduceByKey.
+                    primitiveTriTriLiteAccumulators = (TriTriLiteAccum*)solverScratchSpace.allocateTempVector(
+                        "primitiveTriTriLiteAccumulators", countPrimitive * sizeof(TriTriLiteAccum));
+                    recomputeTriTriAreaAndPrepareLiteAccumulators(&simParams, &granData, keys,
+                                                                  triTriPatchVotedNormals,
+                                                                  primitiveTriTriLiteAccumulators,
+                                                                  startOffsetPrimitive,
+                                                                  startOffsetPatch, countPatch, countPrimitive,
+                                                                  streamInfo.stream);
+                }
                 double* finalAreas =
                     (double*)solverScratchSpace.allocateTempVector("finalAreas", countPatch * sizeof(double));
                 float3* finalNormals =
                     (float3*)solverScratchSpace.allocateTempVector("finalNormals", countPatch * sizeof(float3));
-                // Resize permanent finalPenetrations array for this patch contact batch.
-                // Note: I made it a permanent array in case that in the future, we want to transfer this entire array
-                // to kT for better margin derivation.
                 DEME_DEVICE_ARRAY_RESIZE(finalPenetrations, countPatch);
-
                 double3* finalContactPoints =
                     (double3*)solverScratchSpace.allocateTempVector("finalContactPoints", countPatch * sizeof(double3));
-                finalizePatchResultsFromAccumulators(patchContactAccumulators, votedNormals, zeroAreaNormals,
-                                                     zeroAreaPenetrations, zeroAreaContactPoints,
-                                                     finalAreas, finalNormals, finalPenetrations.data(),
-                                                     finalContactPoints, countPatch, streamInfo.stream);
+
+                if (contact_type == TRIANGLE_TRIANGLE_CONTACT && countPatch > 0) {
+                    // Stage 2: one single ReduceByKey for all positive-area tri-tri patch outputs.
+                    patchTriTriLiteAccumulators = (TriTriLiteAccum*)solverScratchSpace.allocateTempVector(
+                        "patchTriTriLiteAccumulators", countPatch * sizeof(TriTriLiteAccum));
+                    cubSumReduceByKey<contactPairs_t, TriTriLiteAccum>(
+                        keys, uniqueKeys, primitiveTriTriLiteAccumulators, patchTriTriLiteAccumulators,
+                        numUniqueKeys, countPrimitive, streamInfo.stream, solverScratchSpace);
+
+                    DEME_DEBUG_EXEC({
+                        solverScratchSpace.syncDualStructDeviceToHost("numUniqueKeys");
+                        size_t numUniqueKeysHost = *(solverScratchSpace.getDualStructHost("numUniqueKeys"));
+                        if (numUniqueKeysHost != countPatch) {
+                            DEME_ERROR(
+                                "Patch-based grouping produced %zu unique patch pairs, but expected %zu pairs for "
+                                "contact type %d!",
+                                numUniqueKeysHost, countPatch, contact_type);
+                        }
+                    });
+
+                    // Zero-area fallback: keep the original code path (max-negative primitive selection).
+                    double* primitivePenetrations = (double*)solverScratchSpace.allocateTempVector(
+                        "primitivePenetrations", countPrimitive * sizeof(double));
+                    extractPrimitivePenetrations(&granData, primitivePenetrations, startOffsetPrimitive, countPrimitive,
+                                                 streamInfo.stream);
+                    double* maxPenetrations =
+                        (double*)solverScratchSpace.allocateTempVector("maxPenetrations", countPatch * sizeof(double));
+                    cubMaxNegativeReduceByKey<contactPairs_t, double>(keys, uniqueKeys, primitivePenetrations,
+                                                                      maxPenetrations, numUniqueKeys, countPrimitive,
+                                                                      streamInfo.stream, solverScratchSpace);
+                    solverScratchSpace.finishUsingTempVector("primitivePenetrations");
+
+                    float3* zeroAreaNormals =
+                        (float3*)solverScratchSpace.allocateTempVector("zeroAreaNormals", countPatch * sizeof(float3));
+                    double* zeroAreaPenetrations =
+                        (double*)solverScratchSpace.allocateTempVector("zeroAreaPenetrations", countPatch * sizeof(double));
+                    double3* zeroAreaContactPoints = (double3*)solverScratchSpace.allocateTempVector(
+                        "zeroAreaContactPoints", countPatch * sizeof(double3));
+                    findMaxPenetrationPrimitiveForZeroAreaPatches(
+                        &granData, maxPenetrations, zeroAreaNormals, zeroAreaPenetrations, zeroAreaContactPoints, keys,
+                        startOffsetPrimitive, startOffsetPatch, countPatch, countPrimitive, streamInfo.stream);
+                    solverScratchSpace.finishUsingTempVector("maxPenetrations");
+
+                    finalizeTriTriLitePatchResults(patchTriTriLiteAccumulators, triTriPatchVotedNormals,
+                                                   zeroAreaNormals, zeroAreaPenetrations, zeroAreaContactPoints,
+                                                   finalAreas, finalNormals, finalPenetrations.data(),
+                                                   finalContactPoints, countPatch, streamInfo.stream);
+
+                    solverScratchSpace.finishUsingTempVector("zeroAreaNormals");
+                    solverScratchSpace.finishUsingTempVector("zeroAreaPenetrations");
+                    solverScratchSpace.finishUsingTempVector("zeroAreaContactPoints");
+                } else {
+                    // Legacy fused patch-accumulator path for non-tri-tri patch contacts.
+                    primitivePatchAccumulators = (PatchContactAccum*)solverScratchSpace.allocateTempVector(
+                        "primitivePatchAccumulators", countPrimitive * sizeof(PatchContactAccum));
+                    computePatchContactAccumulators(&granData, keys, primitivePatchAccumulators,
+                                                    startOffsetPrimitive, countPrimitive, streamInfo.stream);
+                    patchContactAccumulators = (PatchContactAccum*)solverScratchSpace.allocateTempVector(
+                        "patchContactAccumulators", countPatch * sizeof(PatchContactAccum));
+                    cubSumReduceByKey<contactPairs_t, PatchContactAccum>(
+                        keys, uniqueKeys, primitivePatchAccumulators, patchContactAccumulators, numUniqueKeys,
+                        countPrimitive, streamInfo.stream, solverScratchSpace);
+
+
+                    // Handle zero-area patches (all primitive areas are 0)
+                    double* primitivePenetrations = (double*)solverScratchSpace.allocateTempVector(
+                        "primitivePenetrations", countPrimitive * sizeof(double));
+                    extractPrimitivePenetrations(&granData, primitivePenetrations, startOffsetPrimitive, countPrimitive,
+                                                 streamInfo.stream);
+                    double* maxPenetrations =
+                        (double*)solverScratchSpace.allocateTempVector("maxPenetrations", countPatch * sizeof(double));
+                    cubMaxNegativeReduceByKey<contactPairs_t, double>(keys, uniqueKeys, primitivePenetrations,
+                                                                      maxPenetrations, numUniqueKeys, countPrimitive,
+                                                                      streamInfo.stream, solverScratchSpace);
+                    solverScratchSpace.finishUsingTempVector("primitivePenetrations");
+
+                    float3* zeroAreaNormals =
+                        (float3*)solverScratchSpace.allocateTempVector("zeroAreaNormals", countPatch * sizeof(float3));
+                    double* zeroAreaPenetrations =
+                        (double*)solverScratchSpace.allocateTempVector("zeroAreaPenetrations", countPatch * sizeof(double));
+                    double3* zeroAreaContactPoints = (double3*)solverScratchSpace.allocateTempVector(
+                        "zeroAreaContactPoints", countPatch * sizeof(double3));
+                    findMaxPenetrationPrimitiveForZeroAreaPatches(
+                        &granData, maxPenetrations, zeroAreaNormals, zeroAreaPenetrations, zeroAreaContactPoints, keys,
+                        startOffsetPrimitive, startOffsetPatch, countPatch, countPrimitive, streamInfo.stream);
+                    solverScratchSpace.finishUsingTempVector("maxPenetrations");
+
+                    finalizePatchResultsFromAccumulators(patchContactAccumulators, nullptr, zeroAreaNormals,
+                                                         zeroAreaPenetrations, zeroAreaContactPoints, finalAreas,
+                                                         finalNormals, finalPenetrations.data(),
+                                                         finalContactPoints, countPatch, streamInfo.stream);
 
                 // Clean up temporaries no longer needed past this point.
-                solverScratchSpace.finishUsingTempVector("votedNormals");
-                solverScratchSpace.finishUsingTempVector("zeroAreaNormals");
-                solverScratchSpace.finishUsingTempVector("zeroAreaPenetrations");
-                solverScratchSpace.finishUsingTempVector("zeroAreaContactPoints");
-
+                    solverScratchSpace.finishUsingTempVector("zeroAreaNormals");
+                    solverScratchSpace.finishUsingTempVector("zeroAreaPenetrations");
+                    solverScratchSpace.finishUsingTempVector("zeroAreaContactPoints");
+                }            
                 // Clean up CUB bookkeeping buffers.
                 solverScratchSpace.finishUsingTempVector("uniqueKeys");
                 solverScratchSpace.finishUsingDualStruct("numUniqueKeys");
@@ -3796,17 +3837,29 @@ inline void DEMDynamicThread::dispatchPatchBasedForceCorrections(
                     computePatchPVScalars(&simParams, &granData, finalNormals, finalContactPoints,
                                           startOffsetPatch, countPatch,
                                           patchNormalForce, patchSlipSpeed, streamInfo.stream);
-                    accumulateTrianglePVFromPatchContacts(
-                        &simParams, &granData, keys, primitivePatchAccumulators, patchContactAccumulators,
-                        patchNormalForce, patchSlipSpeed, startOffsetPrimitive, startOffsetPatch, countPrimitive,
-                        triPVGlobalTriToLocal.device(), triPVAccumP.device(),
-                        triPVAccumPV.device(), streamInfo.stream);
+                    if (patchContactAccumulators) {
+                        accumulateTrianglePVFromPatchContacts(
+                            &simParams, &granData, keys, primitivePatchAccumulators, finalAreas,
+                            patchNormalForce, patchSlipSpeed, startOffsetPrimitive, startOffsetPatch, countPatch, countPrimitive,
+                            triPVGlobalTriToLocal.device(), triPVAccumP.device(),
+                            triPVAccumPV.device(), streamInfo.stream);
+                    }
                     solverScratchSpace.finishUsingTempVector("patchNormalForce");
                     solverScratchSpace.finishUsingTempVector("patchSlipSpeed");
                 }
 
-                solverScratchSpace.finishUsingTempVector("primitivePatchAccumulators");
-                solverScratchSpace.finishUsingTempVector("patchContactAccumulators");
+                if (primitivePatchAccumulators) {
+                    solverScratchSpace.finishUsingTempVector("primitivePatchAccumulators");
+                }
+                if (patchContactAccumulators) {
+                    solverScratchSpace.finishUsingTempVector("patchContactAccumulators");
+                }
+                if (primitiveTriTriLiteAccumulators) {
+                    solverScratchSpace.finishUsingTempVector("primitiveTriTriLiteAccumulators");
+                }
+                if (patchTriTriLiteAccumulators) {
+                    solverScratchSpace.finishUsingTempVector("patchTriTriLiteAccumulators");
+                }
 
                 // If this is a tri-tri contact, compute max penetration for kT
                 // The max value stays on device until sendToTheirBuffer transfers it
@@ -3826,11 +3879,15 @@ inline void DEMDynamicThread::dispatchPatchBasedForceCorrections(
                 solverScratchSpace.finishUsingTempVector("finalNormals");
                 // Note: finalPenetrations is now a permanent array, not freed here
                 solverScratchSpace.finishUsingTempVector("finalContactPoints");
+                if (triTriPatchVotedNormals) {
+                    solverScratchSpace.finishUsingTempVector("triTriPatchVotedNormals");
+                }
             }
         }
     }
     // std::cout << "===========================" << std::endl;
 }
+
 
 void DEMDynamicThread::finalizeTrianglePVWindowStep() {
     if (!triPVTrackingEnabled || triPVNumTrackedTriangles == 0) {

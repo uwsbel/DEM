@@ -7,6 +7,7 @@
 #include <algorithms/DEMStaticDeviceUtilities.cuh>
 
 #include <kernel/DEMHelperKernels.cuh>
+#include <kernel/DEMCollisionKernels_SphTri_TriTri.cuh>
 
 // Reject insane local contact points that are actually packed-double storage (overlap depth / area).
 // This prevents catastrophic torque explosions when a slot is misclassified as patch-contact.
@@ -27,6 +28,121 @@ __device__ inline bool saneLocalCPWithBound(const float3& p, float max_norm) {
 }
 
 namespace deme {
+
+__device__ __forceinline__ void fetchTriangleWorldNodesForTriTri(const deme::DEMSimParams* simParams,
+                                                                 const deme::DEMDataDT* granData,
+                                                                 const deme::bodyID_t triID,
+                                                                 double3& a,
+                                                                 double3& b,
+                                                                 double3& c) {
+    const deme::bodyID_t owner = granData->ownerTriMesh[triID];
+    double3 ownerPos;
+    voxelIDToPosition<double, voxelID_t, subVoxelPos_t>(ownerPos.x, ownerPos.y, ownerPos.z, granData->voxelID[owner],
+                                                         granData->locX[owner], granData->locY[owner], granData->locZ[owner],
+                                                         simParams->nvXp2, simParams->nvYp2, simParams->voxelSize, simParams->l);
+    ownerPos.x += simParams->LBFX;
+    ownerPos.y += simParams->LBFY;
+    ownerPos.z += simParams->LBFZ;
+    const float4 q = make_float4(granData->oriQx[owner], granData->oriQy[owner], granData->oriQz[owner], granData->oriQw[owner]);
+
+    a = to_double3(granData->relPosNode1[triID]);
+    b = to_double3(granData->relPosNode2[triID]);
+    c = to_double3(granData->relPosNode3[triID]);
+    applyOriQToVector3<double, float>(a.x, a.y, a.z, q.w, q.x, q.y, q.z);
+    applyOriQToVector3<double, float>(b.x, b.y, b.z, q.w, q.x, q.y, q.z);
+    applyOriQToVector3<double, float>(c.x, c.y, c.z, q.w, q.x, q.y, q.z);
+    a += ownerPos;
+    b += ownerPos;
+    c += ownerPos;
+}
+
+// Rescue path for seam slivers: retry the same mutually-submerged overlap reconstruction with a progressively
+// relaxed clipping tolerance. This preserves the geometric model (submerged polygons) and avoids the large-area
+// artifacts of full-triangle projection.
+__device__ __forceinline__ double projectedTriangleOverlapAreaCpAlongNormal(const double3& A0,
+                                                                            const double3& A1,
+                                                                            const double3& A2,
+                                                                            const double3& B0,
+                                                                            const double3& B1,
+                                                                            const double3& B2,
+                                                                            double3 nCommon,
+                                                                            double3& contactPoint) {
+    double projArea = 0.0;
+    contactPoint = make_zero3<double3>();
+
+    const double geomScale = local_length_scale6<double3, double>(A0, A1, A2, B0, B1, B2);
+    const double baseEps = rel_len_tol<double>() * geomScale;
+
+    const double nLen2 = dot(nCommon, nCommon);
+    if (nLen2 <= (double)(DEME_TINY_FLOAT * DEME_TINY_FLOAT)) {
+        return 0.0;
+    }
+    nCommon = nCommon * (1.0 / sqrt(nLen2));
+
+    const double3 nA = cross(A1 - A0, A2 - A0);
+    const double3 nB = cross(B1 - B0, B2 - B0);
+    const double nALen2 = dot(nA, nA);
+    const double nBLen2 = dot(nB, nB);
+    if (nALen2 <= (double)(DEME_TINY_FLOAT * DEME_TINY_FLOAT) ||
+        nBLen2 <= (double)(DEME_TINY_FLOAT * DEME_TINY_FLOAT)) {
+        return 0.0;
+    }
+
+    const double denA = dot(nA, nCommon);
+    const double denB = dot(nB, nCommon);
+    if (absT(denA) <= (double)DEME_TINY_FLOAT || absT(denB) <= (double)DEME_TINY_FLOAT) {
+        return 0.0;
+    }
+
+    double3 u, v;
+    build_plane_basis_from_normal<double3, double>(nCommon, u, v);
+    const double3 O = (A0 + B0) * 0.5;
+    const double cA = dot(nA, A0 - O);
+    const double cB = dot(nB, B0 - O);
+    const double alphaA = dot(nA, u), betaA = dot(nA, v);
+    const double alphaB = dot(nB, u), betaB = dot(nB, v);
+
+    const double epsMults[4] = {1.0, 4.0, 16.0, 64.0};
+    for (int attempt = 0; attempt < 4; attempt++) {
+        const double planeEps = baseEps * epsMults[attempt];
+        const double eps2d = planeEps;
+
+        double3 aPen3[4], bPen3[4];
+        int nAPen = clip_triangle_by_plane_keep_negative<double3, double>(A0, A1, A2, B0, nB, planeEps, aPen3);
+        int nBPen = clip_triangle_by_plane_keep_negative<double3, double>(B0, B1, B2, A0, nA, planeEps, bPen3);
+        if (nAPen < 3 || nBPen < 3) {
+            continue;
+        }
+
+        double aX[8], aY[8], bX[8], bY[8];
+        nAPen = project_poly_3d_to_2d<double3, double>(aPen3, nAPen, O, u, v, aX, aY, eps2d);
+        nBPen = project_poly_3d_to_2d<double3, double>(bPen3, nBPen, O, u, v, bX, bY, eps2d);
+        if (nAPen < 3 || nBPen < 3) {
+            continue;
+        }
+
+        double outX[8], outY[8];
+        const int nPoly = clip_convex_poly_2d<double>(bX, bY, nBPen, aX, aY, nAPen, outX, outY, eps2d);
+        if (nPoly < 3) {
+            continue;
+        }
+
+        double cx = 0.0, cy = 0.0;
+        if (!polygon_area_centroid_2d<double>(outX, outY, nPoly, projArea, cx, cy)) {
+            continue;
+        }
+        if (projArea <= 0.0) {
+            continue;
+        }
+
+        const double wA = (cA - alphaA * cx - betaA * cy) / denA;
+        const double wB = (cB - alphaB * cx - betaB * cy) / denB;
+        contactPoint = O + u * cx + v * cy + nCommon * ((wA + wB) * 0.5);
+        return projArea;
+    }
+
+    return 0.0;
+}
 
 __global__ void getContactForcesConcerningOwners_impl(float3* d_points,
                                                       float3* d_forces,
@@ -240,11 +356,45 @@ __global__ void prepareWeightedNormalsForVoting_impl(DEMDataDT* granData,
         contactPairs_t myContactID = startOffset + idx;
 
         // Normal and geometric quantities were produced by the primitive contact kernels.
-        const float3 normal = granData->contactForces[myContactID];
-        const float3 areaStorage = granData->contactPointGeometryB[myContactID];
-        float area = float3StorageToDouble(areaStorage);
+        float3 normal = granData->contactForces[myContactID];
 
-        weightedNormals[idx] = make_float3(normal.x * area, normal.y * area, normal.z * area);
+        // TODO: is this block necessary?
+
+        // For tri-tri contacts, orient primitive normals to the canonical patch-pair ordering.
+        // Otherwise, primitive A/B role flips can make normals cancel in patch voting.
+        if (granData->contactTypePrimitive[myContactID] == TRIANGLE_TRIANGLE_CONTACT) {
+            const contactPairs_t patchContactID = granData->geomToPatchMap[myContactID];
+            const bodyID_t patchA = granData->idPatchA[patchContactID];
+            const bodyID_t patchB = granData->idPatchB[patchContactID];
+
+            bool ghostA = false;
+            bool ghostA_neg = false;
+            bool ghostB = false;
+            bool ghostB_neg = false;
+            const bodyID_t triA = cylPeriodicDecodeID(granData->idPrimitiveA[myContactID], ghostA, ghostA_neg);
+            const bodyID_t triB = cylPeriodicDecodeID(granData->idPrimitiveB[myContactID], ghostB, ghostB_neg);
+
+            bodyID_t triPatchA = granData->triPatchID[triA];
+            bodyID_t triPatchB = granData->triPatchID[triB];
+            if (ghostA) {
+                triPatchA = cylPeriodicEncodeGhostID(triPatchA, ghostA_neg);
+            }
+            if (ghostB) {
+                triPatchB = cylPeriodicEncodeGhostID(triPatchB, ghostB_neg);
+            }
+
+            // Primitive kernel normal convention is B->A in primitive ordering.
+            // If primitive ordering is opposite to canonical patch ordering, flip sign.
+            const bool primitiveAlignedToPatch = (triPatchA == patchA && triPatchB == patchB);
+            const bool primitiveOppositeToPatch = (triPatchA == patchB && triPatchB == patchA);
+            if (!primitiveAlignedToPatch && primitiveOppositeToPatch) {
+                normal = -normal;
+            }
+        }
+
+        // End TODO Block
+
+        weightedNormals[idx] = make_float3(normal.x, normal.y, normal.z);
     }
 }
 
@@ -295,9 +445,485 @@ void normalizeAndScatterVotedNormals(float3* votedWeightedNormals,
     }
 }
 
+__device__ __forceinline__ bool finiteDouble3(const double3& a) {
+    return isfinite(a.x) && isfinite(a.y) && isfinite(a.z);
+}
+
+__device__ __forceinline__ float3 normalizeFloat3OrZero(const float3& v) {
+    const float len2 = length2(v);
+    if (!(len2 > 0.f) || !isfinite(len2)) {
+        return make_float3(0.f, 0.f, 0.f);
+    }
+    return v * rsqrtf(len2);
+}
+
+__device__ __forceinline__ bool jacobiEigenSymmetric3x3Device(const double in_A[3][3],
+                                                              double eigvals[3],
+                                                              double eigvecs[3][3]) {
+    double A[3][3];
+    for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 3; c++) {
+            A[r][c] = in_A[r][c];
+            eigvecs[r][c] = (r == c) ? 1.0 : 0.0;
+        }
+    }
+    constexpr int max_iters = 24;
+    constexpr double eps = 1e-24;
+    for (int it = 0; it < max_iters; it++) {
+        int p = 0;
+        int q = 1;
+        double max_off = fabs(A[0][1]);
+        const double off_02 = fabs(A[0][2]);
+        const double off_12 = fabs(A[1][2]);
+        if (off_02 > max_off) { p = 0; q = 2; max_off = off_02; }
+        if (off_12 > max_off) { p = 1; q = 2; max_off = off_12; }
+        const double diag_scale = fabs(A[0][0]) + fabs(A[1][1]) + fabs(A[2][2]) + 1.0;
+        if (max_off <= diag_scale * 1e-14) break;
+        const double app = A[p][p];
+        const double aqq = A[q][q];
+        const double apq = A[p][q];
+        if (fabs(apq) <= eps) continue;
+        const double tau = (aqq - app) / (2.0 * apq);
+        const double t = (tau >= 0.0) ? (1.0 / (tau + sqrt(1.0 + tau * tau)))
+                                      : (-1.0 / (-tau + sqrt(1.0 + tau * tau)));
+        const double c = 1.0 / sqrt(1.0 + t * t);
+        const double s = t * c;
+        for (int k = 0; k < 3; k++) {
+            if (k == p || k == q) continue;
+            const double aik = A[k][p];
+            const double akq = A[k][q];
+            A[k][p] = c * aik - s * akq;
+            A[p][k] = A[k][p];
+            A[k][q] = c * akq + s * aik;
+            A[q][k] = A[k][q];
+        }
+        A[p][p] = c * c * app - 2.0 * s * c * apq + s * s * aqq;
+        A[q][q] = s * s * app + 2.0 * s * c * apq + c * c * aqq;
+        A[p][q] = 0.0; A[q][p] = 0.0;
+        for (int k = 0; k < 3; k++) {
+            const double vkp = eigvecs[k][p];
+            const double vkq = eigvecs[k][q];
+            eigvecs[k][p] = c * vkp - s * vkq;
+            eigvecs[k][q] = s * vkp + c * vkq;
+        }
+    }
+    eigvals[0] = A[0][0]; eigvals[1] = A[1][1]; eigvals[2] = A[2][2];
+    return isfinite(eigvals[0]) && isfinite(eigvals[1]) && isfinite(eigvals[2]);
+}
+
+__device__ __forceinline__ float3 deterministicPerpendicular(const float3& t) {
+    const float3 tx = make_float3(fabsf(t.x), fabsf(t.y), fabsf(t.z));
+    float3 axis = make_float3(1.f, 0.f, 0.f);
+    if (tx.y <= tx.x && tx.y <= tx.z) {
+        axis = make_float3(0.f, 1.f, 0.f);
+    } else if (tx.z <= tx.x && tx.z <= tx.y) {
+        axis = make_float3(0.f, 0.f, 1.f);
+    }
+    return normalizeFloat3OrZero(cross(t, axis));
+}
+
+__global__ void prepareTriTriNormalsForPatchVote_impl(const DEMSimParams* simParams,
+                                                      DEMDataDT* granData,
+                                                      float3* orientedNormals,
+                                                      contactPairs_t startOffset,
+                                                      contactPairs_t count) {
+    contactPairs_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) {
+        return;
+    }
+
+    const contactPairs_t myContactID = startOffset + idx;
+    float3 n_raw = granData->contactForces[myContactID];
+    if (granData->contactTypePrimitive[myContactID] != TRIANGLE_TRIANGLE_CONTACT) {
+        orientedNormals[idx] = n_raw;
+        return;
+    }
+
+    // TODO: Check if this block is necessary
+
+    // Keep tri-tri primitive normals consistent with canonical patch ordering.
+    // Primitive A/B can swap across frames, but patch pairs are canonicalized; align signs here
+    // before patch voting to avoid normal cancellation and spurious patch-force drops.
+    const contactPairs_t patchContactID = granData->geomToPatchMap[myContactID];
+    const bodyID_t patchA = granData->idPatchA[patchContactID];
+    const bodyID_t patchB = granData->idPatchB[patchContactID];
+
+    bool ghostA = false;
+    bool ghostA_neg = false;
+    bool ghostB = false;
+    bool ghostB_neg = false;
+    const bodyID_t triA = cylPeriodicDecodeID(granData->idPrimitiveA[myContactID], ghostA, ghostA_neg);
+    const bodyID_t triB = cylPeriodicDecodeID(granData->idPrimitiveB[myContactID], ghostB, ghostB_neg);
+
+    bodyID_t triPatchA = granData->triPatchID[triA];
+    bodyID_t triPatchB = granData->triPatchID[triB];
+    if (ghostA) {
+        triPatchA = cylPeriodicEncodeGhostID(triPatchA, ghostA_neg);
+    }
+    if (ghostB) {
+        triPatchB = cylPeriodicEncodeGhostID(triPatchB, ghostB_neg);
+    }
+
+    const bool primitiveAlignedToPatch = (triPatchA == patchA && triPatchB == patchB);
+    const bool primitiveOppositeToPatch = (triPatchA == patchB && triPatchB == patchA);
+    if (!primitiveAlignedToPatch && primitiveOppositeToPatch) {
+        n_raw = -n_raw;
+    }
+
+    // End block check
+
+    // Weight the patch-normal vote by positive penetration. This keeps the stage-0 normal
+    // common across the patch, but avoids letting near-degenerate primitives dominate the vote.
+    const double rawPen = float3StorageToDouble(granData->contactPointGeometryA[myContactID]);
+    const float w = (rawPen > 0.0) ? static_cast<float>(rawPen) : 0.0f;
+    orientedNormals[idx] = make_float3(n_raw.x * w, n_raw.y * w, n_raw.z * w);
+}
+
+void prepareTriTriNormalsForPatchVote(const DEMSimParams* simParams,
+                                      DEMDataDT* granData,
+                                      float3* orientedNormals,
+                                      contactPairs_t startOffset,
+                                      contactPairs_t count,
+                                      cudaStream_t& this_stream) {
+    size_t blocks_needed = (count + DEME_MAX_THREADS_PER_BLOCK - 1) / DEME_MAX_THREADS_PER_BLOCK;
+    if (blocks_needed > 0) {
+        prepareTriTriNormalsForPatchVote_impl<<<blocks_needed, DEME_MAX_THREADS_PER_BLOCK, 0, this_stream>>>(
+            simParams, granData, orientedNormals, startOffset, count);
+    }
+}
+
+__global__ void prepareTriTriPlaneFitAccumulators_impl(DEMDataDT* granData,
+                                                       TriTriPlaneFitAccum* accumulators,
+                                                       contactPairs_t startOffset,
+                                                       contactPairs_t count) {
+    contactPairs_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) {
+        return;
+    }
+
+    TriTriPlaneFitAccum acc{};
+    const contactPairs_t myContactID = startOffset + idx;
+    if (granData->contactTypePrimitive[myContactID] == TRIANGLE_TRIANGLE_CONTACT) {
+        const double rawPen = float3StorageToDouble(granData->contactPointGeometryA[myContactID]);
+        if (rawPen >= 0.0) {
+            const double3 cp = to_double3(granData->contactTorque_convToForce[myContactID]);
+            if (finiteDouble3(cp)) {
+                const float3 n_unit = normalizeFloat3OrZero(granData->contactForces[myContactID]);
+                const double w = (rawPen > 0.0) ? rawPen : 1.0;
+                acc.weightSum = w;
+                acc.sumPx = w * cp.x;
+                acc.sumPy = w * cp.y;
+                acc.sumPz = w * cp.z;
+                acc.sumPxx = w * cp.x * cp.x;
+                acc.sumPxy = w * cp.x * cp.y;
+                acc.sumPxz = w * cp.x * cp.z;
+                acc.sumPyy = w * cp.y * cp.y;
+                acc.sumPyz = w * cp.y * cp.z;
+                acc.sumPzz = w * cp.z * cp.z;
+                acc.sumNx = w * (double)n_unit.x;
+                acc.sumNy = w * (double)n_unit.y;
+                acc.sumNz = w * (double)n_unit.z;
+                acc.count = 1u;
+            }
+        }
+    }
+    accumulators[idx] = acc;
+}
+
+void prepareTriTriPlaneFitAccumulators(DEMDataDT* granData,
+                                       TriTriPlaneFitAccum* accumulators,
+                                       contactPairs_t startOffset,
+                                       contactPairs_t count,
+                                       cudaStream_t& this_stream) {
+    size_t blocks_needed = (count + DEME_MAX_THREADS_PER_BLOCK - 1) / DEME_MAX_THREADS_PER_BLOCK;
+    if (blocks_needed > 0) {
+        prepareTriTriPlaneFitAccumulators_impl<<<blocks_needed, DEME_MAX_THREADS_PER_BLOCK, 0, this_stream>>>(
+            granData, accumulators, startOffset, count);
+    }
+}
+
+__global__ void finalizeTriTriPatchNormalsFromPlaneFit_impl(const TriTriPlaneFitAccum* patchAccumulators,
+                                                            float3* patchNormals,
+                                                            contactPairs_t count) {
+    contactPairs_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) {
+        return;
+    }
+    const TriTriPlaneFitAccum acc = patchAccumulators[idx];
+    const float3 meanNormal = normalizeFloat3OrZero(make_float3((float)acc.sumNx, (float)acc.sumNy, (float)acc.sumNz));
+    if (!(acc.weightSum > 0.0) || acc.count == 0u) {
+        patchNormals[idx] = make_float3(0.f, 0.f, 0.f);
+        return;
+    }
+    // With fewer than 3 witness points there is no reliable plane fit.
+    // Keep the primitive-voted normal directly and avoid PCA tie/degeneracy artifacts.
+    if (acc.count < 3u) {
+        patchNormals[idx] = meanNormal;
+        return;
+    }
+    const double invW = 1.0 / acc.weightSum;
+    const double cx = acc.sumPx * invW;
+    const double cy = acc.sumPy * invW;
+    const double cz = acc.sumPz * invW;
+    double C[3][3];
+    C[0][0] = acc.sumPxx * invW - cx * cx;
+    C[0][1] = acc.sumPxy * invW - cx * cy;
+    C[0][2] = acc.sumPxz * invW - cx * cz;
+    C[1][0] = C[0][1];
+    C[1][1] = acc.sumPyy * invW - cy * cy;
+    C[1][2] = acc.sumPyz * invW - cy * cz;
+    C[2][0] = C[0][2];
+    C[2][1] = C[1][2];
+    C[2][2] = acc.sumPzz * invW - cz * cz;
+    double eigvals[3];
+    double eigvecs[3][3];
+    if (!jacobiEigenSymmetric3x3Device(C, eigvals, eigvecs)) {
+        patchNormals[idx] = meanNormal;
+        return;
+    }
+    // Robust eigen index ordering (ascending) with deterministic tie handling.
+    int ord0 = 0, ord1 = 1, ord2 = 2;
+    if (eigvals[ord0] > eigvals[ord1]) { const int t = ord0; ord0 = ord1; ord1 = t; }
+    if (eigvals[ord1] > eigvals[ord2]) { const int t = ord1; ord1 = ord2; ord2 = t; }
+    if (eigvals[ord0] > eigvals[ord1]) { const int t = ord0; ord0 = ord1; ord1 = t; }
+    const int min_idx = ord0;
+    const int mid_idx = ord1;
+    const int max_idx = ord2;
+    const double max_eval = eigvals[max_idx];
+    const double mid_eval = eigvals[mid_idx];
+    const double geom_scale = fabs(max_eval) + fabs(mid_eval) + fabs(eigvals[min_idx]) + 1.0;
+    const bool planar = (acc.count >= 3u) && isfinite(mid_eval) && (mid_eval > geom_scale * 1e-8);
+    float3 n;
+    if (planar) {
+        n = make_float3((float)eigvecs[0][min_idx], (float)eigvecs[1][min_idx], (float)eigvecs[2][min_idx]);
+        n = normalizeFloat3OrZero(n);
+    } else {
+        // Non-planar/near-degenerate covariance: keep the primitive-voted mean normal.
+        // This avoids unstable tangent-projection artifacts in sparse/noisy contact islands.
+        n = meanNormal;
+    }
+    if (length2(n) <= 0.f) {
+        patchNormals[idx] = meanNormal;
+        return;
+    }
+    if (length2(meanNormal) > 0.f && dot(n, meanNormal) < 0.f) {
+        n = -n;
+    }
+    patchNormals[idx] = n;
+}
+
+void finalizeTriTriPatchNormalsFromPlaneFit(const TriTriPlaneFitAccum* patchAccumulators,
+                                            float3* patchNormals,
+                                            contactPairs_t count,
+                                            cudaStream_t& this_stream) {
+    size_t blocks_needed = (count + DEME_MAX_THREADS_PER_BLOCK - 1) / DEME_MAX_THREADS_PER_BLOCK;
+    if (blocks_needed > 0) {
+        finalizeTriTriPatchNormalsFromPlaneFit_impl<<<blocks_needed, DEME_MAX_THREADS_PER_BLOCK, 0, this_stream>>>(
+            patchAccumulators, patchNormals, count);
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Fused patch aggregation kernels (projected area, penetration, contact point)
 ////////////////////////////////////////////////////////////////////////////////
+
+__global__ void recomputeTriTriAreaAndPrepareLiteAccumulators_impl(const DEMSimParams* simParams,
+                                                                   DEMDataDT* granData,
+                                                                   const contactPairs_t* keys,
+                                                                   const float3* patchNormals,
+                                                                   TriTriLiteAccum* accumulators,
+                                                                   contactPairs_t startOffsetPrimitive,
+                                                                   contactPairs_t startOffsetPatch,
+                                                                   contactPairs_t countPatch,
+                                                                   contactPairs_t countPrimitive) {
+    contactPairs_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= countPrimitive) {
+        return;
+    }
+
+    TriTriLiteAccum acc{};
+    const contactPairs_t myContactID = startOffsetPrimitive + idx;
+    if (granData->contactTypePrimitive[myContactID] != TRIANGLE_TRIANGLE_CONTACT) {
+        accumulators[idx] = acc;
+        return;
+    }
+
+    const float3 cpFallbackStorage = granData->contactTorque_convToForce[myContactID];
+    double3 cp = to_double3(cpFallbackStorage);
+    double area = 0.0;
+
+    const contactPairs_t patchID = keys[idx];
+    const bool patchValid = (patchID >= startOffsetPatch && patchID < startOffsetPatch + countPatch);
+    const double rawPen = float3StorageToDouble(granData->contactPointGeometryA[myContactID]);
+    const double posPen = (rawPen > 0.0) ? rawPen : 0.0;
+
+    if (patchValid) {
+        const float3 n = patchNormals[patchID - startOffsetPatch];
+        const double nlen2 = (double)length2(n);
+        if (nlen2 > (double)(DEME_TINY_FLOAT * DEME_TINY_FLOAT)) {
+            // Keep penetration aggregation independent from stage-1 area reconstruction.
+            // A primitive can be a valid overlap witness (positive pass-1 penetration) even when
+            // its reconstructed projected area collapses numerically at a seam/sliver. If we only
+            // update maxPositivePen on area>0 contributors, patch penetration can dip although the
+            // contact island is still present.
+            acc.maxPositivePen = posPen;
+            bool ghostA = false, ghostA_neg = false, ghostB = false, ghostB_neg = false;
+            const bodyID_t triA = cylPeriodicDecodeID(granData->idPrimitiveA[myContactID], ghostA, ghostA_neg);
+            const bodyID_t triB = cylPeriodicDecodeID(granData->idPrimitiveB[myContactID], ghostB, ghostB_neg);
+            double3 a, b, c, d, e, f;
+            fetchTriangleWorldNodesForTriTri(simParams, granData, triA, a, b, c);
+            fetchTriangleWorldNodesForTriTri(simParams, granData, triB, d, e, f);
+
+            // Once the patch normal is known, a primitive can contribute positive projected area even when the
+            // zero-thickness SAT/Moller pass reported a slightly negative raw penetration. These "support-only"
+            // contributors are essential near mesh-to-mesh seam transitions; dropping them causes the patch area to
+            // lose entire cells although the reconstructed island geometry is still valid.
+            const double3 n_patch = to_double3(n);
+            const double3 n_patch_neg = make_double3(-n_patch.x, -n_patch.y, -n_patch.z);
+            area = area_cp_along_normal<double3, double>(a, b, c, d, e, f, n_patch, cp);
+            if (area <= 0.0) {
+                double3 cp2 = cp;
+                const double area2 = area_cp_along_normal<double3, double>(d, e, f, a, b, c, n_patch, cp2);
+                if (area2 > 0.0) {
+                    area = area2;
+                    cp = cp2;
+                }
+            }
+            if (area <= 0.0) {
+                // Orientation-robust retry: if patch normal orientation is locally inconsistent,
+                // the submerged-polygon clipping can fail for +n but succeed for -n.
+                double3 cp3 = cp;
+                const double area3 = area_cp_along_normal<double3, double>(a, b, c, d, e, f, n_patch_neg, cp3);
+                if (area3 > 0.0) {
+                    area = area3;
+                    cp = cp3;
+                }
+            }
+            if (area <= 0.0) {
+                double3 cp4 = cp;
+                const double area4 = area_cp_along_normal<double3, double>(d, e, f, a, b, c, n_patch_neg, cp4);
+                if (area4 > 0.0) {
+                    area = area4;
+                    cp = cp4;
+                }
+            }
+            // Keep area reconstruction conservative: extra rescue passes can over-inflate
+            // patch area in grazing cases where normals/penetration are already stable.
+            if (area > 0.0) {
+                if (posPen > 0.0) {
+                    const double invn = 1.0 / sqrt(nlen2);
+                    const double3 nUnit = to_double3(n) * invn;
+                    cp = cp - nUnit * (0.5 * posPen);
+                }
+                acc.sumProjArea = area;
+                acc.sumAreaWeightedCPx = cp.x * area;
+                acc.sumAreaWeightedCPy = cp.y * area;
+                acc.sumAreaWeightedCPz = cp.z * area;
+            }
+        }
+    }
+
+    granData->contactPointGeometryB[myContactID] = doubleToFloat3Storage(area > 0.0 ? area : 0.0);
+    granData->contactTorque_convToForce[myContactID] = to_float3(cp);
+    // Do not kill the primitive candidate here. This stage only reconstructs patch area; candidate lifetime belongs to
+    // kT/pass-1. Zeroing the type here turns tiny numerical seam misses into visible patch-area flicker.
+    accumulators[idx] = acc;
+}
+
+void recomputeTriTriAreaAndPrepareLiteAccumulators(const DEMSimParams* simParams,
+                                                   DEMDataDT* granData,
+                                                   const contactPairs_t* keys,
+                                                   const float3* patchNormals,
+                                                   TriTriLiteAccum* accumulators,
+                                                   contactPairs_t startOffsetPrimitive,
+                                                   contactPairs_t startOffsetPatch,
+                                                   contactPairs_t countPatch,
+                                                   contactPairs_t countPrimitive,
+                                                   cudaStream_t& this_stream) {
+    constexpr int RECOMPUTE_THREADS = 64;
+    size_t blocks_needed = (countPrimitive + RECOMPUTE_THREADS - 1) / RECOMPUTE_THREADS;
+    if (blocks_needed > 0) {
+        recomputeTriTriAreaAndPrepareLiteAccumulators_impl<<<blocks_needed, RECOMPUTE_THREADS, 0, this_stream>>>(
+            simParams, granData, keys, patchNormals, accumulators, startOffsetPrimitive, startOffsetPatch, countPatch,
+            countPrimitive);
+    }
+}
+
+__global__ void finalizeTriTriLitePatchResults_impl(const TriTriLiteAccum* patchAccumulators,
+                                                    const float3* patchNormals,
+                                                    const float3* zeroAreaNormals,
+                                                    const double* zeroAreaPenetrations,
+                                                    const double3* zeroAreaContactPoints,
+                                                    double* finalAreas,
+                                                    float3* finalNormals,
+                                                    double* finalPenetrations,
+                                                    double3* finalContactPoints,
+                                                    contactPairs_t count) {
+    contactPairs_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) {
+        return;
+    }
+
+    const TriTriLiteAccum acc = patchAccumulators[idx];
+    if (acc.sumProjArea > 0.0) {
+        float3 n = patchNormals[idx];
+        const float nlen2 = length2(n);
+        if (nlen2 > 0.f) {
+            n *= rsqrtf(nlen2);
+        } else {
+            n = make_float3(0.f, 0.f, 0.f);
+        }
+        finalAreas[idx] = acc.sumProjArea;
+        finalNormals[idx] = n;
+        finalPenetrations[idx] = acc.maxPositivePen;
+        const double invA = 1.0 / acc.sumProjArea;
+        finalContactPoints[idx] = make_double3(acc.sumAreaWeightedCPx * invA,
+                                               acc.sumAreaWeightedCPy * invA,
+                                               acc.sumAreaWeightedCPz * invA);
+    } else {
+        finalAreas[idx] = 0.0;
+        finalNormals[idx] = zeroAreaNormals[idx];
+        finalPenetrations[idx] = zeroAreaPenetrations[idx];
+        finalContactPoints[idx] = zeroAreaContactPoints[idx];
+    }
+}
+
+void finalizeTriTriLitePatchResults(const TriTriLiteAccum* patchAccumulators,
+                                    const float3* patchNormals,
+                                    const float3* zeroAreaNormals,
+                                    const double* zeroAreaPenetrations,
+                                    const double3* zeroAreaContactPoints,
+                                    double* finalAreas,
+                                    float3* finalNormals,
+                                    double* finalPenetrations,
+                                    double3* finalContactPoints,
+                                    contactPairs_t count,
+                                    cudaStream_t& this_stream) {
+    size_t blocks_needed = (count + DEME_MAX_THREADS_PER_BLOCK - 1) / DEME_MAX_THREADS_PER_BLOCK;
+    if (blocks_needed > 0) {
+        finalizeTriTriLitePatchResults_impl<<<blocks_needed, DEME_MAX_THREADS_PER_BLOCK, 0, this_stream>>>(
+            patchAccumulators, patchNormals, zeroAreaNormals, zeroAreaPenetrations, zeroAreaContactPoints,
+            finalAreas, finalNormals, finalPenetrations, finalContactPoints, count);
+    }
+}
+
+__device__ __forceinline__ void makePatchTangentBasis(const float3& n, float3& t1, float3& t2) {
+    const float3 ref = (fabsf(n.z) < 0.9f) ? make_float3(0.0f, 0.0f, 1.0f) : make_float3(0.0f, 1.0f, 0.0f);
+    t1 = cross(ref, n);
+    const float t1_len2 = length2(t1);
+    if (t1_len2 > 0.0f) {
+        t1 *= rsqrtf(t1_len2);
+    } else {
+        t1 = make_float3(1.0f, 0.0f, 0.0f);
+    }
+    t2 = cross(n, t1);
+    const float t2_len2 = length2(t2);
+    if (t2_len2 > 0.0f) {
+        t2 *= rsqrtf(t2_len2);
+    } else {
+        t2 = make_float3(0.0f, 1.0f, 0.0f);
+    }
+}
 
 // Per-primitive accumulator generation.
 //
@@ -309,68 +935,88 @@ void normalizeAndScatterVotedNormals(float3* votedWeightedNormals,
 // It produces the same patch-level quantities, but materializes only one array
 // (PatchContactAccum) and performs a single ReduceByKey.
 __global__ void computePatchContactAccumulators_impl(DEMDataDT* granData,
-                                                     const float3* votedNormals,
                                                      const contactPairs_t* keys,
                                                      PatchContactAccum* accumulators,
                                                      contactPairs_t startOffsetPrimitive,
-                                                     contactPairs_t startOffsetPatch,
                                                      contactPairs_t count) {
     contactPairs_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < count) {
         const contactPairs_t myContactID = startOffsetPrimitive + idx;
 
-        // Map this primitive to its patch-pair index, then to local [0, countPatch) index.
-        const contactPairs_t patchIdx = keys[idx];
-        const contactPairs_t localPatchIdx = patchIdx - startOffsetPatch;
-
-        const float3 votedNormal = votedNormals[localPatchIdx];
-        const float3 originalNormal = granData->contactForces[myContactID];
-
-        // Penetration depth (positive means overlap/contact); negative is non-contact and does not contribute.
         const float3 penStorage = granData->contactPointGeometryA[myContactID];
         double originalPenetration = float3StorageToDouble(penStorage);
         originalPenetration = (originalPenetration > 0.0) ? originalPenetration : 0.0;
 
-        // Contact area (non-negative; fake contacts have 0 area and thus contribute 0).
         const float3 areaStorage = granData->contactPointGeometryB[myContactID];
         const double area = float3StorageToDouble(areaStorage);
 
-        // Projection factor: clamp negative dot products to 0 (tangential/opposing contributions do not participate).
-        const float dotProduct = dot(originalNormal, votedNormal);
-        const double cospos = (dotProduct > 0.f) ? (double)dotProduct : 0.0;
+        const double projectedArea = area;
+        const bool contributes = projectedArea > 0.0;
+        // For patch normal/depth voting, only primitives with positive projected area are valid contributors.
+        // Non-contact primitives can still carry positive geometric penetration placeholders (e.g., one-sided
+        // sph-tri face rejects), and allowing them into max-penetration voting can inject invalid normals.
+        const double projectedPenetration = contributes ? originalPenetration : 0.0;
 
-        const double projectedPenetration = originalPenetration * cospos;
-        const double projectedArea = area * cospos;
-
-        const double weight = projectedPenetration * projectedArea;
-
-        const double3 contactPoint = to_double3(granData->contactTorque_convToForce[myContactID]);
-        const double3 weightedCP = make_double3(contactPoint.x * weight, contactPoint.y * weight, contactPoint.z * weight);
+        const double3 contactPointRaw = to_double3(granData->contactTorque_convToForce[myContactID]);
+        const double3 contactPoint = contributes ? contactPointRaw : make_double3(0.0, 0.0, 0.0);
         const double3 areaWeightedCP =
-            make_double3(contactPoint.x * projectedArea, contactPoint.y * projectedArea, contactPoint.z * projectedArea);
+            make_double3(contactPoint.x * projectedArea,
+                         contactPoint.y * projectedArea,
+                         contactPoint.z * projectedArea);
+        const float3 primitiveNormal = contributes ? granData->contactForces[myContactID] : make_float3(0.f, 0.f, 0.f);
 
-        PatchContactAccum acc;
+        PatchContactAccum acc{};
         acc.sumProjArea = projectedArea;
         acc.maxProjPen = projectedPenetration;
-        acc.sumWeight = weight;
-        acc.sumWeightedCP = weightedCP;
         acc.sumAreaWeightedCP = areaWeightedCP;
+        acc.cpAtMaxPen = contactPoint;
+        acc.normalAtMaxPen = primitiveNormal;
+        acc.minSpanU = DEME_HUGE_FLOAT;
+        acc.maxSpanU = -DEME_HUGE_FLOAT;
+        acc.minSpanV = DEME_HUGE_FLOAT;
+        acc.maxSpanV = -DEME_HUGE_FLOAT;
+        acc.triTriCount = 0u;
         accumulators[idx] = acc;
     }
 }
 
 void computePatchContactAccumulators(DEMDataDT* granData,
-                                     const float3* votedNormals,
                                      const contactPairs_t* keys,
                                      PatchContactAccum* accumulators,
                                      contactPairs_t startOffsetPrimitive,
-                                     contactPairs_t startOffsetPatch,
                                      contactPairs_t count,
                                      cudaStream_t& this_stream) {
     size_t blocks_needed = (count + DEME_MAX_THREADS_PER_BLOCK - 1) / DEME_MAX_THREADS_PER_BLOCK;
     if (blocks_needed > 0) {
         computePatchContactAccumulators_impl<<<blocks_needed, DEME_MAX_THREADS_PER_BLOCK, 0, this_stream>>>(
-            granData, votedNormals, keys, accumulators, startOffsetPrimitive, startOffsetPatch, count);
+            granData, keys, accumulators, startOffsetPrimitive, count);
+    }
+}
+
+__global__ void extractPrimitivePatchAccumFields_impl(const PatchContactAccum* primitiveAccumulators,
+                                                      double* projectedAreas,
+                                                      double* projectedPenetrations,
+                                                      double3* areaWeightedContactPoints,
+                                                      contactPairs_t count) {
+    contactPairs_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count) {
+        const PatchContactAccum acc = primitiveAccumulators[idx];
+        projectedAreas[idx] = acc.sumProjArea;
+        projectedPenetrations[idx] = acc.maxProjPen;
+        areaWeightedContactPoints[idx] = acc.sumAreaWeightedCP;
+    }
+}
+
+void extractPrimitivePatchAccumFields(const PatchContactAccum* primitiveAccumulators,
+                                      double* projectedAreas,
+                                      double* projectedPenetrations,
+                                      double3* areaWeightedContactPoints,
+                                      contactPairs_t count,
+                                      cudaStream_t& this_stream) {
+    size_t blocks_needed = (count + DEME_MAX_THREADS_PER_BLOCK - 1) / DEME_MAX_THREADS_PER_BLOCK;
+    if (blocks_needed > 0) {
+        extractPrimitivePatchAccumFields_impl<<<blocks_needed, DEME_MAX_THREADS_PER_BLOCK, 0, this_stream>>>(
+            primitiveAccumulators, projectedAreas, projectedPenetrations, areaWeightedContactPoints, count);
     }
 }
 
@@ -388,36 +1034,26 @@ __global__ void finalizePatchResultsFromAccumulators_impl(const PatchContactAccu
     contactPairs_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < count) {
         const PatchContactAccum acc = patchAccumulators[idx];
-        const double projectedArea = acc.sumProjArea;
+        const double patchArea = acc.sumProjArea;
 
-        // Use voted results only if projectedArea > 0
-        if (projectedArea > 0.0) {
-            finalAreas[idx] = projectedArea;
-            finalNormals[idx] = votedNormals[idx];
-            finalPenetrations[idx] = acc.maxProjPen;
-
-            if (acc.sumWeight > 0.0) {
-                const double invW = 1.0 / acc.sumWeight;
-                finalContactPoints[idx] = make_double3(acc.sumWeightedCP.x * invW,
-                                                      acc.sumWeightedCP.y * invW,
-                                                      acc.sumWeightedCP.z * invW);
-            } else if (projectedArea > 0.0 && isfinite(acc.sumAreaWeightedCP.x) && isfinite(acc.sumAreaWeightedCP.y) &&
-                       isfinite(acc.sumAreaWeightedCP.z)) {
-                const double invA = 1.0 / projectedArea;
-                finalContactPoints[idx] = make_double3(acc.sumAreaWeightedCP.x * invA,
-                                                      acc.sumAreaWeightedCP.y * invA,
-                                                      acc.sumAreaWeightedCP.z * invA);
+        if (patchArea > 0.0) {
+            finalAreas[idx] = patchArea;
+            float3 n = acc.normalAtMaxPen;
+            const float nlen2 = length2(n);
+            if (nlen2 > 0.f) {
+                n *= rsqrtf(nlen2);
+                finalNormals[idx] = n;
             } else {
-                // Last fallback: max-penetration primitive CP.
-                const double3 cp_fallback = zeroAreaContactPoints[idx];
-                if (isfinite(cp_fallback.x) && isfinite(cp_fallback.y) && isfinite(cp_fallback.z)) {
-                    finalContactPoints[idx] = cp_fallback;
-                } else {
-                    finalContactPoints[idx] = make_double3(0.0, 0.0, 0.0);
-                }
+                finalNormals[idx] = zeroAreaNormals[idx];
             }
+            finalPenetrations[idx] = acc.maxProjPen;
+            // Use area-averaged contact point for patch contacts to avoid witness-jump
+            // torque spikes when the max-penetration primitive switches between facets.
+            const double invA = 1.0 / patchArea;
+            finalContactPoints[idx] = make_double3(acc.sumAreaWeightedCP.x * invA,
+                                                   acc.sumAreaWeightedCP.y * invA,
+                                                   acc.sumAreaWeightedCP.z * invA);
         } else {
-            // Zero-area case: fallback to max-penetration primitive's results
             finalAreas[idx] = 0.0;
             finalNormals[idx] = zeroAreaNormals[idx];
             finalPenetrations[idx] = zeroAreaPenetrations[idx];
@@ -440,100 +1076,8 @@ void finalizePatchResultsFromAccumulators(const PatchContactAccum* patchAccumula
     size_t blocks_needed = (count + DEME_MAX_THREADS_PER_BLOCK - 1) / DEME_MAX_THREADS_PER_BLOCK;
     if (blocks_needed > 0) {
         finalizePatchResultsFromAccumulators_impl<<<blocks_needed, DEME_MAX_THREADS_PER_BLOCK, 0, this_stream>>>(
-            patchAccumulators, votedNormals, zeroAreaNormals, zeroAreaPenetrations, zeroAreaContactPoints,
-            finalAreas, finalNormals, finalPenetrations, finalContactPoints, count);
-    }
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Penetration depth computation kernels for mesh contact correction
-////////////////////////////////////////////////////////////////////////////////
-
-// Kernel to compute weighted useful penetration for each primitive contact
-// The "useful" penetration is the original penetration projected onto the voted normal.
-// If the projection makes penetration negative (tangential contact), it's clamped to 0.
-// Each primitive's useful penetration is then weighted by its contact area.
-__global__ void computeWeightedUsefulPenetration_impl(DEMDataDT* granData,
-                                                      float3* votedNormals,
-                                                      contactPairs_t* keys,
-                                                      double* areas,
-                                                      double* projectedPenetrations,
-                                                      double* projectedAreas,
-                                                      contactPairs_t startOffsetPrimitive,
-                                                      contactPairs_t startOffsetPatch,
-                                                      contactPairs_t count) {
-    contactPairs_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < count) {
-        contactPairs_t myContactID = startOffsetPrimitive + idx;
-
-        // Get the patch pair index for this primitive (absolute index)
-        contactPairs_t patchIdx = keys[idx];
-
-        // Get the voted normalized normal for this patch pair
-        // Subtract startOffsetPatch to get the local index into votedNormals
-        contactPairs_t localPatchIdx = patchIdx - startOffsetPatch;
-        float3 votedNormal = votedNormals[localPatchIdx];
-        // If voted normal is (0,0,0), meaning all primitive contacts agree on no contact, then the end result must be
-        // 0, no special handling needed
-
-        // Get the original contact normal (stored in contactForces during primitive force calc)
-        float3 originalNormal = granData->contactForces[myContactID];
-
-        // Get the original penetration depth from contactPointGeometryA (stored as double in float3)
-        float3 penetrationStorage = granData->contactPointGeometryA[myContactID];
-        double originalPenetration = float3StorageToDouble(penetrationStorage);
-        // Negative penetration does not participate
-        if (originalPenetration <= 0.0) {
-            originalPenetration = 0.0;
-        }
-
-        // Get the contact area from storage that is not yet freed. Note the index is idx not myContactID, as areas is a
-        // type-specific vector.
-        double area = areas[idx];
-
-        // Compute the projected penetration and area by projecting onto the voted normal
-        // Projected penetration: originalPenetration * dot(originalNormal, votedNormal)
-        // Projected area: area * dot(originalNormal, votedNormal)
-        // If dot product is negative (opposite directions), set both to 0
-        float dotProduct = dot(originalNormal, votedNormal);
-        double projectedPenetration = originalPenetration * (double)dotProduct;
-        double projectedArea = area * (double)dotProduct;
-
-        // If projected values becomes negative, set both area and penetration to 0
-        if (projectedPenetration <= 0.0) {
-            projectedPenetration = 0.0;
-        }
-        if (projectedArea <= 0.0) {
-            projectedArea = 0.0;
-        }
-
-        projectedPenetrations[idx] = projectedPenetration;
-        projectedAreas[idx] = projectedArea;
-
-        // printf(
-        //     "voted normal: (%f, %f, %f), original normal: (%f, %f, %f), original pen: %f, dot: %f, projected pen: %f,
-        //     " "area: %f, projected area: %f\n", votedNormal.x, votedNormal.y, votedNormal.z, originalNormal.x,
-        //     originalNormal.y, originalNormal.z, originalPenetration, dotProduct, projectedPenetration, area,
-        //     projectedArea);
-    }
-}
-
-void computeWeightedUsefulPenetration(DEMDataDT* granData,
-                                      float3* votedNormals,
-                                      contactPairs_t* keys,
-                                      double* areas,
-                                      double* projectedPenetrations,
-                                      double* projectedAreas,
-                                      contactPairs_t startOffsetPrimitive,
-                                      contactPairs_t startOffsetPatch,
-                                      contactPairs_t count,
-                                      cudaStream_t& this_stream) {
-    size_t blocks_needed = (count + DEME_MAX_THREADS_PER_BLOCK - 1) / DEME_MAX_THREADS_PER_BLOCK;
-    if (blocks_needed > 0) {
-        computeWeightedUsefulPenetration_impl<<<blocks_needed, DEME_MAX_THREADS_PER_BLOCK, 0, this_stream>>>(
-            granData, votedNormals, keys, areas, projectedPenetrations, projectedAreas, startOffsetPrimitive,
-            startOffsetPatch, count);
-
+            patchAccumulators, votedNormals, zeroAreaNormals, zeroAreaPenetrations, zeroAreaContactPoints, finalAreas,
+            finalNormals, finalPenetrations, finalContactPoints, count);
     }
 }
 
@@ -582,11 +1126,15 @@ __global__ void findMaxPenetrationPrimitiveForZeroAreaPatches_impl(DEMDataDT* gr
                                                                    contactPairs_t* keys,
                                                                    contactPairs_t startOffsetPrimitive,
                                                                    contactPairs_t startOffsetPatch,
+                                                                   contactPairs_t countPatch,
                                                                    contactPairs_t countPrimitive) {
     contactPairs_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < countPrimitive) {
         contactPairs_t myContactID = startOffsetPrimitive + idx;
         contactPairs_t patchIdx = keys[idx];
+        if (patchIdx < startOffsetPatch || patchIdx >= startOffsetPatch + countPatch) {
+            return;
+        }
         contactPairs_t localPatchIdx = patchIdx - startOffsetPatch;
 
         // In fact, we just need to proceed if area is zero. But these no-contact cases are so
@@ -630,6 +1178,7 @@ void findMaxPenetrationPrimitiveForZeroAreaPatches(DEMDataDT* granData,
                                                    contactPairs_t* keys,
                                                    contactPairs_t startOffsetPrimitive,
                                                    contactPairs_t startOffsetPatch,
+                                                   contactPairs_t countPatch,
                                                    contactPairs_t countPrimitive,
                                                    cudaStream_t& this_stream) {
     size_t blocks_needed = (countPrimitive + DEME_MAX_THREADS_PER_BLOCK - 1) / DEME_MAX_THREADS_PER_BLOCK;
@@ -637,7 +1186,7 @@ void findMaxPenetrationPrimitiveForZeroAreaPatches(DEMDataDT* granData,
         findMaxPenetrationPrimitiveForZeroAreaPatches_impl<<<blocks_needed, DEME_MAX_THREADS_PER_BLOCK, 0,
                                                              this_stream>>>(
             granData, maxPenetrations, zeroAreaNormals, zeroAreaPenetrations, zeroAreaContactPoints, keys,
-            startOffsetPrimitive, startOffsetPatch, countPrimitive);
+            startOffsetPrimitive, startOffsetPatch, countPatch, countPrimitive);
     }
 }
 
@@ -695,54 +1244,6 @@ void finalizePatchResults(double* totalProjectedAreas,
             totalProjectedAreas, votedNormals, votedPenetrations, votedContactPoints, zeroAreaNormals,
             zeroAreaPenetrations, zeroAreaContactPoints, finalAreas, finalNormals, finalPenetrations,
             finalContactPoints, count);
-    }
-}
-
-// Kernel to compute weighted contact points for each primitive contact
-// The weight is: projected_penetration * projected_area
-// This prepares data for reduction to get patch-based contact points
-__global__ void computeWeightedContactPoints_impl(DEMDataDT* granData,
-                                                  double3* weightedContactPoints,
-                                                  double* weights,
-                                                  double* projectedPenetrations,
-                                                  double* projectedAreas,
-                                                  contactPairs_t startOffsetPrimitive,
-                                                  contactPairs_t count) {
-    contactPairs_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < count) {
-        contactPairs_t myContactID = startOffsetPrimitive + idx;
-
-        // Get the contact point from contactTorque_convToForce (stored as float3)
-        double3 contactPoint = to_double3(granData->contactTorque_convToForce[myContactID]);
-
-        // Get the projected penetration and area
-        double penetration = projectedPenetrations[idx];
-        double area = projectedAreas[idx];
-
-        // Compute weight = projected_penetration * projected_area
-        double weight = penetration * area;
-
-        // Compute weighted contact point (multiply each component by weight)
-        weightedContactPoints[idx] = contactPoint * weight;
-
-        // Store weight for later normalization
-        weights[idx] = weight;
-    }
-}
-
-void computeWeightedContactPoints(DEMDataDT* granData,
-                                  double3* weightedContactPoints,
-                                  double* weights,
-                                  double* projectedPenetrations,
-                                  double* projectedAreas,
-                                  contactPairs_t startOffsetPrimitive,
-                                  contactPairs_t count,
-                                  cudaStream_t& this_stream) {
-    size_t blocks_needed = (count + DEME_MAX_THREADS_PER_BLOCK - 1) / DEME_MAX_THREADS_PER_BLOCK;
-    if (blocks_needed > 0) {
-        computeWeightedContactPoints_impl<<<blocks_needed, DEME_MAX_THREADS_PER_BLOCK, 0, this_stream>>>(
-            granData, weightedContactPoints, weights, projectedPenetrations, projectedAreas, startOffsetPrimitive,
-            count);
     }
 }
 
@@ -942,29 +1443,30 @@ __global__ void accumulateTrianglePVFromPatchContacts_impl(const DEMSimParams* s
                                                            DEMDataDT* granData,
                                                            const contactPairs_t* keys,
                                                            const PatchContactAccum* primitiveAccumulators,
-                                                           const PatchContactAccum* patchAccumulators,
+                                                           const double* finalPatchAreas,
                                                            const float* patchNormalForce,
                                                            const float* patchSlipSpeed,
                                                            contactPairs_t startOffsetPrimitive,
                                                            contactPairs_t startOffsetPatch,
+                                                           contactPairs_t countPatch,
                                                            contactPairs_t countPrimitive,
                                                            const int* triGlobalToLocal,
                                                            float* triAccumP,
                                                            float* triAccumPV) {
     contactPairs_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= countPrimitive || !triGlobalToLocal || !triAccumP || !triAccumPV) {
+    if (idx >= countPrimitive || !triGlobalToLocal || !triAccumP || !triAccumPV || !finalPatchAreas) {
         return;
     }
 
     const contactPairs_t primContactID = startOffsetPrimitive + idx;
     const contactPairs_t patchContactID = keys[idx];
-    if (patchContactID < startOffsetPatch) {
+    if (patchContactID < startOffsetPatch || patchContactID >= startOffsetPatch + countPatch) {
         return;
     }
     const contactPairs_t localPatchIdx = patchContactID - startOffsetPatch;
 
-    const double patchWeight = patchAccumulators[localPatchIdx].sumWeight;
-    const double primitiveWeight = primitiveAccumulators[idx].sumWeight;
+    const double patchWeight = finalPatchAreas[localPatchIdx];
+    const double primitiveWeight = primitiveAccumulators[idx].sumProjArea;
     if (patchWeight <= 0.0 || primitiveWeight <= 0.0) {
         return;
     }
@@ -1020,11 +1522,12 @@ void accumulateTrianglePVFromPatchContacts(DEMSimParams* simParams,
                                            DEMDataDT* granData,
                                            const contactPairs_t* keys,
                                            const PatchContactAccum* primitiveAccumulators,
-                                           const PatchContactAccum* patchAccumulators,
+                                           const double* finalPatchAreas,
                                            const float* patchNormalForce,
                                            const float* patchSlipSpeed,
                                            contactPairs_t startOffsetPrimitive,
                                            contactPairs_t startOffsetPatch,
+                                           contactPairs_t countPatch,
                                            contactPairs_t countPrimitive,
                                            const int* triGlobalToLocal,
                                            float* triAccumP,
@@ -1033,8 +1536,8 @@ void accumulateTrianglePVFromPatchContacts(DEMSimParams* simParams,
     size_t blocks_needed = (countPrimitive + DEME_MAX_THREADS_PER_BLOCK - 1) / DEME_MAX_THREADS_PER_BLOCK;
     if (blocks_needed > 0) {
         accumulateTrianglePVFromPatchContacts_impl<<<blocks_needed, DEME_MAX_THREADS_PER_BLOCK, 0, this_stream>>>(
-            simParams, granData, keys, primitiveAccumulators, patchAccumulators, patchNormalForce, patchSlipSpeed,
-            startOffsetPrimitive, startOffsetPatch, countPrimitive, triGlobalToLocal, triAccumP, triAccumPV);
+            simParams, granData, keys, primitiveAccumulators, finalPatchAreas, patchNormalForce, patchSlipSpeed,
+            startOffsetPrimitive, startOffsetPatch, countPatch, countPrimitive, triGlobalToLocal, triAccumP, triAccumPV);
     }
 }
 
@@ -1112,11 +1615,12 @@ __global__ void rearrangeContactWildcards_impl(DEMDataDT* granData,
                                                float* newWildcards,
                                                notStupidBool_t* sentry,
                                                unsigned int nWildcards,
+                                               size_t nPrevContactPairs,
                                                size_t nContactPairs) {
     size_t myID = blockIdx.x * blockDim.x + threadIdx.x;
     if (myID < nContactPairs) {
         contactPairs_t map_from = granData->contactMapping[myID];
-        if (map_from == NULL_MAPPING_PARTNER) {
+        if (map_from == NULL_MAPPING_PARTNER || map_from >= nPrevContactPairs) {
             // If it is a NULL ID then kT says this contact is new. Initialize all wildcard arrays.
             for (size_t i = 0; i < nWildcards; i++) {
                 newWildcards[nContactPairs * i + myID] = 0;
@@ -1136,12 +1640,13 @@ void rearrangeContactWildcards(DEMDataDT* granData,
                                float* wildcard,
                                notStupidBool_t* sentry,
                                unsigned int nWildcards,
+                               size_t nPrevContactPairs,
                                size_t nContactPairs,
                                cudaStream_t& this_stream) {
     size_t blocks_needed = (nContactPairs + DEME_MAX_THREADS_PER_BLOCK - 1) / DEME_MAX_THREADS_PER_BLOCK;
     if (blocks_needed > 0) {
         rearrangeContactWildcards_impl<<<blocks_needed, DEME_MAX_THREADS_PER_BLOCK, 0, this_stream>>>(
-            granData, wildcard, sentry, nWildcards, nContactPairs);
+            granData, wildcard, sentry, nWildcards, nPrevContactPairs, nContactPairs);
     }
 }
 
