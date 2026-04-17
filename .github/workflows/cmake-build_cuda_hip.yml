@@ -2,9 +2,7 @@ name: CMake CUDA/HIP compile matrix
 
 on:
   push:
-    branches: [ main, master, develop ]
   pull_request:
-    branches: [ main, master, develop ]
   workflow_dispatch:
 
 concurrency:
@@ -66,7 +64,12 @@ jobs:
         run: |
           set -euo pipefail
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends             build-essential             cmake             ninja-build             git             pkg-config
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            git \
+            pkg-config
 
       - name: Show toolchain
         shell: bash
@@ -79,7 +82,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cmake -S . -B build             -G Ninja             -DCMAKE_BUILD_TYPE=${BUILD_TYPE}             -DDEME_GPU_BACKEND=CUDA
+          cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
+            -DDEME_GPU_BACKEND=CUDA
 
       - name: Build
         shell: bash
@@ -97,7 +103,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # CDNA / HPC
           - rocm: '7.2'
             image: 'rocm/dev-ubuntu-24.04:7.2-complete'
             arch: 'gfx90a'
@@ -110,8 +115,6 @@ jobs:
           - rocm: '7.2.1'
             image: 'rocm/dev-ubuntu-24.04:7.2.1-complete'
             arch: 'gfx942'
-
-          # RDNA3 / workstation + newer Radeon
           - rocm: '7.2'
             image: 'rocm/dev-ubuntu-24.04:7.2-complete'
             arch: 'gfx1100'
@@ -146,7 +149,12 @@ jobs:
         run: |
           set -euo pipefail
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends             build-essential             cmake             ninja-build             git             pkg-config
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            git \
+            pkg-config
 
       - name: Show toolchain
         shell: bash
@@ -161,7 +169,14 @@ jobs:
           ROCM_PATH: /opt/rocm
         run: |
           set -euo pipefail
-          cmake -S . -B build             -G Ninja             -DCMAKE_BUILD_TYPE=${BUILD_TYPE}             -DDEME_GPU_BACKEND=HIP             -DDEME_ROCM_ROOT=/opt/rocm             -DDEME_HIP_ARCH=${{ matrix.arch }}             -DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm             -DCMAKE_HIP_PLATFORM=amd
+          cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
+            -DDEME_GPU_BACKEND=HIP \
+            -DDEME_ROCM_ROOT=/opt/rocm \
+            -DDEME_HIP_ARCH=${{ matrix.arch }} \
+            -DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm \
+            -DCMAKE_HIP_PLATFORM=amd
 
       - name: Build
         shell: bash
