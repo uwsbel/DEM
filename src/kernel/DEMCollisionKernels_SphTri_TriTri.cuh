@@ -1027,33 +1027,44 @@ Output:
 A return value of "true" signals collision.
 */
 template <typename T1, typename T2>
-__device__ bool checkTriSphereOverlap_directional(const T1& A,           ///< First vertex of the triangle
+__device__ __forceinline__ bool checkTriSphereOverlap_directional(const T1& A,           ///< First vertex of the triangle
                                                   const T1& B,           ///< Second vertex of the triangle
                                                   const T1& C,           ///< Third vertex of the triangle
                                                   const T1& sphere_pos,  ///< Location of the center of the sphere
                                                   const T2 radius,       ///< Sphere radius
                                                   T1& normal,            ///< contact normal
                                                   T2& depth,             ///< penetration (positive if in contact)
+                                                  T2& overlapArea,       ///< overlap area
                                                   T1& pt1                ///< contact point on triangle
 ) {
     // Directional law:
     // - Face witness: oriented one-sided barrier depth (radius - signed height), normal fixed to face normal.
     // - Edge/vertex witness: geometric closest-point depth, but prefer oriented face support when active.
     // This maintains outward recovery when the center drifts behind the local face.
-    const T1 face_n = normalize(cross(B - A, C - A));
+
+    const T1 AB = B - A;
+    const T1 AC = C - A;
+    const T1 N = cross(AB, AC);
+    const T2 N2 = dot(N, N);
+
+    T1 face_n = make_one3<T1>(1, 0, 0);
+    if (N2 > (T2)DEME_TINY_FLOAT * (T2)DEME_TINY_FLOAT) {
+        face_n = ((T2)1 / sqrt(N2)) * N;
+    }
 
     T1 faceLoc;
     const bool on_edge = snap_to_face<T1, T2>(A, B, C, sphere_pos, faceLoc);
 
     const T2 h = dot(sphere_pos - faceLoc, face_n);
     const T1 normal_d = sphere_pos - faceLoc;
-    const T2 dist = length(normal_d);
+    const T2 dist2 = dot(normal_d, normal_d);
+    const T2 dist = sqrt(dist2);
     const T2 depth_geom = radius - dist;
     const T2 depth_face = radius - h;
 
     if (!on_edge) {
-            depth = depth_face;
-            normal = face_n;
+        depth = depth_face;
+        normal = face_n;
     } else {
         // Edge/vertex witness:
         // - Outside the oriented face plane (h >= 0): use geometric closest-point contact.
@@ -1079,7 +1090,34 @@ __device__ bool checkTriSphereOverlap_directional(const T1& A,           ///< Fi
     }
 
     pt1 = faceLoc - (depth * (T2)0.5) * normal;
-    return depth > (T2)0;
+
+    if (depth <= (T2)0) {
+        overlapArea = (T2)0;
+        return false;
+    }
+
+    if (N2 <= (T2)DEME_TINY_FLOAT * (T2)DEME_TINY_FLOAT) {
+        overlapArea = (T2)0;
+        return true;
+    }
+
+    const T2 signed_h = dot(sphere_pos - A, face_n);
+    const T2 abs_h = absT(signed_h);
+    if (abs_h >= radius) {
+        overlapArea = (T2)0;
+        return true;
+    }
+
+    const T2 circle_r2 = radius * radius - signed_h * signed_h;
+    if (circle_r2 <= (T2)0) {
+        overlapArea = (T2)0;
+        return true;
+    }
+
+    const T2 circle_r = sqrt(circle_r2);
+    const T1 circle_center = sphere_pos - signed_h * face_n;
+    overlapArea = additive_circle_triangle_area_fast<T1, T2>(A, B, C, circle_center, face_n, circle_r);
+    return true;
 }
 
 // -----------------------------------------------------------------------------
