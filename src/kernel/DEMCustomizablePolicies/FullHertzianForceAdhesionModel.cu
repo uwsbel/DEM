@@ -22,6 +22,7 @@ float dry_pull_off_cnt = 0.f;
 float dry_delta_cnt = 0.f;
 float wet_cap_cnt = 0.f;
 float wet_rupture_cnt = 0.f;
+float wet_rupture_inv_cnt = 0.f;
 {
     // E and nu are associated with each material, so obtain them this way
     float E_A = E[bodyAMatType];
@@ -41,6 +42,7 @@ float wet_rupture_cnt = 0.f;
     dry_delta_cnt = AdhesionDryDistance[bodyAMatType][bodyBMatType];
     wet_cap_cnt = AdhesionWetCap[bodyAMatType][bodyBMatType];
     wet_rupture_cnt = AdhesionWetRupture[bodyAMatType][bodyBMatType];
+    wet_rupture_inv_cnt = AdhesionWetRuptureInv[bodyAMatType][bodyBMatType];
 }
 
 const bool dry_enabled = (dry_pull_off_cnt > DEME_TINY_FLOAT) && (dry_delta_cnt > DEME_TINY_FLOAT);
@@ -90,9 +92,11 @@ if (physical_contact || wet_bridge_live) {
     vrel_tan = velB2A - projection * B2A;
     mass_eff = (AOwnerMass * BOwnerMass) / (AOwnerMass + BOwnerMass);
 
-    // Wet bridge state update. Formation only on physical contact; once formed, it survives into the gap.
+    // Wet bridge state update. Formation only on a closing physical contact; once formed, it survives into the gap.
     if (wet_enabled) {
-        if (physical_contact || wet_bridge_live) {
+        if (wet_bridge_live) {
+            bridge_on = 1.f;
+        } else if (physical_contact && projection <= 0.f) {
             bridge_on = 1.f;
         } else {
             bridge_on = 0.f;
@@ -220,15 +224,25 @@ if (physical_contact || wet_bridge_live) {
         }
     } else {
         // Gap-only wet bridge: no tangential contact history and no dry memory should remain active.
+        // if the current outward normal kinetic energy exceeds the remaining
+        // capillary work of the linear force-gap law, rupture the bridge.
         delta_time = 0.f;
         delta_tan = make_float3(0.f, 0.f, 0.f);
         delta_max = 0.f;
 
         if (wet_enabled && bridge_on > 0.5f) {
             const float gap = -overlapDepth;
-            if (gap < wet_rupture_cnt) {
-                const float wet_ratio = fmaxf(0.f, 1.f - gap / wet_rupture_cnt);
-                force += (-wet_cap_force * wet_ratio) * B2A;
+            const float rem_gap = wet_rupture_cnt - gap;
+            if (rem_gap > 0.f) {
+                const float sep_v = fmaxf(projection, 0.f);
+                const float sep_v2 = sep_v * sep_v;
+                const float cap_work_rem = wet_cap_force * rem_gap * rem_gap * wet_rupture_inv_cnt;
+                if (mass_eff * sep_v2 < cap_work_rem) {
+                    const float wet_ratio = rem_gap * wet_rupture_inv_cnt;
+                    force += (-wet_cap_force * wet_ratio) * B2A;
+                } else {
+                    bridge_on = 0.f;
+                }
             } else {
                 bridge_on = 0.f;
             }

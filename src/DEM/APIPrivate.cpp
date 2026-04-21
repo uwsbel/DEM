@@ -2847,8 +2847,28 @@ inline void DEMSolver::equipMaterials(std::unordered_map<std::string, std::strin
                 materialDefs += "{0}";
             }
             materialDefs += "};\n";
+
+            // API-private derived pair-wise property: reciprocal rupture distance for hot wet-bridge path.
+            if (prop_name == "AdhesionWetRupture") {
+                materialDefs += line_header + std::string("AdhesionWetRuptureInv") + "[][" +
+                                std::to_string(num_mats) + "] = {";
+                for (unsigned int i = 0; i < num_mats; i++) {
+                    materialDefs += "{";
+                    for (unsigned int j = 0; j < num_mats; j++) {
+                        const float rupture = pair_mat[i][j];
+                        const float rupture_inv = (rupture > DEME_TINY_FLOAT) ? (1.f / rupture) : 0.f;
+                        materialDefs += to_string_with_precision(rupture_inv) + ",";
+                    }
+                    materialDefs += "},";
+                }
+                if (num_mats == 0) {
+                    materialDefs += "{0}";
+                }
+                materialDefs += "};\n";
+            }
         }
     }
+
     DEME_DEBUG_PRINTF("Material properties in kernel:");
     DEME_DEBUG_PRINTF("%s", materialDefs.c_str());
     // Try imagining something like this...
