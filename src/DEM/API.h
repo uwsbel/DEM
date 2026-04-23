@@ -753,6 +753,10 @@ class DEMSolver {
     /// @brief Get the device memory usage (in bytes) on dT.
     /// @return Number of bytes.
     size_t GetDeviceMemUsageDynamic() const { return dT->estimateDeviceMemUsage(); }
+    /// @brief Peak device bytes tracked inside DEME-managed device allocations.
+    size_t GetTrackedDevicePeakMemUsage() const { return ::deme::GetTrackedProgramDevicePeakMemoryUsage(); }
+    /// @brief Reset the DEME-managed device-memory peak to the current live value.
+    void ResetTrackedDevicePeakMemUsage() const { ::deme::ResetTrackedProgramDevicePeakMemoryUsage(); }
     /// @brief Get the host memory usage (in bytes) on kT.
     /// @return Number of bytes.
     size_t GetHostMemUsageKinematic() const { return kT->estimateHostMemUsage(); }

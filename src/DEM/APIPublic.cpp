@@ -2020,6 +2020,7 @@ void DEMSolver::ShowMemStats() const {
     DEME_PRINTF("kT device memory usage: %s\n", pretty_format_bytes(GetDeviceMemUsageKinematic()).c_str());
     DEME_PRINTF("dT host memory usage: %s\n", pretty_format_bytes(GetHostMemUsageDynamic()).c_str());
     DEME_PRINTF("dT device memory usage: %s\n", pretty_format_bytes(GetDeviceMemUsageDynamic()).c_str());
+    DEME_PRINTF("DEME-managed device memory peak: %s\n", pretty_format_bytes(GetTrackedDevicePeakMemUsage()).c_str());
     DEME_PRINTF("Reported contacts: %zu\n", GetNumContacts());
     DEME_PRINTF("Avg contacts per primitive: %.7g\n", GetAvgPrimitiveContacts());
 }

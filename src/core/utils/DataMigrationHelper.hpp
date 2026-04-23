@@ -7,6 +7,8 @@
 #define DEME_DATA_MIGRATION_HPP
 
 #include <cassert>
+#include <atomic>
+#include <mutex>
 #include <optional>
 #include <utility>
 #include <unordered_map>
@@ -24,6 +26,67 @@ template <typename T>
 class DeviceArray;
 template <typename T>
 bool swap_device_buffer(DualArray<T>& lhs, DeviceArray<T>& rhs);
+
+namespace detail {
+
+struct ProgramDeviceMemTracker {
+    std::atomic<size_t> live_bytes{0};
+    std::atomic<size_t> peak_bytes{0};
+    std::mutex mutex;
+    std::unordered_map<const void*, size_t> allocations;
+};
+
+inline ProgramDeviceMemTracker& tracked_device_mem() {
+    static ProgramDeviceMemTracker tracker;
+    return tracker;
+}
+
+inline void update_atomic_max(std::atomic<size_t>& target, size_t value) {
+    size_t observed = target.load(std::memory_order_relaxed);
+    while (observed < value &&
+           !target.compare_exchange_weak(observed, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+}
+
+inline void register_device_allocation(const void* ptr, size_t bytes) {
+    if (!ptr || !bytes)
+        return;
+    auto& tracker = tracked_device_mem();
+    {
+        std::lock_guard<std::mutex> lock(tracker.mutex);
+        tracker.allocations[ptr] = bytes;
+    }
+    const size_t live_now = tracker.live_bytes.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+    update_atomic_max(tracker.peak_bytes, live_now);
+}
+
+inline void unregister_device_allocation(const void* ptr) {
+    if (!ptr)
+        return;
+    auto& tracker = tracked_device_mem();
+    size_t bytes = 0;
+    {
+        std::lock_guard<std::mutex> lock(tracker.mutex);
+        auto it = tracker.allocations.find(ptr);
+        if (it != tracker.allocations.end()) {
+            bytes = it->second;
+            tracker.allocations.erase(it);
+        }
+    }
+    if (bytes)
+        tracker.live_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+}
+
+inline size_t get_tracked_program_device_peak_memory_usage() {
+    return tracked_device_mem().peak_bytes.load(std::memory_order_relaxed);
+}
+
+inline void reset_tracked_program_device_peak_memory_usage() {
+    auto& tracker = tracked_device_mem();
+    tracker.peak_bytes.store(tracker.live_bytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
+}
+
+}  // namespace detail
 
 // A to-device memcpy wrapper
 template <typename T>
@@ -53,14 +116,17 @@ inline void DevicePtrDealloc(T*& ptr) {
     cudaPointerAttributes attrib;
     DEME_GPU_CALL(cudaPointerGetAttributes(&attrib, ptr));
 
-    if (attrib.type != cudaMemoryType::cudaMemoryTypeUnregistered)
+    if (attrib.type != cudaMemoryType::cudaMemoryTypeUnregistered) {
+        detail::unregister_device_allocation(ptr);
         DEME_GPU_CALL(cudaFree(ptr));
+    }
 }
 
 // You have to deal with it yourself if ptr is an already-used device pointer
 template <typename T>
 inline void DevicePtrAlloc(T*& ptr, size_t size) {
     DEME_GPU_CALL(cudaMalloc((void**)&ptr, size * sizeof(T)));
+    detail::register_device_allocation(ptr, size * sizeof(T));
 }
 
 template <typename T>
@@ -1227,6 +1293,14 @@ struct XferList {
 };
 
 }  // namespace xfer
+
+inline size_t GetTrackedProgramDevicePeakMemoryUsage() {
+    return detail::get_tracked_program_device_peak_memory_usage();
+}
+
+inline void ResetTrackedProgramDevicePeakMemoryUsage() {
+    detail::reset_tracked_program_device_peak_memory_usage();
+}
 
 }  // namespace deme
 
