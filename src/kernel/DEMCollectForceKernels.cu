@@ -61,6 +61,41 @@ inline __device__ deme::bodyID_t getPatchOwnerSafe(const deme::DEMSimParams* sim
     return deme::NULL_BODYID;
 }
 
+inline __device__ float3 deme_shift_contact_point_primary_frame(const float3& cpAWorld,
+                                                               int cpShiftFromA,
+                                                               const deme::DEMSimParams* simParams) {
+    if (!(simParams->useCylPeriodic && simParams->cylPeriodicSpan > 0.f) || cpShiftFromA == 0) {
+        return cpAWorld;
+    }
+    float cos_theta = 1.f, sin_theta = 0.f, cos_half = 1.f, sin_half = 0.f;
+    cylPeriodicShiftTrig(cpShiftFromA, simParams, cos_theta, sin_theta, cos_half, sin_half);
+    return cylPeriodicRotate(cpAWorld, simParams->cylPeriodicOrigin, simParams->cylPeriodicAxisVec,
+                             simParams->cylPeriodicU, simParams->cylPeriodicV, cos_theta, sin_theta);
+}
+
+inline __device__ float3 deme_reconstruct_local_cp_from_A(const float3& cpAWorld,
+                                                         int cpShiftFromA,
+                                                         const deme::DEMSimParams* simParams,
+                                                         const deme::DEMDataDT* granData,
+                                                         deme::bodyID_t owner) {
+    float3 cpWorld = deme_shift_contact_point_primary_frame(cpAWorld, cpShiftFromA, simParams);
+
+    double3 CoM;
+    voxelIDToPosition<double, deme::voxelID_t, deme::subVoxelPos_t>(
+        CoM.x, CoM.y, CoM.z, granData->voxelID[owner], granData->locX[owner], granData->locY[owner],
+        granData->locZ[owner], simParams->nvXp2, simParams->nvYp2, simParams->voxelSize, simParams->l);
+    CoM.x += simParams->LBFX;
+    CoM.y += simParams->LBFY;
+    CoM.z += simParams->LBFZ;
+
+    float3 local = make_float3(cpWorld.x - static_cast<float>(CoM.x), cpWorld.y - static_cast<float>(CoM.y),
+                               cpWorld.z - static_cast<float>(CoM.z));
+    applyOriQToVector3<float, deme::oriQ_t>(local.x, local.y, local.z, granData->oriQw[owner],
+                                            -granData->oriQx[owner], -granData->oriQy[owner],
+                                            -granData->oriQz[owner]);
+    return local;
+}
+
 // computes a ./ b
 DEME_KERNEL void forceToAcc(deme::DEMSimParams* simParams, deme::DEMDataDT* granData, size_t n) {
     deme::contactPairs_t myID = blockIdx.x * blockDim.x + threadIdx.x;
@@ -95,10 +130,10 @@ DEME_KERNEL void forceToAcc(deme::DEMSimParams* simParams, deme::DEMDataDT* gran
             return;
         }
 
+        int wrapShiftA = ghostA ? (ghostA_neg ? -1 : 1) : 0;
+        int wrapShiftB = ghostB ? (ghostB_neg ? -1 : 1) : 0;
         if (simParams->useCylPeriodic && simParams->cylPeriodicSpan > 0.f) {
-            // Use only the kT ghost flag to rotate forces back to the base-wedge frame.
-            int wrapShiftA = ghostA ? (ghostA_neg ? -1 : 1) : 0;
-            int wrapShiftB = ghostB ? (ghostB_neg ? -1 : 1) : 0;
+            // Use the kT ghost flag plus owner primary-frame offset to rotate forces back to each owner's frame.
             if (granData->ownerCylWrapOffset) {
                 wrapShiftA += granData->ownerCylWrapOffset[ownerA];
                 wrapShiftB += granData->ownerCylWrapOffset[ownerB];
@@ -122,8 +157,10 @@ DEME_KERNEL void forceToAcc(deme::DEMSimParams* simParams, deme::DEMDataDT* gran
             float myMass;
             float3 myMOI;
             const deme::bodyID_t idPatch = idPatchA;
-            const float3 myCntPnt = granData->contactPointGeometryA[myID];
+            const float3 storedCntPntA = granData->contactPointGeometryA[myID];
             const deme::bodyID_t myOwner = ownerA;
+            const float3 myCntPnt =
+                deme_reconstruct_local_cp_from_A(storedCntPntA, 0, simParams, granData, myOwner);
             // Get my mass info from either jitified arrays or global memory
             // Outputs myMass
             // Use an input named exactly `myOwner' which is the id of this owner
@@ -147,20 +184,20 @@ DEME_KERNEL void forceToAcc(deme::DEMSimParams* simParams, deme::DEMDataDT* gran
 
             // Then ang acc
             if (!(bad_vec || bad_cp)) {
-            const deme::oriQ_t myOriQw = granData->oriQw[myOwner];
-            const deme::oriQ_t myOriQx = granData->oriQx[myOwner];
-            const deme::oriQ_t myOriQy = granData->oriQy[myOwner];
-            const deme::oriQ_t myOriQz = granData->oriQz[myOwner];
+                const deme::oriQ_t myOriQw = granData->oriQw[myOwner];
+                const deme::oriQ_t myOriQx = granData->oriQx[myOwner];
+                const deme::oriQ_t myOriQy = granData->oriQy[myOwner];
+                const deme::oriQ_t myOriQz = granData->oriQz[myOwner];
 
-            // torque_inForceForm is usually the contribution of rolling resistance and it contributes to torque only,
-            // not linear velocity
-            float3 myF = (forceA + torqueA);
-            // F is in global frame, but it needs to be in local to coordinate with moi and cntPnt
-            applyOriQToVector3<float, deme::oriQ_t>(myF.x, myF.y, myF.z, myOriQw, -myOriQx, -myOriQy, -myOriQz);
-            const float3 angAcc = cross(myCntPnt, myF) / myMOI;
-            atomicAdd(granData->alphaX + myOwner, angAcc.x);
-            atomicAdd(granData->alphaY + myOwner, angAcc.y);
-            atomicAdd(granData->alphaZ + myOwner, angAcc.z);
+                // torque_inForceForm is usually the contribution of rolling resistance and it contributes to torque only,
+                // not linear velocity
+                float3 myF = (forceA + torqueA);
+                // F is in global frame, but it needs to be in local to coordinate with moi and cntPnt
+                applyOriQToVector3<float, deme::oriQ_t>(myF.x, myF.y, myF.z, myOriQw, -myOriQx, -myOriQy, -myOriQz);
+                const float3 angAcc = cross(myCntPnt, myF) / myMOI;
+                atomicAdd(granData->alphaX + myOwner, angAcc.x);
+                atomicAdd(granData->alphaY + myOwner, angAcc.y);
+                atomicAdd(granData->alphaZ + myOwner, angAcc.z);
             }
         }
 
@@ -169,8 +206,10 @@ DEME_KERNEL void forceToAcc(deme::DEMSimParams* simParams, deme::DEMDataDT* gran
             float myMass;
             float3 myMOI;
             const deme::bodyID_t idPatch = idPatchB;
-            const float3 myCntPnt = granData->contactPointGeometryB[myID];
+            const float3 storedCntPntA = granData->contactPointGeometryA[myID];
             deme::bodyID_t myOwner = ownerB;
+            const float3 myCntPnt = deme_reconstruct_local_cp_from_A(storedCntPntA, wrapShiftA - wrapShiftB,
+                                                                     simParams, granData, myOwner);
 
             // Get my mass info from either jitified arrays or global memory
             // Outputs myMass

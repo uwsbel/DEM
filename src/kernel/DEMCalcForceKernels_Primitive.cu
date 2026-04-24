@@ -1056,6 +1056,8 @@ __device__ __forceinline__ void calculatePrimitiveContactForces_impl(deme::DEMSi
         // Local position of the contact point is always a piece of info we require... regardless of force model
         float3 locCPA = to_float3(contactPnt - AOwnerPos);
         float3 locCPB = to_float3(contactPnt - BOwnerPos);
+        // Final contact output stores one world-space contact point in owner-A's primary frame.
+        double3 contactPntWriteD = contactPnt;
         // Now map this contact point location to bodies' local ref
         applyOriQToVector3<float, deme::oriQ_t>(locCPA.x, locCPA.y, locCPA.z, AOriQ.w, -AOriQ.x, -AOriQ.y, -AOriQ.z);
         applyOriQToVector3<float, deme::oriQ_t>(locCPB.x, locCPB.y, locCPB.z, BOriQ.w, -BOriQ.x, -BOriQ.y, -BOriQ.z);
@@ -1189,6 +1191,7 @@ __device__ __forceinline__ void calculatePrimitiveContactForces_impl(deme::DEMSi
             BOwnerPos = BOwnerPos_orig;
             AOriQ = AOriQ_orig;
             BOriQ = BOriQ_orig;
+            contactPntWriteD = contactPntA;
             locCPA = to_float3(contactPntA - AOwnerPos);
             locCPB = to_float3(contactPntB - BOwnerPos);
             applyOriQToVector3<float, deme::oriQ_t>(locCPA.x, locCPA.y, locCPA.z, AOriQ.w, -AOriQ.x, -AOriQ.y,
@@ -1200,8 +1203,10 @@ __device__ __forceinline__ void calculatePrimitiveContactForces_impl(deme::DEMSi
         if (ContactType == deme::NOT_A_CONTACT) {
             locCPA = make_float3(0.f, 0.f, 0.f);
             locCPB = make_float3(0.f, 0.f, 0.f);
+            contactPntWriteD = make_double3(0.0, 0.0, 0.0);
         }
-        // Write contact location values back to global memory (after periodic wrap correction).
+        const float3 contactPntWrite = to_float3(contactPntWriteD);
+        // Write final contact values back to global memory (after periodic wrap correction).
         _contactInfoWrite_;
 
         // Optionally, the forces can be reduced to acc right here (may be faster)
@@ -1267,23 +1272,31 @@ __device__ __forceinline__ void calculatePrimitiveContactForces_impl(deme::DEMSi
             overlapDepth = -1.0;
             overlapArea = 0.0;
         }
-        // Use contactForces, contactPointGeometryAB to store the contact info for the next
-        // kernel to compute forces. contactForces is used to store the contact normal. contactPointGeometryA is used to
-        // store the (double) contact penetration. contactPointGeometryB is used to store the (double) contact area
-        // contactTorque_convToForce is used to store the contact point position (cast from double3 to float3)
+        // Use two float3 lanes plus two double scalar lanes for the next patch aggregation kernels:
+        // contactForces stores the primitive normal, contactTorque_convToForce stores the primitive contact point,
+        // contactPenetration/contactArea store the scalar payload without the old float3 packing overhead.
 
         // Store contact normal (B2A is already a float3)
         granData->contactForces[myPrimitiveContactID] = B2A;
-        // Store contact penetration depth (double) in contactPointGeometryA (float3)
-        granData->contactPointGeometryA[myPrimitiveContactID] = doubleToFloat3Storage(overlapDepth);
-        // Store contact area (double) in contactPointGeometryB (float3)
-        // If this is not a contact, we store 0.0 in the area, so it has no voting power in the next kernels. Note the
+        const bool scalarSlotValid =
+            granData->contactPenetration && granData->contactArea &&
+            myPrimitiveContactID >= granData->contactScalarOffset &&
+            myPrimitiveContactID < granData->contactScalarOffset + granData->contactScalarCount;
+        if (!scalarSlotValid) {
+            DEME_ABORT_KERNEL(
+                "Mesh primitive contact %u of type %u has no scalar scratch slot: offset=%u count=%u.\n",
+                myPrimitiveContactID, ContactType, granData->contactScalarOffset, granData->contactScalarCount);
+        }
+        const deme::contactPairs_t scalarID = myPrimitiveContactID - granData->contactScalarOffset;
+        // Store contact penetration depth and area in dedicated double scratch lanes.
+        granData->contactPenetration[scalarID] = overlapDepth;
+        // If this is not a contact, store 0.0 in area, so it has no voting power in the next kernels. Note the
         // NOT_A_CONTACT control flow here and in the next few kernels is integrated in areas.
         if (ContactType == deme::TRIANGLE_TRIANGLE_CONTACT) {
-            granData->contactPointGeometryB[myPrimitiveContactID] = doubleToFloat3Storage(0.0);
+            granData->contactArea[scalarID] = 0.0;
         } else {
-            granData->contactPointGeometryB[myPrimitiveContactID] =
-                doubleToFloat3Storage((ContactType == deme::NOT_A_CONTACT || overlapArea <= 0.0) ? 0.0 : overlapArea);
+            granData->contactArea[scalarID] =
+                (ContactType == deme::NOT_A_CONTACT || overlapArea <= 0.0) ? 0.0 : overlapArea;
         }
         // Store contact point (cast from double3 to float3). Could make the following check, but hopefully it's not
         // necessary. if (!isfinite(contactPnt.x) || !isfinite(contactPnt.y) || !isfinite(contactPnt.z)) {

@@ -630,6 +630,9 @@ inline void DEMKinematicThread::sendToTheirBuffer() {
 
     size_t resize_prim = tri_scene_flag ? quantized_contact_capacity(std::max<size_t>(nPrimitive, 1)) : nPrimitive;
     size_t resize_patch = tri_scene_flag ? quantized_contact_capacity(std::max<size_t>(nPatch, 1)) : nPatch;
+    // Producer-side ownership swap is only safe when the receiving buffer can become the next kT workspace.
+    // For non-triangle scenes we grow the dT ping-pong buffer to retained kT capacity.
+    // For triangle scenes that capacity clone costs VRAM, so kT uses copy-to-buffer and dT optimizes receive.
     if (same_dev && allow_output_swap && !tri_scene_flag) {
         resize_prim = DEME_MAX(resize_prim, idPrimitiveA.size());
         resize_prim = DEME_MAX(resize_prim, idPrimitiveB.size());
@@ -665,6 +668,8 @@ inline void DEMKinematicThread::sendToTheirBuffer() {
 
     bool output_swapped = false;
 #ifndef DEME_USE_MANAGED_ARRAYS
+    // Do not producer-swap triangle contact arrays into smaller ping-pong buffers: kT must keep its retained producer
+    // capacity across contact-detection passes. dT may still receive the copied buffer by swapping/direct mapping.
     if (same_dev && allow_output_swap && !tri_scene_flag) {
         output_swapped = swap_device_buffer(idPrimitiveA, dT->idPrimitiveA_buffer[write_idx]);
         output_swapped = swap_device_buffer(idPrimitiveB, dT->idPrimitiveB_buffer[write_idx]) && output_swapped;

@@ -274,8 +274,15 @@ class DEMDynamicThread {
                                                             DeviceArray<contactPairs_t>(&m_approxDeviceBytesUsed)};
     int kt_write_buf = 0;  // which buffer kT writes to next
 
-    // Permanent array for patch contact penetrations (used to compute max tri-tri penetration)
-    DeviceArray<double> finalPenetrations = DeviceArray<double>(&m_approxDeviceBytesUsed);
+    // Raw device arena shared by direct-contact points, mesh primitive scalar scratch, and, when safe,
+    // final world contact points. Mesh primitive pen/area storage is compacted to only mesh-related primitive ranges,
+    // so direct sphere-sphere/sphere-analytical contacts no longer force a separate full contact-point array.
+    DeviceArray<char> contactAuxArena = DeviceArray<char>(&m_approxDeviceBytesUsed);
+    size_t contactScalarStart = 0;
+    size_t contactScalarCount = 0;
+    size_t contactDirectPointLimit = 0;
+    bool contactFinalPointUsesSeparateDeviceArray = true;
+    bool contactFinalPointUsesArena = false;
 
     // Max tri-tri penetration value to be sent to kT
     DualStruct<double> maxTriTriPenetration = DualStruct<double>(0.0);
@@ -454,8 +461,10 @@ class DEMDynamicThread {
     // contact pair-based, meaning we do not know the specs of each contact body, so we can register force only, not
     // torque. Therefore, this vector arises. This force-like torque is in global.
     DualArray<float3> contactTorque_convToForce = DualArray<float3>(&m_approxHostBytesUsed, &m_approxDeviceBytesUsed);
-    // Local position of contact point of contact w.r.t. the reference frame of body A and B
+    // Host mirror for the final world-space contact point (owner-A primary frame). Device storage is either this
+    // DualArray's own device buffer (fallback/mixed-contact mode) or contactAuxArena (40N alias mode).
     DualArray<float3> contactPointGeometryA = DualArray<float3>(&m_approxHostBytesUsed, &m_approxDeviceBytesUsed);
+    // Deprecated/unused device array retained only to avoid a wider ABI/JIT refactor. It is not allocated.
     DualArray<float3> contactPointGeometryB = DualArray<float3>(&m_approxHostBytesUsed, &m_approxDeviceBytesUsed);
     // Wildcard (extra property) arrays associated with contacts and owners
     std::vector<std::unique_ptr<DualArray<float>>> contactWildcards;
@@ -1087,6 +1096,19 @@ class DEMDynamicThread {
         const ContactTypeMap<std::pair<contactPairs_t, contactPairs_t>>& typeStartCountPatchMap,
         const ContactTypeMap<std::vector<std::pair<std::shared_ptr<JitHelper::CachedProgram>, std::string>>>&
             typeKernelMap);
+    inline bool canAliasFinalContactPointWorkspace() const;
+    inline void computeContactWorkspaceLayout(size_t& scalarStart,
+                                              size_t& scalarCount,
+                                              size_t& directPointLimit,
+                                              size_t& finalPointCount) const;
+    inline void getDirectPrimitiveRanges(contactPairs_t& sphSphStart,
+                                         contactPairs_t& sphSphCount,
+                                         contactPairs_t& sphAnalStart,
+                                         contactPairs_t& sphAnalCount) const;
+    inline size_t computeDirectPointLimitExact();
+    inline void resizeContactAuxArena(size_t scalarCount, size_t finalPointCount, size_t directPointLimit);
+    inline void bindPrimitiveContactWorkspace(bool separate_final_points);
+    inline void bindFinalContactPointWorkspace(bool separate_final_points);
     // Update clump-based acceleration array based on sphere-based force array
     void calculateForces();
     // Fold this solver-step's triangle contributions into the current output window.

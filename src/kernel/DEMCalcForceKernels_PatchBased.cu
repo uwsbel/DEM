@@ -754,6 +754,8 @@ __device__ __forceinline__ void calculatePatchContactForces_impl(deme::DEMSimPar
     // design has implications in our new two-step patch-based force calculation algorithm, as we re-use some
     // force-storing arrays for intermediate values.
 
+    // Final contact output stores one world-space contact point in owner-A's primary frame.
+    double3 contactPntWriteD = contactPnt;
     if (simParams->useCylPeriodic && simParams->cylPeriodicSpan > 0.f && (wrapA || wrapB)) {
         double3 contactPntA = contactPnt;
         double3 contactPntB = contactPnt;
@@ -767,6 +769,7 @@ __device__ __forceinline__ void calculatePatchContactForces_impl(deme::DEMSimPar
         BOwnerPos = BOwnerPos_orig;
         AOriQ = AOriQ_orig;
         BOriQ = BOriQ_orig;
+        contactPntWriteD = contactPntA;
         locCPA = to_float3(contactPntA - AOwnerPos);
         locCPB = to_float3(contactPntB - BOwnerPos);
         applyOriQToVector3<float, deme::oriQ_t>(locCPA.x, locCPA.y, locCPA.z, AOriQ.w, -AOriQ.x, -AOriQ.y,
@@ -778,8 +781,10 @@ __device__ __forceinline__ void calculatePatchContactForces_impl(deme::DEMSimPar
     if (ContactType == deme::NOT_A_CONTACT) {
         locCPA = make_float3(0.f, 0.f, 0.f);
         locCPB = make_float3(0.f, 0.f, 0.f);
+        contactPntWriteD = make_double3(0.0, 0.0, 0.0);
     }
-    // Write contact location values back to global memory (after periodic wrap correction).
+    const float3 contactPntWrite = to_float3(contactPntWriteD);
+    // Write final contact values back to global memory (after periodic wrap correction).
     _contactInfoWrite_;
 
     // Optionally, the forces can be reduced to acc right here (may be faster)

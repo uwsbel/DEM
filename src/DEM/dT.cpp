@@ -447,8 +447,15 @@ void DEMDynamicThread::packDataPointers() {
 
     contactForces.bindDevicePointer(&(granData->contactForces));
     contactTorque_convToForce.bindDevicePointer(&(granData->contactTorque_convToForce));
-    contactPointGeometryA.bindDevicePointer(&(granData->contactPointGeometryA));
-    contactPointGeometryB.bindDevicePointer(&(granData->contactPointGeometryB));
+    // Contact point/scalar workspace pointers are phase-bound explicitly by bindPrimitiveContactWorkspace() and
+    // bindFinalContactPointWorkspace(). Do not bind them to DualArray storage here: the 40N path aliases them through
+    // contactAuxArena.
+    granData->contactPointGeometryA = nullptr;
+    granData->contactPointGeometryB = nullptr;
+    granData->contactPenetration = nullptr;
+    granData->contactArea = nullptr;
+    granData->contactScalarOffset = 0;
+    granData->contactScalarCount = 0;
     // granData->contactHistory = contactHistory.data();
     // granData->contactDuration = contactDuration.data();
 
@@ -624,8 +631,7 @@ void DEMDynamicThread::migrateDataToDevice() {
 
     contactForces.toDeviceAsync(streamInfo.stream);
     contactTorque_convToForce.toDeviceAsync(streamInfo.stream);
-    contactPointGeometryA.toDeviceAsync(streamInfo.stream);
-    contactPointGeometryB.toDeviceAsync(streamInfo.stream);
+    // contactPointGeometryA device storage is phase-bound later; contactPointGeometryB is deprecated.
 
     for (unsigned int i = 0; i < simParams->nContactWildcards; i++) {
         contactWildcards[i]->toDeviceAsync(streamInfo.stream);
@@ -734,8 +740,16 @@ void DEMDynamicThread::migrateContactInfoToHost() {
     // Contact results
     contactForces.toHost();
     contactTorque_convToForce.toHost();
-    contactPointGeometryA.toHost();
-    contactPointGeometryB.toHost();
+    // Final contact points may live either in contactPointGeometryA's own device buffer or in contactAuxArena.
+    // Copy only live patch contacts, not host capacity: in the 40N path the arena is sized for the active P.
+    const size_t nLiveContacts = *solverScratchSpace.numContacts;
+    if (nLiveContacts > 0 && granData->contactPointGeometryA) {
+        if (contactPointGeometryA.size() < nLiveContacts) {
+            contactPointGeometryA.resizeHost(nLiveContacts, make_float3(0));
+        }
+        DEME_GPU_CALL(cudaMemcpy(contactPointGeometryA.host(), granData->contactPointGeometryA,
+                                 nLiveContacts * sizeof(float3), cudaMemcpyDeviceToHost));
+    }
     for (unsigned int i = 0; i < simParams->nContactWildcards; i++) {
         contactWildcards[i]->toHost();
     }
@@ -1155,8 +1169,8 @@ void DEMDynamicThread::allocateGPUArrays(size_t nOwnerBodies,
         if (!(solverFlags.useNoContactRecord && simParams->nTriGM == 0)) {
             DEME_DUAL_ARRAY_RESIZE(contactForces, cnt_arr_size, make_float3(0));
             DEME_DUAL_ARRAY_RESIZE(contactTorque_convToForce, cnt_arr_size, make_float3(0));
-            DEME_DUAL_ARRAY_RESIZE(contactPointGeometryA, cnt_arr_size, make_float3(0));
-            DEME_DUAL_ARRAY_RESIZE(contactPointGeometryB, cnt_arr_size, make_float3(0));
+            contactPointGeometryA.resizeHost(cnt_arr_size, make_float3(0));
+            // Contact aux arena is sized lazily in bindPrimitiveContactWorkspace(), after contact type ranges are known.
         }
         // Allocate memory for each wildcard array
         contactWildcards.resize(simParams->nContactWildcards);
@@ -2462,8 +2476,8 @@ std::shared_ptr<ContactInfoContainer> DEMDynamicThread::generateContactInfoFromH
             contactInfo.Get<float3>("Force")[useful_cnt] = forcexyz;
         }
 
-        // Contact point is in local frame. To make it global, first map that vector to axis-aligned global frame, then
-        // add the location of body A CoM
+        // Persisted contact point is world-space in owner-A's primary frame. Reconstruct owner-A local lever arm
+        // on demand so host-side torque queries keep the same physics semantics.
         float4 oriQA;
         float3 CoM, cntPntA, cntPntALocal;
         {
@@ -2482,9 +2496,9 @@ std::shared_ptr<ContactInfoContainer> DEMDynamicThread::generateContactInfoFromH
             CoM.y += simParams->LBFY;
             CoM.z += simParams->LBFZ;
             cntPntA = contactPointGeometryA[i];
-            cntPntALocal = cntPntA;
-            applyOriQToVector3(cntPntA.x, cntPntA.y, cntPntA.z, oriQA.w, oriQA.x, oriQA.y, oriQA.z);
-            cntPntA += CoM;
+            cntPntALocal = cntPntA - CoM;
+            applyOriQToVector3(cntPntALocal.x, cntPntALocal.y, cntPntALocal.z, oriQA.w, -oriQA.x, -oriQA.y,
+                               -oriQA.z);
         }
         if (solverFlags.cntOutFlags & CNT_OUTPUT_CONTENT::CNT_POINT) {
             // oriQ is updated already... whereas the contact point is effectively last step's... That's unfortunate.
@@ -3017,6 +3031,214 @@ void DEMDynamicThread::writeMeshesAsPlyFromHost(std::ofstream& ptFile, bool patc
     ptFile << ostream.str();
 }
 
+
+inline bool DEMDynamicThread::canAliasFinalContactPointWorkspace() const {
+    if (solverFlags.useNoContactRecord && simParams->nTriGM == 0) {
+        return false;
+    }
+
+    // Direct primitive contacts no longer force a fallback: their final contact points live in the front of
+    // contactAuxArena while mesh primitive pen/area scratch is placed after that direct-contact prefix.
+    // The remaining unsafe case is multiple patch-based contact types in one step. Patch force kernels currently write
+    // final contact points type-by-type; writing the first type into the arena would overwrite scalar scratch still
+    // needed by later patch types. Keep a separate final-point buffer for that mixed-patch case.
+    unsigned int active_patch_types = 0;
+    for (const contact_t t : {SPHERE_TRIANGLE_CONTACT, TRIANGLE_TRIANGLE_CONTACT, TRIANGLE_ANALYTICAL_CONTACT}) {
+        auto it = typeStartCountPatchMap.find(t);
+        if (it != typeStartCountPatchMap.end() && it->second.second > 0) {
+            active_patch_types++;
+        }
+    }
+    return active_patch_types <= 1;
+}
+
+namespace {
+inline size_t alignUpSize(size_t value, size_t alignment) {
+    return alignment == 0 ? value : ((value + alignment - 1) / alignment) * alignment;
+}
+}
+
+inline void DEMDynamicThread::computeContactWorkspaceLayout(size_t& scalarStart,
+                                                            size_t& scalarCount,
+                                                            size_t& directPointLimit,
+                                                            size_t& finalPointCount) const {
+    scalarStart = 0;
+    scalarCount = 0;
+    directPointLimit = 0;
+    finalPointCount = *solverScratchSpace.numContacts;
+
+    bool have_scalar_range = false;
+    size_t scalarEnd = 0;
+    for (const contact_t t : {SPHERE_TRIANGLE_CONTACT, TRIANGLE_TRIANGLE_CONTACT, TRIANGLE_ANALYTICAL_CONTACT}) {
+        auto it = typeStartCountPrimitiveMap.find(t);
+        if (it != typeStartCountPrimitiveMap.end() && it->second.second > 0) {
+            const size_t begin = it->second.first;
+            const size_t end = begin + it->second.second;
+            if (!have_scalar_range) {
+                scalarStart = begin;
+                scalarEnd = end;
+                have_scalar_range = true;
+            } else {
+                scalarStart = std::min(scalarStart, begin);
+                scalarEnd = std::max(scalarEnd, end);
+            }
+        }
+    }
+    scalarCount = have_scalar_range ? (scalarEnd - scalarStart) : 0;
+
+    // directPointLimit is filled exactly in bindPrimitiveContactWorkspace() from geomToPatchMap.
+    // Do not infer it from typeStartCountPatchMap: direct patch slots are not guaranteed to be
+    // a contiguous prefix, and underestimating this value lets direct primitive force kernels
+    // overwrite the mesh scalar scratch area in contactAuxArena.
+}
+
+inline void DEMDynamicThread::getDirectPrimitiveRanges(contactPairs_t& sphSphStart,
+                                                       contactPairs_t& sphSphCount,
+                                                       contactPairs_t& sphAnalStart,
+                                                       contactPairs_t& sphAnalCount) const {
+    sphSphStart = 0;
+    sphSphCount = 0;
+    sphAnalStart = 0;
+    sphAnalCount = 0;
+    auto sph_sph = typeStartCountPrimitiveMap.find(SPHERE_SPHERE_CONTACT);
+    if (sph_sph != typeStartCountPrimitiveMap.end() && sph_sph->second.second > 0) {
+        sphSphStart = sph_sph->second.first;
+        sphSphCount = sph_sph->second.second;
+    }
+    auto sph_anal = typeStartCountPrimitiveMap.find(SPHERE_ANALYTICAL_CONTACT);
+    if (sph_anal != typeStartCountPrimitiveMap.end() && sph_anal->second.second > 0) {
+        sphAnalStart = sph_anal->second.first;
+        sphAnalCount = sph_anal->second.second;
+    }
+}
+
+inline size_t DEMDynamicThread::computeDirectPointLimitExact() {
+    contactPairs_t sphSphStart = 0;
+    contactPairs_t sphSphCount = 0;
+    contactPairs_t sphAnalStart = 0;
+    contactPairs_t sphAnalCount = 0;
+    getDirectPrimitiveRanges(sphSphStart, sphSphCount, sphAnalStart, sphAnalCount);
+    if (sphSphCount == 0 && sphAnalCount == 0) {
+        return 0;
+    }
+
+    contactPairs_t* directPointLimitDevice =
+        (contactPairs_t*)solverScratchSpace.allocateTempVector("directPointLimit", sizeof(contactPairs_t));
+    computeDirectContactPointLimit(&granData, directPointLimitDevice, sphSphStart, sphSphCount, sphAnalStart,
+                                   sphAnalCount, streamInfo.stream);
+    contactPairs_t directPointLimitHost = 0;
+    DEME_GPU_CALL(cudaMemcpyAsync(&directPointLimitHost, directPointLimitDevice, sizeof(contactPairs_t),
+                                  cudaMemcpyDeviceToHost, streamInfo.stream));
+    DEME_GPU_CALL(cudaStreamSynchronize(streamInfo.stream));
+    solverScratchSpace.finishUsingTempVector("directPointLimit");
+
+    const size_t finalPointCount = *solverScratchSpace.numContacts;
+    if (directPointLimitHost > finalPointCount) {
+        DEME_ERROR("Direct contact workspace limit %u exceeds live final-contact count %zu.", directPointLimitHost,
+                   finalPointCount);
+    }
+    return static_cast<size_t>(directPointLimitHost);
+}
+
+inline void DEMDynamicThread::resizeContactAuxArena(size_t scalarCount, size_t finalPointCount, size_t directPointLimit) {
+    if (solverFlags.useNoContactRecord && simParams->nTriGM == 0) {
+        return;
+    }
+    const size_t direct_point_bytes = directPointLimit * sizeof(float3);
+    const size_t scalar_offset_bytes = alignUpSize(direct_point_bytes, alignof(double));
+    const size_t primitive_phase_bytes = scalar_offset_bytes + 2 * scalarCount * sizeof(double);
+    const size_t final_point_bytes = finalPointCount * sizeof(float3);
+    const size_t bytes = std::max(primitive_phase_bytes, final_point_bytes);
+    if (bytes > 0) {
+        contactAuxArena.resize(bytes);
+    }
+}
+
+inline void DEMDynamicThread::bindPrimitiveContactWorkspace(bool separate_final_points) {
+    if (solverFlags.useNoContactRecord && simParams->nTriGM == 0) {
+        granData->contactPointGeometryA = nullptr;
+        granData->contactPointGeometryB = nullptr;
+        granData->contactPenetration = nullptr;
+        granData->contactArea = nullptr;
+        granData->contactScalarOffset = 0;
+        granData->contactScalarCount = 0;
+        contactScalarStart = 0;
+        contactScalarCount = 0;
+        contactDirectPointLimit = 0;
+        contactFinalPointUsesSeparateDeviceArray = false;
+        contactFinalPointUsesArena = false;
+        return;
+    }
+
+    size_t finalPointCount = 0;
+    computeContactWorkspaceLayout(contactScalarStart, contactScalarCount, contactDirectPointLimit, finalPointCount);
+    contactDirectPointLimit = separate_final_points ? 0 : computeDirectPointLimitExact();
+    resizeContactAuxArena(contactScalarCount, finalPointCount, contactDirectPointLimit);
+
+    char* arena = contactAuxArena.data();
+    const size_t direct_point_bytes = contactDirectPointLimit * sizeof(float3);
+    const size_t scalar_offset_bytes = alignUpSize(direct_point_bytes, alignof(double));
+    granData->contactScalarOffset = static_cast<contactPairs_t>(contactScalarStart);
+    granData->contactScalarCount = static_cast<contactPairs_t>(contactScalarCount);
+    if (contactScalarCount > 0) {
+        granData->contactPenetration = reinterpret_cast<double*>(arena + scalar_offset_bytes);
+        granData->contactArea = granData->contactPenetration + contactScalarCount;
+    } else {
+        granData->contactPenetration = nullptr;
+        granData->contactArea = nullptr;
+    }
+    granData->contactPointGeometryB = nullptr;
+
+    contactFinalPointUsesSeparateDeviceArray = separate_final_points;
+    contactFinalPointUsesArena = !separate_final_points;
+    if (separate_final_points) {
+        if (contactPointGeometryA.size() < finalPointCount) {
+            contactPointGeometryA.resizeHost(finalPointCount, make_float3(0));
+        }
+        contactPointGeometryA.resizeDevice(finalPointCount);
+        granData->contactPointGeometryA = contactPointGeometryA.device();
+    } else {
+        // Direct contacts write their final point during the primitive force pass. Patch contacts do not write final
+        // points until bindFinalContactPointWorkspace() reuses the whole arena after scalar aggregation is complete.
+        granData->contactPointGeometryA = contactDirectPointLimit > 0 ? reinterpret_cast<float3*>(arena) : nullptr;
+    }
+    granData.toDeviceAsync(streamInfo.stream);
+}
+
+inline void DEMDynamicThread::bindFinalContactPointWorkspace(bool separate_final_points) {
+    if (solverFlags.useNoContactRecord && simParams->nTriGM == 0) {
+        return;
+    }
+    size_t scalarStart = 0;
+    size_t scalarCount = 0;
+    size_t directPointLimit = 0;
+    size_t finalPointCount = 0;
+    computeContactWorkspaceLayout(scalarStart, scalarCount, directPointLimit, finalPointCount);
+    directPointLimit = contactDirectPointLimit;
+    resizeContactAuxArena(scalarCount, finalPointCount, directPointLimit);
+    granData->contactPointGeometryB = nullptr;
+
+    contactFinalPointUsesSeparateDeviceArray = separate_final_points;
+    contactFinalPointUsesArena = !separate_final_points;
+    if (separate_final_points) {
+        // Keep primitive scalar pointers alive: later patch-contact types in the same step may still need them.
+        if (contactPointGeometryA.size() < finalPointCount) {
+            contactPointGeometryA.resizeHost(finalPointCount, make_float3(0));
+        }
+        contactPointGeometryA.resizeDevice(finalPointCount);
+        granData->contactPointGeometryA = contactPointGeometryA.device();
+    } else {
+        // Safe arena mode: all scalar-consuming patch aggregation for this step is complete, so the arena front becomes
+        // the final CP array. Direct-contact CPs already occupy their patch slots in this same array.
+        granData->contactPenetration = nullptr;
+        granData->contactArea = nullptr;
+        granData->contactScalarOffset = 0;
+        granData->contactScalarCount = 0;
+        granData->contactPointGeometryA = reinterpret_cast<float3*>(contactAuxArena.data());
+    }
+    granData.toDeviceAsync(streamInfo.stream);
+}
+
 inline void DEMDynamicThread::contactPrimitivesArraysResize(size_t nContactPairs) {
     DEME_DUAL_ARRAY_RESIZE(idPrimitiveA, nContactPairs, 0);
     DEME_DUAL_ARRAY_RESIZE(idPrimitiveB, nContactPairs, 0);
@@ -3030,8 +3252,7 @@ inline void DEMDynamicThread::contactPrimitivesArraysResize(size_t nContactPairs
     if (!(solverFlags.useNoContactRecord && simParams->nTriGM == 0)) {
         DEME_DUAL_ARRAY_RESIZE(contactForces, nContactPairs, make_float3(0));
         DEME_DUAL_ARRAY_RESIZE(contactTorque_convToForce, nContactPairs, make_float3(0));
-        DEME_DUAL_ARRAY_RESIZE(contactPointGeometryA, nContactPairs, make_float3(0));
-        DEME_DUAL_ARRAY_RESIZE(contactPointGeometryB, nContactPairs, make_float3(0));
+        // Contact aux arena is sized lazily in bindPrimitiveContactWorkspace(), after contact type ranges are known.
     }
 
     // Re-packing pointers now is automatic
@@ -3047,6 +3268,10 @@ inline void DEMDynamicThread::contactPatchArrayResize(size_t nPatchPairs) {
     DEME_DUAL_ARRAY_RESIZE(idPatchB, nPatchPairs, 0);
     DEME_DUAL_ARRAY_RESIZE(contactTypePatch, nPatchPairs, NOT_A_CONTACT);
     DEME_DUAL_ARRAY_RESIZE(contactPatchIsland, nPatchPairs, NULL_BODYID);
+    if (!(solverFlags.useNoContactRecord && simParams->nTriGM == 0)) {
+        contactPointGeometryA.resizeHost(nPatchPairs, make_float3(0));
+        // Contact aux arena is sized lazily in bindPrimitiveContactWorkspace(), after contact type ranges are known.
+    }
 
     // Re-packing pointers to device now is automatic
     // Sync pointers to device can be delayed... we'll only need to do that before kernel calls
@@ -3109,10 +3334,9 @@ inline void DEMDynamicThread::unpackMyBuffer() {
         }
         return !(env[0] == '0' && env[1] == '\0');
     }();
-    const bool tri_scene = triangle_scene(simParams);
     bool swapped = false;
 #ifndef DEME_USE_MANAGED_ARRAYS
-    if (!tri_scene && kT && allow_swap && streamInfo.device == kT->streamInfo.device) {
+    if (kT && allow_swap && streamInfo.device == kT->streamInfo.device) {
         swapped = swap_device_buffer(idPrimitiveA, idPrimitiveA_buffer[read_idx]);
         swapped = swap_device_buffer(idPrimitiveB, idPrimitiveB_buffer[read_idx]) && swapped;
         swapped = swap_device_buffer(contactTypePrimitive, contactTypePrimitive_buffer[read_idx]) && swapped;
@@ -3139,7 +3363,7 @@ inline void DEMDynamicThread::unpackMyBuffer() {
     }
 
     if (!solverFlags.isHistoryless) {
-        if (!tri_scene && kT && allow_direct_mapping && streamInfo.device == kT->streamInfo.device) {
+        if (kT && allow_direct_mapping && streamInfo.device == kT->streamInfo.device) {
             granData->contactMapping = contactMapping_buffer[read_idx].data();
             contactMappingUsesBuffer = true;
         } else {
@@ -3235,8 +3459,7 @@ void DEMDynamicThread::compactTriangleContactStorage(size_t nPrimitivePairs, siz
         if (!(solverFlags.useNoContactRecord && simParams->nTriGM == 0)) {
             compact_dual_array(contactForces, prim_target);
             compact_dual_array(contactTorque_convToForce, prim_target);
-            compact_dual_array(contactPointGeometryA, prim_target);
-            compact_dual_array(contactPointGeometryB, prim_target);
+            // Contact aux arena is sized lazily in bindPrimitiveContactWorkspace(), after contact type ranges are known.
         }
     }
 
@@ -3245,6 +3468,10 @@ void DEMDynamicThread::compactTriangleContactStorage(size_t nPrimitivePairs, siz
         compact_dual_array(idPatchB, patch_target);
         compact_dual_array(contactTypePatch, patch_target);
         compact_dual_array(contactPatchIsland, patch_target);
+        if (!(solverFlags.useNoContactRecord && simParams->nTriGM == 0)) {
+            contactPointGeometryA.resizeHost(patch_target, make_float3(0));
+            // Contact aux arena is sized lazily in bindPrimitiveContactWorkspace(), after contact type ranges are known.
+        }
     }
 
     const int write_idx = kt_write_buf;
@@ -3696,7 +3923,8 @@ inline void DEMDynamicThread::dispatchPatchBasedForceCorrections(
                     (double*)solverScratchSpace.allocateTempVector("finalAreas", countPatch * sizeof(double));
                 float3* finalNormals =
                     (float3*)solverScratchSpace.allocateTempVector("finalNormals", countPatch * sizeof(float3));
-                DEME_DEVICE_ARRAY_RESIZE(finalPenetrations, countPatch);
+                double* finalPenetrations =
+                    (double*)solverScratchSpace.allocateTempVector("finalPenetrations", countPatch * sizeof(double));
                 double3* finalContactPoints =
                     (double3*)solverScratchSpace.allocateTempVector("finalContactPoints", countPatch * sizeof(double3));
 
@@ -3744,7 +3972,7 @@ inline void DEMDynamicThread::dispatchPatchBasedForceCorrections(
 
                     finalizeTriTriLitePatchResults(patchTriTriLiteAccumulators, triTriPatchVotedNormals,
                                                    zeroAreaNormals, zeroAreaPenetrations, zeroAreaContactPoints,
-                                                   finalAreas, finalNormals, finalPenetrations.data(),
+                                                   finalAreas, finalNormals, finalPenetrations,
                                                    finalContactPoints, countPatch, streamInfo.stream);
 
                     solverScratchSpace.finishUsingTempVector("zeroAreaNormals");
@@ -3788,7 +4016,7 @@ inline void DEMDynamicThread::dispatchPatchBasedForceCorrections(
 
                     finalizePatchResultsFromAccumulators(patchContactAccumulators, nullptr, zeroAreaNormals,
                                                          zeroAreaPenetrations, zeroAreaContactPoints, finalAreas,
-                                                         finalNormals, finalPenetrations.data(),
+                                                         finalNormals, finalPenetrations,
                                                          finalContactPoints, countPatch, streamInfo.stream);
 
                 // Clean up temporaries no longer needed past this point.
@@ -3813,6 +4041,10 @@ inline void DEMDynamicThread::dispatchPatchBasedForceCorrections(
                 // displayDeviceFloat3(finalNormals, countPatch);
                 // displayDeviceFloat3<double3>(finalContactPoints, countPatch);
 
+                // Rebind final contact-point storage before patch force kernels write _contactInfoWrite_. In the pure
+                // single patch-type case this aliases contactAuxArena and realizes the 40N resident contact workspace.
+                bindFinalContactPointWorkspace(!canAliasFinalContactPointWorkspace());
+
                 // Call specialized patch-based force correction kernels here
                 if (contactTypePatchKernelMap.count(contact_type) > 0) {
                     const auto& kernelList = contactTypePatchKernelMap.at(contact_type);
@@ -3823,7 +4055,7 @@ inline void DEMDynamicThread::dispatchPatchBasedForceCorrections(
                             progName->kernel(kernelName)
                                 .instantiate()
                                 .configure(dim3(blocks), dim3(DT_FORCE_CALC_NTHREADS_PER_BLOCK), 0, streamInfo.stream)
-                                .launch(&simParams, &granData, finalAreas, finalNormals, finalPenetrations.data(),
+                                .launch(&simParams, &granData, finalAreas, finalNormals, finalPenetrations,
                                         finalContactPoints, startOffsetPatch, countPatch);
                         }
                     }
@@ -3866,7 +4098,7 @@ inline void DEMDynamicThread::dispatchPatchBasedForceCorrections(
                 if (contact_type == TRIANGLE_TRIANGLE_CONTACT && countPatch > 0) {
                     // Compute max penetration and store it on device
                     // Note: penetration values should always be non-negative in physical contacts
-                    cubMaxReduce<double>(finalPenetrations.data(), &maxTriTriPenetration, countPatch, streamInfo.stream,
+                    cubMaxReduce<double>(finalPenetrations, &maxTriTriPenetration, countPatch, streamInfo.stream,
                                          solverScratchSpace);
                     // No toHost() here - keep on device since host never needs it
                     // maxTriTriPenetration.toHost();
@@ -3877,7 +4109,7 @@ inline void DEMDynamicThread::dispatchPatchBasedForceCorrections(
                 // Final clean up
                 solverScratchSpace.finishUsingTempVector("finalAreas");
                 solverScratchSpace.finishUsingTempVector("finalNormals");
-                // Note: finalPenetrations is now a permanent array, not freed here
+                solverScratchSpace.finishUsingTempVector("finalPenetrations");
                 solverScratchSpace.finishUsingTempVector("finalContactPoints");
                 if (triTriPatchVotedNormals) {
                     solverScratchSpace.finishUsingTempVector("triTriPatchVotedNormals");
@@ -3920,6 +4152,12 @@ void DEMDynamicThread::calculateForces() {
     if (nContactPairs > 0) {
         timers.StartGpuTimer("Calculate contact forces", streamInfo.stream);
         DEME_NVTX_RANGE("dT::contactForces");
+
+        // Bind primitive pen/area scratch before the primitive force pass. In pure single patch-type scenes this is
+        // the 40N path: two float3 lanes plus a 16N scalar arena. Mixed direct/multi-patch scenes keep a separate final
+        // contact-point buffer for correctness.
+        const bool separate_final_contact_points = !canAliasFinalContactPointWorkspace();
+        bindPrimitiveContactWorkspace(separate_final_contact_points);
 
         // Call specialized kernels for each contact type that exists
         dispatchPrimitiveForceKernels(typeStartCountPrimitiveMap, contactTypePrimitiveKernelMap);

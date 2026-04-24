@@ -451,8 +451,20 @@ struct DEMDataDT {
     // Some dT's own work array pointers
     float3* contactForces;
     float3* contactTorque_convToForce;
+    // Persisted final contact point in world coordinates, expressed in owner-A's primary frame.
+    // During the primitive pass this can be null; patch/contact-output kernels bind it only once pen/area
+    // scratch is no longer needed.
     float3* contactPointGeometryA;
+    // Deprecated device storage. Kept in DEMDataDT for ABI/JIT compatibility, but intentionally not allocated.
     float3* contactPointGeometryB;
+    // Primitive-contact scalar payloads. These alias a raw contact workspace arena during the primitive/aggregation
+    // phase and are invalid after the workspace is rebound for final contact points.
+    double* contactPenetration;
+    double* contactArea;
+    // Global primitive-contact index corresponding to contactPenetration[0]/contactArea[0].
+    // Only mesh-related primitive contacts have scalar payloads; direct contacts do not need these lanes.
+    contactPairs_t contactScalarOffset;
+    contactPairs_t contactScalarCount;
     // float3* contactHistory;
     // float* contactDuration;
 

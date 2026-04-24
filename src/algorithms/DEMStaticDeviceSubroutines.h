@@ -393,12 +393,23 @@ void finalizePatchResultsFromAccumulators(const PatchContactAccum* patchAccumula
                                           contactPairs_t count,
                                           cudaStream_t& this_stream);
 
-// Extracts primitive penetrations from contactPointGeometryA for max-reduce operation
+// Extracts primitive penetrations from contactPenetration for max-reduce operation
 void extractPrimitivePenetrations(DEMDataDT* granData,
                                   double* penetrations,
                                   contactPairs_t startOffset,
                                   contactPairs_t count,
                                   cudaStream_t& this_stream);
+
+// Computes one plus the maximum patch-contact slot referenced by direct primitive contacts.
+// This sizes the contact-point prefix in the aliased contact workspace exactly; direct
+// patch slots are not assumed to be a contiguous prefix of the patch-contact array.
+void computeDirectContactPointLimit(DEMDataDT* granData,
+                                    contactPairs_t* directPointLimit,
+                                    contactPairs_t sphSphStart,
+                                    contactPairs_t sphSphCount,
+                                    contactPairs_t sphAnalStart,
+                                    contactPairs_t sphAnalCount,
+                                    cudaStream_t& this_stream);
 
 // Finds the primitive with max penetration for zero-area patches and extracts its normal, penetration, and contact
 // point

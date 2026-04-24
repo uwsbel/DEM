@@ -2333,8 +2333,9 @@ inline void DEMSolver::equipForceModel(std::unordered_map<std::string, std::stri
     std::string contact_info_clear_strat = " ";
     if (!no_recording_contact_forces) {
         contact_info_clear_strat =
-            "granData->contactPointGeometryA[myContactID] = make_float3(0,0,0);"
-            "granData->contactPointGeometryB[myContactID] = make_float3(0,0,0);"
+            "if (granData->contactPointGeometryA) granData->contactPointGeometryA[myContactID] = make_float3(0,0,0);"
+            "if (granData->contactPenetration && myContactID >= granData->contactScalarOffset && myContactID < granData->contactScalarOffset + granData->contactScalarCount) granData->contactPenetration[myContactID - granData->contactScalarOffset] = 0.0;"
+            "if (granData->contactArea && myContactID >= granData->contactScalarOffset && myContactID < granData->contactScalarOffset + granData->contactScalarCount) granData->contactArea[myContactID - granData->contactScalarOffset] = 0.0;"
             "granData->contactForces[myContactID] = make_float3(0,0,0);"
             "granData->contactTorque_convToForce[myContactID] = make_float3(0,0,0)";
     }
