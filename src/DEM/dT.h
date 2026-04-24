@@ -1153,6 +1153,8 @@ class DEMDynamicThread {
     void deallocateEverything();
     // The dT-side allocations that can be done at initialization time
     void initAllocation();
+    void registerMemoryLedgerNames();
+    void tryShareStaticGeometryFromKinematic();
 
     // Wildcard setting impl function
     void setFamilyContactWildcardValue_impl(

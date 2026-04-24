@@ -1127,6 +1127,9 @@ void DEMSolver::SetTriNodeRelPos(size_t owner, size_t triID, const std::vector<f
             "%zu nodes, yet the provided vector has length %zu.",
             mesh->GetNumNodes(), new_nodes.size());
     }
+    mesh->SetDeformable(true);
+    dT->solverFlags.meshNodeRelPosImmutable = false;
+    kT->solverFlags.meshNodeRelPosImmutable = false;
     // We actually modify the cached mesh... since it has implications in output
     for (size_t i = 0; i < mesh->GetNumNodes(); i++) {
         mesh->m_vertices[i] = new_nodes[i];
@@ -1136,6 +1139,7 @@ void DEMSolver::SetTriNodeRelPos(size_t owner, size_t triID, const std::vector<f
         new_triangles[i] = mesh->GetTriangle(i);
     }
     dT->setTriNodeRelPos(triID, new_triangles);
+    kT->ensureMeshDeformTransferBuffers();
     dT->solverFlags.willMeshDeform = true;
 
     // kT just receives update from dT, to avoid mem hazards
@@ -1149,6 +1153,9 @@ void DEMSolver::UpdateTriNodeRelPos(size_t owner, size_t triID, const std::vecto
             "%zu nodes, yet the provided vector has length %zu.",
             mesh->GetNumNodes(), updates.size());
     }
+    mesh->SetDeformable(true);
+    dT->solverFlags.meshNodeRelPosImmutable = false;
+    kT->solverFlags.meshNodeRelPosImmutable = false;
     // We actually modify the cached mesh... since it has implications in output
     for (size_t i = 0; i < mesh->GetNumNodes(); i++) {
         mesh->m_vertices[i] += updates[i];
@@ -1160,6 +1167,7 @@ void DEMSolver::UpdateTriNodeRelPos(size_t owner, size_t triID, const std::vecto
     }
     // This is correct to use setTriNodeRelPos, as mesh is already modified in this method
     dT->setTriNodeRelPos(triID, new_triangles);
+    kT->ensureMeshDeformTransferBuffers();
     dT->solverFlags.willMeshDeform = true;
 
     // kT just receives update from dT, to avoid mem hazards
@@ -3811,6 +3819,28 @@ void DEMSolver::ShowThreadCollaborationStats() {
                 (dTkT_InteractionManager->schedulingStats.nTimesDynamicHeldBack).load());
     // DEME_PRINTF("Number of times kinematic held back: %zu\n",
     //             (dTkT_InteractionManager->schedulingStats.nTimesKinematicHeldBack).load());
+    const size_t compact_keep_bytes = detail::safe_scratch_cache_limit_bytes();
+    if (compact_keep_bytes != static_cast<size_t>(-1)) {
+        // This is an externally visible/reporting safe point: synchronize both worker streams before releasing
+        // logically free scratch slots. Do not do this inside the kT/dT producer-consumer hot path.
+        if (kT) {
+            DEME_GPU_CALL(cudaSetDevice(kT->streamInfo.device));
+            DEME_GPU_CALL(cudaStreamSynchronize(kT->streamInfo.stream));
+        }
+        if (dT) {
+            DEME_GPU_CALL(cudaSetDevice(dT->streamInfo.device));
+            DEME_GPU_CALL(cudaStreamSynchronize(dT->streamInfo.stream));
+        }
+        size_t freed = 0;
+        if (kT)
+            freed += kT->solverScratchSpace.trimDeviceVectorCache(compact_keep_bytes);
+        if (dT)
+            freed += dT->solverScratchSpace.trimDeviceVectorCache(compact_keep_bytes);
+        if (freed > 0 && detail::mem_trace_enabled())
+            DEME_PRINTF("Compact safe scratch trim freed %.3f MiB\n", (double)freed / (1024.0 * 1024.0));
+    }
+    detail::dump_memory_ledger_csv("thread_collab_stats");
+    detail::print_memory_ledger_summary();
     DEME_PRINTF("-----------------------------\n");
 }
 

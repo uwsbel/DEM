@@ -1954,6 +1954,20 @@ void DEMSolver::allocateGPUArrays() {
     nTriNeighbors = tri_neighbors;
 
     // Resize arrays based on the statistical data we have
+    bool mesh_nodes_immutable_after_init = true;
+    for (const auto& mesh_obj : cached_mesh_objs) {
+        if (mesh_obj && mesh_obj->CanNodeRelPosDeform()) {
+            mesh_nodes_immutable_after_init = false;
+            break;
+        }
+    }
+    if (!detail::mesh_static_contract_enabled()) {
+        mesh_nodes_immutable_after_init = false;
+    }
+    dT->solverFlags.meshNodeRelPosImmutable = mesh_nodes_immutable_after_init;
+    kT->solverFlags.meshNodeRelPosImmutable = mesh_nodes_immutable_after_init;
+
+
     std::thread dThread = std::move(std::thread([this]() {
         this->dT->allocateGPUArrays(this->nOwnerBodies, this->nOwnerClumps, this->nExtObj, this->nTriMeshes,
                                     this->nSpheresGM, this->nTriGM, this->nTriNeighbors, this->nMeshPatches,
@@ -2036,6 +2050,19 @@ void DEMSolver::updateClumpMeshArrays(size_t nOwners,
     ClumpTemplateFlatten flattened_clump_templates(m_template_clump_mass, m_template_clump_moi, m_template_sp_mat_ids,
                                                    m_template_sp_radii, m_template_sp_relPos, m_template_clump_volume);
 
+    bool mesh_nodes_immutable_after_update = true;
+    for (const auto& mesh_obj : cached_mesh_objs) {
+        if (mesh_obj && mesh_obj->CanNodeRelPosDeform()) {
+            mesh_nodes_immutable_after_update = false;
+            break;
+        }
+    }
+    if (!detail::mesh_static_contract_enabled()) {
+        mesh_nodes_immutable_after_update = false;
+    }
+    dT->solverFlags.meshNodeRelPosImmutable = mesh_nodes_immutable_after_update;
+    kT->solverFlags.meshNodeRelPosImmutable = mesh_nodes_immutable_after_update;
+
     dT->updateClumpMeshArrays(
         // Clump batchs' initial stats
         cached_input_clump_batches,
@@ -2105,6 +2132,12 @@ void DEMSolver::migrateArrayDataToDevice() {
     // Then move DualArray data to device
     dT->migrateDataToDevice();
     kT->migrateDataToDevice();
+
+    // Same-GPU optimization: after the full migration is complete, replace selected dT immutable metadata device
+    // allocations with read-only views of the kT copies. Doing this here is important: if sharing happens before
+    // migrateDataToDevice(), DualArray::toDevice* correctly detaches the view to preserve legacy write semantics, so
+    // no memory is actually saved.
+    dT->tryShareStaticGeometryFromKinematic();
 }
 
 void DEMSolver::migrateArrayDataToHost() {

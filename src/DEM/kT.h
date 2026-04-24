@@ -280,6 +280,8 @@ class DEMKinematicThread {
     friend class DEMSolver;
     friend class DEMDynamicThread;
 
+    void ensureMeshDeformTransferBuffers();
+
     DEMKinematicThread(WorkerReportChannel* pPager, ThreadManager* pSchedSup, const GpuManager::StreamInfo& sInfo)
         : pPagerToMain(pPager), pSchedSupport(pSchedSup), streamInfo(sInfo) {
         pPagerToMain->userCallDone = false;
@@ -526,6 +528,7 @@ class DEMKinematicThread {
     void calibrateParams();
     // The kT-side allocations that can be done at initialization time
     void initAllocation();
+    void registerMemoryLedgerNames();
     // Deallocate everything
     void deallocateEverything();
 

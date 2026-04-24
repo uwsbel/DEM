@@ -469,27 +469,37 @@ inline void DEMKinematicThread::unpackMyBuffer() {
     }
 
     if (solverFlags.willMeshDeform) {
-        bool swapped_mesh = false;
+        const bool mesh_buffers_ready = relPosNode1_buffer.data() && relPosNode2_buffer.data() &&
+                                        relPosNode3_buffer.data() && relPosNode1_buffer.size() >= simParams->nTriGM &&
+                                        relPosNode2_buffer.size() >= simParams->nTriGM &&
+                                        relPosNode3_buffer.size() >= simParams->nTriGM;
+        if (!mesh_buffers_ready) {
+            // Lazy mesh-deform buffers are intentionally absent for static meshes. A stale/deferred flag must not
+            // trigger a null-source device copy; real public deformation entry points allocate these buffers first.
+            solverFlags.willMeshDeform = false;
+        } else {
+            bool swapped_mesh = false;
 #ifndef DEME_USE_MANAGED_ARRAYS
-        if (same_dev) {
-            swapped_mesh = swap_device_buffer(relPosNode1, relPosNode1_buffer);
-            swapped_mesh = swap_device_buffer(relPosNode2, relPosNode2_buffer) && swapped_mesh;
-            swapped_mesh = swap_device_buffer(relPosNode3, relPosNode3_buffer) && swapped_mesh;
-        }
+            if (same_dev) {
+                swapped_mesh = swap_device_buffer(relPosNode1, relPosNode1_buffer);
+                swapped_mesh = swap_device_buffer(relPosNode2, relPosNode2_buffer) && swapped_mesh;
+                swapped_mesh = swap_device_buffer(relPosNode3, relPosNode3_buffer) && swapped_mesh;
+            }
 #endif
-        if (!swapped_mesh) {
-            DEME_GPU_CALL(cudaMemcpyAsync(granData->relPosNode1, relPosNode1_buffer.data(),
-                                          simParams->nTriGM * sizeof(float3), cudaMemcpyDeviceToDevice,
-                                          streamInfo.stream));
-            DEME_GPU_CALL(cudaMemcpyAsync(granData->relPosNode2, relPosNode2_buffer.data(),
-                                          simParams->nTriGM * sizeof(float3), cudaMemcpyDeviceToDevice,
-                                          streamInfo.stream));
-            DEME_GPU_CALL(cudaMemcpyAsync(granData->relPosNode3, relPosNode3_buffer.data(),
-                                          simParams->nTriGM * sizeof(float3), cudaMemcpyDeviceToDevice,
-                                          streamInfo.stream));
+            if (!swapped_mesh) {
+                DEME_GPU_CALL(cudaMemcpyAsync(granData->relPosNode1, relPosNode1_buffer.data(),
+                                              simParams->nTriGM * sizeof(float3), cudaMemcpyDeviceToDevice,
+                                              streamInfo.stream));
+                DEME_GPU_CALL(cudaMemcpyAsync(granData->relPosNode2, relPosNode2_buffer.data(),
+                                              simParams->nTriGM * sizeof(float3), cudaMemcpyDeviceToDevice,
+                                              streamInfo.stream));
+                DEME_GPU_CALL(cudaMemcpyAsync(granData->relPosNode3, relPosNode3_buffer.data(),
+                                              simParams->nTriGM * sizeof(float3), cudaMemcpyDeviceToDevice,
+                                              streamInfo.stream));
+            }
+            solverFlags.willMeshDeform = false;
+            needGranDataDeviceSync = needGranDataDeviceSync || swapped_mesh;
         }
-        solverFlags.willMeshDeform = false;
-        needGranDataDeviceSync = needGranDataDeviceSync || swapped_mesh;
     }
 
     if (needGranDataDeviceSync) {
@@ -852,6 +862,10 @@ void DEMKinematicThread::workerThread() {
             }
             pSchedSupport->schedulingStats.nDynamicUpdates++;
             timers.GetTimer("Send to dT buffer").stop();
+
+            // Compact memory policy: after contact detection has produced the persistent transfer buffers, phase-local
+            // scratch vectors are no longer needed. Trim only free vectors and keep a small cache for reuse.
+            solverScratchSpace.trimDeviceVectorCacheFromEnv();
 
             // std::cout << "kT host mem usage: " << pretty_format_bytes(estimateHostMemUsage()) << std::endl;
             // std::cout << "kT device mem usage: " << pretty_format_bytes(estimateDeviceMemUsage()) << std::endl;
@@ -1224,6 +1238,22 @@ void DEMKinematicThread::setSimParams(unsigned char nvXp2,
     simParams->nGeoWildcards = geo_wildcards.size();
 }
 
+void DEMKinematicThread::ensureMeshDeformTransferBuffers() {
+    if (!dT || simParams->nTriGM == 0)
+        return;
+    const int old_dev = streamInfo.device;
+    DEME_GPU_CALL(cudaSetDevice(dT->streamInfo.device));
+    DEME_DEVICE_ARRAY_RESIZE(relPosNode1_buffer, simParams->nTriGM);
+    DEME_DEVICE_ARRAY_RESIZE(relPosNode2_buffer, simParams->nTriGM);
+    DEME_DEVICE_ARRAY_RESIZE(relPosNode3_buffer, simParams->nTriGM);
+
+    dT->granData->pKTOwnedBuffer_relPosNode1 = relPosNode1_buffer.data();
+    dT->granData->pKTOwnedBuffer_relPosNode2 = relPosNode2_buffer.data();
+    dT->granData->pKTOwnedBuffer_relPosNode3 = relPosNode3_buffer.data();
+    dT->granData.toDeviceAsync(dT->streamInfo.stream);
+    DEME_GPU_CALL(cudaSetDevice(old_dev));
+}
+
 void DEMKinematicThread::allocateGPUArrays(size_t nOwnerBodies,
                                            size_t nOwnerClumps,
                                            unsigned int nExtObj,
@@ -1238,6 +1268,7 @@ void DEMKinematicThread::allocateGPUArrays(size_t nOwnerBodies,
                                            unsigned int nClumpComponents,
                                            unsigned int nJitifiableClumpComponents,
                                            unsigned int nMatTuples) {
+    registerMemoryLedgerNames();
     DEME_GPU_CALL(cudaSetDevice(streamInfo.device));
 
     // Sizes of these arrays
@@ -1309,9 +1340,17 @@ void DEMKinematicThread::allocateGPUArrays(size_t nOwnerBodies,
             DEME_DEVICE_ARRAY_RESIZE(familyID_buffer, nOwnerBodies);
         }
 
-        DEME_DEVICE_ARRAY_RESIZE(relPosNode1_buffer, nTriGM);
-        DEME_DEVICE_ARRAY_RESIZE(relPosNode2_buffer, nTriGM);
-        DEME_DEVICE_ARRAY_RESIZE(relPosNode3_buffer, nTriGM);
+        // Mesh-deformation transfer buffers are needed only for deformable-node meshes. Keep the legacy buffer layout
+        // by default even for immutable meshes, because a prior lazy-buffer default exposed an unrelated illegal access
+        // in triangle-heavy scenes. Users can explicitly test the full immutable-mesh contract saving with
+        // DEME_OMIT_IMMUTABLE_MESH_DEFORM_BUFFERS=1; any later deformation call will allocate these buffers on demand.
+        const bool immutable_mesh_nodes = detail::mesh_static_contract_enabled() && solverFlags.meshNodeRelPosImmutable;
+        const bool always_alloc_mesh_buffers = detail::env_truthy(std::getenv("DEME_ALWAYS_ALLOC_MESH_DEFORM_BUFFERS"));
+        const bool omit_immutable_mesh_buffers = immutable_mesh_nodes && detail::omit_immutable_mesh_deform_buffers_enabled();
+        if (always_alloc_mesh_buffers || (!omit_immutable_mesh_buffers && !detail::lazy_mesh_deform_buffers_enabled())) {
+            ensureMeshDeformTransferBuffers();
+        }
+
 
         // Unset the device change we just did
         DEME_GPU_CALL(cudaSetDevice(streamInfo.device));
@@ -1395,6 +1434,7 @@ void DEMKinematicThread::allocateGPUArrays(size_t nOwnerBodies,
             DEME_DUAL_ARRAY_RESIZE(previous_contactPatchIsland, cnt_arr_size, NULL_BODYID);
         }
     }
+    detail::dump_memory_ledger_csv("kT_init_done");
 }
 
 void DEMKinematicThread::registerPolicies(const std::vector<notStupidBool_t>& family_mask_matrix) {
@@ -1801,7 +1841,107 @@ void DEMKinematicThread::jitifyKernels(const std::unordered_map<std::string, std
     prewarmKernels();
 }
 
+
+void DEMKinematicThread::registerMemoryLedgerNames() {
+#define DEME_KT_MEM(arr, role) arr.setMemoryContext("kT", #arr, role)
+    DEME_KT_MEM(voxelID_buffer, MemoryRole::TransferSnapshot);
+    DEME_KT_MEM(locX_buffer, MemoryRole::TransferSnapshot);
+    DEME_KT_MEM(locY_buffer, MemoryRole::TransferSnapshot);
+    DEME_KT_MEM(locZ_buffer, MemoryRole::TransferSnapshot);
+    DEME_KT_MEM(oriQ0_buffer, MemoryRole::TransferSnapshot);
+    DEME_KT_MEM(oriQ1_buffer, MemoryRole::TransferSnapshot);
+    DEME_KT_MEM(oriQ2_buffer, MemoryRole::TransferSnapshot);
+    DEME_KT_MEM(oriQ3_buffer, MemoryRole::TransferSnapshot);
+    DEME_KT_MEM(familyID_buffer, MemoryRole::TransferSnapshot);
+    DEME_KT_MEM(relPosNode1_buffer, MemoryRole::TransferSnapshot);
+    DEME_KT_MEM(relPosNode2_buffer, MemoryRole::TransferSnapshot);
+    DEME_KT_MEM(relPosNode3_buffer, MemoryRole::TransferSnapshot);
+    DEME_KT_MEM(absVel_buffer, MemoryRole::TransferSnapshot);
+    DEME_KT_MEM(absAngVel_buffer, MemoryRole::TransferSnapshot);
+    DEME_KT_MEM(ownerCylGhostActive_buffer, MemoryRole::TransferSnapshot);
+
+    DEME_KT_MEM(radiiSphere, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(relPosSphereX, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(relPosSphereY, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(relPosSphereZ, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(relPosNode1, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(relPosNode2, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(relPosNode3, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(relPosEntityX, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(relPosEntityY, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(relPosEntityZ, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(oriEntityX, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(oriEntityY, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(oriEntityZ, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(sizeEntity1, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(sizeEntity2, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(sizeEntity3, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(ownerClumpBody, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(ownerTriMesh, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(ownerTriStart, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(ownerTriCount, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(ownerIsBigMesh, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(bigMeshOwners, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(ownerBigMeshLeafStart, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(ownerBigMeshLeafCount, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(bigMeshLeafOwner, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(bigMeshLeafTriStart, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(bigMeshLeafTriCount, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(bigMeshLeafTriIDs, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(bigMeshLeafLocalMin, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(bigMeshLeafLocalMax, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(bigMeshLeafMaxCentroidRadius, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(bigMeshLeafMaxExpandCoeff, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(bigMeshLeafMargin, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(ownerAnalBody, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(ownerMeshConvex, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(ownerMeshNeverWinner, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(triPatchID, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(triNeighborIndex, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(triNeighbor1, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(triNeighbor2, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(triNeighbor3, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(clumpComponentOffset, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(clumpComponentOffsetExt, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(familyMaskMatrix, MemoryRole::StaticReadOnly);
+    DEME_KT_MEM(familyExtraMarginSize, MemoryRole::StaticReadOnly);
+
+    DEME_KT_MEM(voxelID, MemoryRole::PersistentState);
+    DEME_KT_MEM(locX, MemoryRole::PersistentState);
+    DEME_KT_MEM(locY, MemoryRole::PersistentState);
+    DEME_KT_MEM(locZ, MemoryRole::PersistentState);
+    DEME_KT_MEM(oriQw, MemoryRole::PersistentState);
+    DEME_KT_MEM(oriQx, MemoryRole::PersistentState);
+    DEME_KT_MEM(oriQy, MemoryRole::PersistentState);
+    DEME_KT_MEM(oriQz, MemoryRole::PersistentState);
+    DEME_KT_MEM(ownerCylGhostActive, MemoryRole::PersistentState);
+    DEME_KT_MEM(familyID, MemoryRole::PersistentState);
+
+    DEME_KT_MEM(marginSizeSphere, MemoryRole::ContactWorkspace);
+    DEME_KT_MEM(marginSizeAnalytical, MemoryRole::ContactWorkspace);
+    DEME_KT_MEM(marginSizeTriangle, MemoryRole::ContactWorkspace);
+    DEME_KT_MEM(idPrimitiveA, MemoryRole::ContactWorkspace);
+    DEME_KT_MEM(idPrimitiveB, MemoryRole::ContactWorkspace);
+    DEME_KT_MEM(contactTypePrimitive, MemoryRole::ContactWorkspace);
+    DEME_KT_MEM(previous_idPrimitiveA, MemoryRole::ContactWorkspace);
+    DEME_KT_MEM(previous_idPrimitiveB, MemoryRole::ContactWorkspace);
+    DEME_KT_MEM(previous_contactTypePrimitive, MemoryRole::ContactWorkspace);
+    DEME_KT_MEM(contactPersistency, MemoryRole::ContactWorkspace);
+    DEME_KT_MEM(idPatchA, MemoryRole::ContactWorkspace);
+    DEME_KT_MEM(idPatchB, MemoryRole::ContactWorkspace);
+    DEME_KT_MEM(previous_idPatchA, MemoryRole::ContactWorkspace);
+    DEME_KT_MEM(previous_idPatchB, MemoryRole::ContactWorkspace);
+    DEME_KT_MEM(contactTypePatch, MemoryRole::ContactWorkspace);
+    DEME_KT_MEM(previous_contactTypePatch, MemoryRole::ContactWorkspace);
+    DEME_KT_MEM(contactPatchIsland, MemoryRole::ContactWorkspace);
+    DEME_KT_MEM(previous_contactPatchIsland, MemoryRole::ContactWorkspace);
+    DEME_KT_MEM(geomToPatchMap, MemoryRole::ContactWorkspace);
+    DEME_KT_MEM(contactMapping, MemoryRole::ContactWorkspace);
+#undef DEME_KT_MEM
+}
+
 void DEMKinematicThread::initAllocation() {
+    registerMemoryLedgerNames();
     DEME_DUAL_ARRAY_RESIZE(familyExtraMarginSize, NUM_AVAL_FAMILIES, 0);
 }
 
@@ -1822,6 +1962,9 @@ void DEMKinematicThread::setTriNodeRelPos(size_t start, const std::vector<DEMTri
     relPosNode1.toDeviceAsync(streamInfo.stream, start, triangles.size());
     relPosNode2.toDeviceAsync(streamInfo.stream, start, triangles.size());
     relPosNode3.toDeviceAsync(streamInfo.stream, start, triangles.size());
+    // If relPosNode* had been a borrowed immutable view, toDeviceAsync detached it and updated granData host pointers.
+    // Republish the pointer bundle before kernels can use the newly-owned storage.
+    granData.toDeviceAsync(streamInfo.stream);
     syncMemoryTransfer();
 }
 
@@ -1835,6 +1978,7 @@ void DEMKinematicThread::updateTriNodeRelPos(size_t start, const std::vector<DEM
     relPosNode1.toDeviceAsync(streamInfo.stream, start, updates.size());
     relPosNode2.toDeviceAsync(streamInfo.stream, start, updates.size());
     relPosNode3.toDeviceAsync(streamInfo.stream, start, updates.size());
+    granData.toDeviceAsync(streamInfo.stream);
     syncMemoryTransfer();
 }
 

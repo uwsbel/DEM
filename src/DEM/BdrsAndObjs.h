@@ -274,6 +274,13 @@ class DEMExternObj : public DEMInitializer {
     }
 };
 
+/// Local triangle-node mutability contract for mesh objects.
+/// Rigid-node meshes may still move freely or via prescribed owner motion; only relPosNode* is immutable.
+enum class DEMMeshNodeRelPosPolicy {
+    RIGID = 0,
+    DEFORMABLE = 1
+};
+
 // DEM mesh object
 class DEMMesh : public DEMInitializer {
   private:
@@ -382,6 +389,11 @@ class DEMMesh : public DEMInitializer {
     // Physical shell thickness (full thickness, not half-thickness), in simulation length unit.
     float shell_thickness = 0.f;
 
+    // Local triangle-node mutability. Most production meshes are rigid-node objects: they can freely move or follow
+    // prescribed motion through owner pose, while their relPosNode* geometry remains immutable. Deformable-node meshes
+    // must opt out so kT/dT keep independent relPosNode storage and deformation transfer buffers.
+    DEMMeshNodeRelPosPolicy node_rel_pos_policy = DEMMeshNodeRelPosPolicy::RIGID;
+
     DEMMesh() { obj_type = OWNER_TYPE::MESH; }
     DEMMesh(std::string input_file) {
         LoadWavefrontMesh(input_file);
@@ -426,6 +438,20 @@ class DEMMesh : public DEMInitializer {
     void SetNeverWinner(bool never = true) { never_winner = never; }
     /// Query whether this mesh is marked as never-winner.
     bool IsNeverWinner() const { return never_winner; }
+    /// Mark whether this mesh's local triangle nodes may deform after initialization. Rigid-node meshes can still
+    /// translate/rotate freely or through prescribed motion; only their per-triangle relPosNode* geometry is immutable.
+    void SetDeformable(bool deformable = true) {
+        node_rel_pos_policy = deformable ? DEMMeshNodeRelPosPolicy::DEFORMABLE : DEMMeshNodeRelPosPolicy::RIGID;
+    }
+    /// Convenience inverse of SetDeformable.
+    void SetRigid(bool rigid = true) { SetDeformable(!rigid); }
+    /// Explicit policy setter for advanced workflows.
+    void SetNodeRelPosPolicy(DEMMeshNodeRelPosPolicy policy) { node_rel_pos_policy = policy; }
+    /// Query if SetTriNodeRelPos/UpdateTriNodeRelPos style node deformation is expected for this mesh.
+    bool CanNodeRelPosDeform() const { return node_rel_pos_policy == DEMMeshNodeRelPosPolicy::DEFORMABLE; }
+    /// Query if the mesh local-node geometry is immutable after initialization.
+    bool HasImmutableNodeRelPos() const { return !CanNodeRelPosDeform(); }
+
     /// Treat this mesh as a shell surface with finite thickness. Thickness must be finite and non-negative.
     void SetShellThickness(float thickness) {
         if (!std::isfinite(thickness) || thickness < 0.f) {

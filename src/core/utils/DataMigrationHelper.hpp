@@ -7,11 +7,22 @@
 #define DEME_DATA_MIGRATION_HPP
 
 #include <cassert>
+#include <cctype>
+#include <algorithm>
 #include <atomic>
+#include <cstdlib>
+#include <cstdint>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
 #include <mutex>
 #include <optional>
+#include <sstream>
+#include <string>
+#include <typeinfo>
 #include <utility>
 #include <unordered_map>
+#include <vector>
 
 #include "Logger.hpp"
 #include "BaseClasses.hpp"
@@ -19,6 +30,317 @@
 #include "../../DEM/VariableTypes.h"
 
 namespace deme {
+
+
+enum class MemoryRole {
+    Unknown,
+    PersistentState,
+    StaticReadOnly,
+    TransferSnapshot,
+    ContactWorkspace,
+    ScratchTemporary,
+    OutputStaging,
+    BorrowedView
+};
+
+enum class PreserveOnResize {
+    Preserve,
+    Discard
+};
+
+
+inline const char* MemoryRoleName(MemoryRole role) {
+    switch (role) {
+        case MemoryRole::PersistentState: return "PersistentState";
+        case MemoryRole::StaticReadOnly: return "StaticReadOnly";
+        case MemoryRole::TransferSnapshot: return "TransferSnapshot";
+        case MemoryRole::ContactWorkspace: return "ContactWorkspace";
+        case MemoryRole::ScratchTemporary: return "ScratchTemporary";
+        case MemoryRole::OutputStaging: return "OutputStaging";
+        case MemoryRole::BorrowedView: return "BorrowedView";
+        case MemoryRole::Unknown:
+        default: return "Unknown";
+    }
+}
+
+namespace detail {
+
+
+inline bool env_truthy(const char* env) {
+    return env && *env && !(env[0] == '0' && env[1] == '\0') && env[0] != 'f' && env[0] != 'F' && env[0] != 'n' && env[0] != 'N';
+}
+
+inline bool memory_policy_compact() {
+    const char* env = std::getenv("DEME_MEMORY_POLICY");
+    if (!env || !*env)
+        return false;
+    std::string v(env);
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    return v == "compact" || v == "compact_single_gpu" || v == "compactsinglegpu";
+}
+
+inline size_t scratch_cache_limit_bytes() {
+    // Freeing pooled scratch DeviceArrays is not a safe lifetime operation yet: many call sites mark temp vectors
+    // free before all same-stream/consumer-stream uses are globally complete. Retaining those allocations preserves
+    // the legacy behavior. Real scratch decommit must be implemented with scoped arenas/events or VMM pages.
+    const char* enable_trim = std::getenv("DEME_EXPERIMENTAL_SCRATCH_TRIM");
+    if (!env_truthy(enable_trim))
+        return static_cast<size_t>(-1);
+
+    const char* env = std::getenv("DEME_SCRATCH_CACHE_LIMIT_MB");
+    if (env && *env) {
+        char* end = nullptr;
+        double mb = std::strtod(env, &end);
+        if (end != env && mb >= 0.0) {
+            return static_cast<size_t>(mb * 1024.0 * 1024.0);
+        }
+    }
+    // Opt-in experimental trimming only. Throughput and compact modes both keep legacy unlimited caching unless
+    // DEME_EXPERIMENTAL_SCRATCH_TRIM=1 is explicitly set.
+    return 16ull * 1024ull * 1024ull;
+}
+
+inline bool immutable_metadata_share_enabled() {
+    // Conservative same-GPU kT/dT sharing for metadata that is populated during Initialize/Update and then read-only
+    // during dynamics. This is default-on because it only changes dT device pointers to views of kT-owned immutable
+    // arrays when kT and dT run on the same CUDA device. It can be disabled explicitly for A/B testing.
+    if (env_truthy(std::getenv("DEME_DISABLE_KTDT_IMMUTABLE_METADATA_SHARE")))
+        return false;
+    if (env_truthy(std::getenv("DEME_DISABLE_SAFE_STATIC_GEOMETRY_SHARE")))
+        return false;
+
+    // Backward-compatible override: DEME_SHARE_STATIC_GEOMETRY=0 disables all kT/dT sharing, while =1 enables the
+    // broader experimental static-geometry list below in addition to this default immutable metadata set.
+    const char* env = std::getenv("DEME_SHARE_STATIC_GEOMETRY");
+    if (env && *env)
+        return env_truthy(env);
+    return true;
+}
+
+inline bool safe_static_share_enabled() {
+    // Broader static-geometry/template sharing remains opt-in until every writer/update path is proven immutable.
+    // The narrow immutable metadata set above is handled separately and is default-on for same-GPU kT/dT.
+    if (env_truthy(std::getenv("DEME_DISABLE_SAFE_STATIC_GEOMETRY_SHARE")))
+        return false;
+    return env_truthy(std::getenv("DEME_SHARE_STATIC_GEOMETRY"));
+}
+
+inline bool mesh_static_contract_enabled() {
+    // Mesh-node mutability contract. By default mesh local triangle-node positions are considered immutable after
+    // initialization: rigid free-moving meshes and prescribed-motion rigid workpieces move via owner pose, not by
+    // rewriting relPosNode*. Deformable meshes opt out via DEMMesh::SetDeformable(true) or by calling
+    // SetTriNodeRelPos/UpdateTriNodeRelPos, which detaches dT views and allocates transfer buffers on demand.
+    return !env_truthy(std::getenv("DEME_DISABLE_MESH_STATIC_CONTRACT"));
+}
+
+inline bool static_mesh_node_share_enabled() {
+    // The contract-backed relPosNode sharing is default-on for same-GPU kT/dT when all loaded meshes are rigid-node
+    // meshes. Keep the global sharing opt-out semantics: DEME_SHARE_STATIC_GEOMETRY=0 disables all static sharing.
+    if (!mesh_static_contract_enabled())
+        return false;
+    if (env_truthy(std::getenv("DEME_DISABLE_STATIC_MESH_NODE_SHARE")))
+        return false;
+    const char* env = std::getenv("DEME_SHARE_STATIC_GEOMETRY");
+    if (env && *env && !env_truthy(env))
+        return false;
+    return true;
+}
+
+inline bool omit_immutable_mesh_deform_buffers_enabled() {
+    // Omitting relPosNode*_buffer gives another ~3*sizeof(float3)*nTri saving in purely immutable-mesh scenes, but a
+    // previous default-lazy attempt exposed an illegal access in a triangle-heavy demo. Keep buffer omission explicit
+    // until this path has passed broader CUDA validation. The default contract still shares dT relPosNode device
+    // storage, which gives the safe same-GPU VRAM win without changing the legacy kT buffer layout.
+    if (env_truthy(std::getenv("DEME_ALWAYS_ALLOC_MESH_DEFORM_BUFFERS")))
+        return false;
+    return mesh_static_contract_enabled() &&
+           (env_truthy(std::getenv("DEME_OMIT_IMMUTABLE_MESH_DEFORM_BUFFERS")) ||
+            env_truthy(std::getenv("DEME_MESH_STATIC_CONTRACT_STRICT")));
+}
+
+inline bool experimental_share_static_mesh_nodes_enabled() {
+    // relPosNode1/2/3 are large, but some deformation paths treat them as mutable. Keep this off unless the
+    // scene is known to use only static meshes and the user opts in explicitly.
+    return env_truthy(std::getenv("DEME_EXPERIMENTAL_SHARE_STATIC_MESH_NODES"));
+}
+
+inline size_t safe_scratch_cache_limit_bytes() {
+    // Scratch-pool entries marked free are not guaranteed to be true lifetime-dead objects in the current
+    // architecture: some later phases still rely on cached scratch addresses or reclaim-by-pattern behavior.
+    // Therefore physical scratch trimming must be explicit experimental opt-in, not automatic compact mode.
+    // The previous default-on compact trim saved memory but caused illegal accesses in DEMdemo_Testsf before
+    // sph-tri contacts.
+    if (env_truthy(std::getenv("DEME_DISABLE_SAFE_SCRATCH_TRIM")))
+        return static_cast<size_t>(-1);
+    if (!env_truthy(std::getenv("DEME_EXPERIMENTAL_SAFE_SCRATCH_TRIM")) &&
+        !env_truthy(std::getenv("DEME_EXPERIMENTAL_SCRATCH_TRIM")))
+        return static_cast<size_t>(-1);
+    const char* env = std::getenv("DEME_SCRATCH_CACHE_LIMIT_MB");
+    if (env && *env) {
+        char* end = nullptr;
+        double mb = std::strtod(env, &end);
+        if (end != env && mb >= 0.0)
+            return static_cast<size_t>(mb * 1024.0 * 1024.0);
+    }
+    return 16ull * 1024ull * 1024ull;
+}
+
+inline bool lazy_mesh_deform_buffers_enabled() {
+    // The old relPosNode*_buffer allocations appear to mask an existing downstream OOB in some triangle scenes.
+    // Do not remove them by default; keep lazy allocation available only as an explicit experiment.
+    return env_truthy(std::getenv("DEME_EXPERIMENTAL_LAZY_MESH_DEFORM_BUFFERS"));
+}
+
+inline bool mem_trace_enabled() {
+    const char* env = std::getenv("DEME_MEM_TRACE");
+    return env && *env && !(env[0] == '0' && env[1] == '\0');
+}
+
+inline std::string mem_trace_dir() {
+    const char* env = std::getenv("DEME_MEM_TRACE_DIR");
+    return (env && *env) ? std::string(env) : std::string(".");
+}
+
+inline std::string csv_escape(const std::string& s) {
+    bool quote = false;
+    for (char c : s) {
+        if (c == ',' || c == '"' || c == '\n' || c == '\r') {
+            quote = true;
+            break;
+        }
+    }
+    if (!quote)
+        return s;
+    std::string out = "\"";
+    for (char c : s) {
+        if (c == '"')
+            out += "\"\"";
+        else
+            out += c;
+    }
+    out += "\"";
+    return out;
+}
+
+inline std::string sanitize_phase_name(const std::string& phase) {
+    std::string out;
+    out.reserve(phase.size());
+    for (char c : phase) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-')
+            out.push_back(c);
+        else
+            out.push_back('_');
+    }
+    return out.empty() ? std::string("snapshot") : out;
+}
+
+struct MemoryLedgerRecord {
+    const void* array_object = nullptr;
+    std::string owner;
+    std::string name;
+    std::string role;
+    std::string type_name;
+    size_t type_size = 0;
+    size_t logical_bytes = 0;
+    size_t capacity_bytes = 0;
+    size_t committed_bytes = 0;
+    size_t host_bytes = 0;
+    size_t high_water_capacity_bytes = 0;
+    const void* device_ptr = nullptr;
+    bool is_view = false;
+    bool has_host_mirror = false;
+    std::string backend;
+    std::string phase;
+};
+
+struct MemoryLedger {
+    std::mutex mutex;
+    std::unordered_map<const void*, MemoryLedgerRecord> records;
+};
+
+inline MemoryLedger& memory_ledger() {
+    static MemoryLedger ledger;
+    return ledger;
+}
+
+inline void upsert_memory_ledger_record(const MemoryLedgerRecord& rec) {
+    if (!mem_trace_enabled())
+        return;
+    auto& ledger = memory_ledger();
+    std::lock_guard<std::mutex> lock(ledger.mutex);
+    ledger.records[rec.array_object] = rec;
+}
+
+inline void erase_memory_ledger_record(const void* array_object) {
+    if (!mem_trace_enabled())
+        return;
+    auto& ledger = memory_ledger();
+    std::lock_guard<std::mutex> lock(ledger.mutex);
+    ledger.records.erase(array_object);
+}
+
+inline std::vector<MemoryLedgerRecord> memory_ledger_snapshot() {
+    auto& ledger = memory_ledger();
+    std::lock_guard<std::mutex> lock(ledger.mutex);
+    std::vector<MemoryLedgerRecord> out;
+    out.reserve(ledger.records.size());
+    for (const auto& kv : ledger.records)
+        out.push_back(kv.second);
+    std::sort(out.begin(), out.end(), [](const MemoryLedgerRecord& a, const MemoryLedgerRecord& b) {
+        if (a.committed_bytes != b.committed_bytes)
+            return a.committed_bytes > b.committed_bytes;
+        if (a.capacity_bytes != b.capacity_bytes)
+            return a.capacity_bytes > b.capacity_bytes;
+        return a.name < b.name;
+    });
+    return out;
+}
+
+inline void dump_memory_ledger_csv(const std::string& phase) {
+    if (!mem_trace_enabled())
+        return;
+    auto records = memory_ledger_snapshot();
+    const std::string file = mem_trace_dir() + "/memtrace_" + sanitize_phase_name(phase) + ".csv";
+    std::ofstream os(file);
+    if (!os)
+        return;
+    os << "phase,owner,name,role,type_name,type_size,logical_bytes,capacity_bytes,committed_bytes,host_bytes,"
+          "high_water_capacity_bytes,device_ptr,array_object,is_view,has_host_mirror,backend,last_phase\n";
+    for (const auto& r : records) {
+        os << csv_escape(phase) << ',' << csv_escape(r.owner) << ',' << csv_escape(r.name) << ','
+           << csv_escape(r.role) << ',' << csv_escape(r.type_name) << ',' << r.type_size << ',' << r.logical_bytes
+           << ',' << r.capacity_bytes << ',' << r.committed_bytes << ',' << r.host_bytes << ','
+           << r.high_water_capacity_bytes << ',' << r.device_ptr << ',' << r.array_object << ',' << (r.is_view ? 1 : 0)
+           << ',' << (r.has_host_mirror ? 1 : 0) << ',' << csv_escape(r.backend) << ',' << csv_escape(r.phase) << '\n';
+    }
+}
+
+inline void print_memory_ledger_summary(size_t top_n = 30) {
+    if (!mem_trace_enabled())
+        return;
+    auto records = memory_ledger_snapshot();
+    size_t committed = 0, capacity = 0, host = 0, views = 0;
+    for (const auto& r : records) {
+        committed += r.committed_bytes;
+        capacity += r.capacity_bytes;
+        host += r.host_bytes;
+        views += r.is_view ? 1 : 0;
+    }
+    std::cout << "\n~~ DEME MEMORY LEDGER ~~\n";
+    std::cout << "records=" << records.size() << ", views=" << views << ", device_committed=" << committed
+              << ", device_capacity=" << capacity << ", host_mirror=" << host << " bytes\n";
+    std::cout << "Top " << std::min(top_n, records.size()) << " allocations by committed bytes:\n";
+    for (size_t i = 0; i < records.size() && i < top_n; ++i) {
+        const auto& r = records[i];
+        std::cout << "  " << std::setw(2) << i + 1 << ". " << r.owner << ":" << r.name << " role=" << r.role
+                  << " logical=" << r.logical_bytes << " capacity=" << r.capacity_bytes
+                  << " committed=" << r.committed_bytes << " host=" << r.host_bytes
+                  << (r.is_view ? " view" : "") << "\n";
+    }
+    std::cout << "--------------------------\n";
+}
+
+}  // namespace detail
 
 template <typename T>
 class DualArray;
@@ -164,6 +486,35 @@ inline void HostPtrAlloc(T*& ptr, size_t size) {
 
 // Use (void) to silence unused warnings.
 // #define assertm(exp, msg) assert(((void)msg, exp))
+
+
+// Non-owning device pointer plus size/capacity metadata. This is the lightweight role-split primitive used when
+// an array is a borrowed view rather than an allocation owner.
+template <typename T>
+class DeviceView {
+  public:
+    DeviceView() = default;
+    DeviceView(T* ptr, size_t size, size_t capacity = 0) : m_ptr(ptr), m_size(size), m_capacity(capacity ? capacity : size) {}
+
+    void bind(T* ptr, size_t size, size_t capacity = 0) {
+        m_ptr = ptr;
+        m_size = size;
+        m_capacity = capacity ? capacity : size;
+    }
+
+    T* data() { return m_ptr; }
+    const T* data() const { return m_ptr; }
+    T* device() { return m_ptr; }
+    size_t size() const { return m_size; }
+    size_t capacity() const { return m_capacity; }
+    size_t getNumBytes() const { return m_capacity * sizeof(T); }
+    explicit operator bool() const { return m_ptr != nullptr; }
+
+  private:
+    T* m_ptr = nullptr;
+    size_t m_size = 0;
+    size_t m_capacity = 0;
+};
 
 // Used for wrapping data structures so they become usable on GPU.
 // We protect GPU-related data types with NonCopyable, because the device pointers inside these data types are too
@@ -349,6 +700,7 @@ class DualArray : private NonCopyable {
         m_host_vec_ptr->resize(n);
         size_t new_bytes = m_host_vec_ptr->size() * sizeof(T);
         updateHostMemCounter(static_cast<ssize_t>(new_bytes) - static_cast<ssize_t>(old_bytes));
+        recordMemory("resizeHost");
     }
 
     void resizeHost(size_t n, const T& val) {
@@ -357,6 +709,7 @@ class DualArray : private NonCopyable {
         m_host_vec_ptr->resize(n, val);
         size_t new_bytes = m_host_vec_ptr->size() * sizeof(T);
         updateHostMemCounter(static_cast<ssize_t>(new_bytes) - static_cast<ssize_t>(old_bytes));
+        recordMemory("resizeHost");
     }
 
     // m_device_capacity is allocated memory, not array usable data range.
@@ -364,12 +717,14 @@ class DualArray : private NonCopyable {
     // currently views an external DeviceArray, resizeDevice detaches from that
     // borrowed pointer and creates owned storage before returning.
     void resizeDevice(size_t n, bool allow_shrink = false) {
+        if (m_device_owned && !allow_shrink && m_device_capacity >= n) {
+            recordMemory("resizeDevice-reuse");
+            return;
+        }
         if (n == 0) {
             freeDevice();
             return;
         }
-        if (m_device_owned && !allow_shrink && m_device_capacity >= n)
-            return;
 
         T* new_device_ptr = nullptr;
         DevicePtrAlloc(new_device_ptr, n);
@@ -393,6 +748,7 @@ class DualArray : private NonCopyable {
 
         updateDeviceMemCounter(static_cast<ssize_t>(n * sizeof(T)));
         m_device_capacity = n;
+        recordMemory("resizeDevice");
     }
 
     // Borrow an already-owned device buffer without taking ownership. This is used
@@ -408,6 +764,7 @@ class DualArray : private NonCopyable {
         m_device_capacity = capacity;
         m_device_owned = false;
         updateBoundDevicePointer();
+        recordMemory("setDeviceView");
     }
 
     bool isDeviceView() const { return !m_device_owned && m_device_ptr != nullptr; }
@@ -419,6 +776,7 @@ class DualArray : private NonCopyable {
         m_pinned_vec.reset();
         m_host_vec_ptr = nullptr;
         m_host_dirty = false;
+        recordMemory("freeHost");
     }
 
     void freeDevice() {
@@ -430,6 +788,7 @@ class DualArray : private NonCopyable {
         m_device_capacity = 0;
         m_device_owned = true;
         updateBoundDevicePointer();
+        recordMemory("freeDevice");
     }
 
     void free() {
@@ -447,10 +806,14 @@ class DualArray : private NonCopyable {
     }
 
     void toDevice(size_t start, size_t n) {
-        assert(m_host_vec_ptr && m_device_ptr);
-        // Partial flavor aims for speed, no size check
+        assert(m_host_vec_ptr);
+        const size_t need = start + n;
+        if (!m_device_owned || need > m_device_capacity) {
+            resizeDevice(std::max(size(), need));
+        }
         DEME_GPU_CALL(
             cudaMemcpy(m_device_ptr + start, m_host_vec_ptr->data() + start, n * sizeof(T), cudaMemcpyHostToDevice));
+        m_host_dirty = false;
     }
 
     void toDeviceAsync(cudaStream_t& stream) {
@@ -466,26 +829,43 @@ class DualArray : private NonCopyable {
     // And partial update methods...
     // Normally this is preferred when they are used in tracker implementation
     void toDeviceAsync(cudaStream_t& stream, size_t start, size_t n) {
-        assert(m_host_vec_ptr && m_device_ptr);
-        // Partial flavor aims for speed, no size check
+        assert(m_host_vec_ptr);
+        const size_t need = start + n;
+        if (!m_device_owned || need > m_device_capacity) {
+            resizeDevice(std::max(size(), need));
+        }
         DEME_GPU_CALL(cudaMemcpyAsync(m_device_ptr + start, m_host_vec_ptr->data() + start, n * sizeof(T),
                                       cudaMemcpyHostToDevice, stream));
+        m_host_dirty = false;
     }
 
     void toHost() {
         assert(m_device_ptr && m_host_vec_ptr);
+        if (size() > m_device_capacity) {
+            DEME_ERROR("DualArray::toHost would read past device capacity for %s: host size %zu, device capacity %zu",
+                       m_mem_name.c_str(), size(), m_device_capacity);
+        }
         DEME_GPU_CALL(cudaMemcpy(m_host_vec_ptr->data(), m_device_ptr, size() * sizeof(T), cudaMemcpyDeviceToHost));
         m_host_dirty = false;
     }
 
     void toHost(size_t start, size_t n) {
         assert(m_device_ptr && m_host_vec_ptr);
+        if (start + n > m_device_capacity) {
+            DEME_ERROR("DualArray::toHost range would read past device capacity for %s: range [%zu,%zu), device capacity %zu",
+                       m_mem_name.c_str(), start, start + n, m_device_capacity);
+        }
         DEME_GPU_CALL(
             cudaMemcpy(m_host_vec_ptr->data() + start, m_device_ptr + start, n * sizeof(T), cudaMemcpyDeviceToHost));
+        m_host_dirty = false;
     }
 
     void toHostAsync(cudaStream_t& stream) {
         assert(m_host_vec_ptr && m_device_ptr);
+        if (size() > m_device_capacity) {
+            DEME_ERROR("DualArray::toHostAsync would read past device capacity for %s: host size %zu, device capacity %zu",
+                       m_mem_name.c_str(), size(), m_device_capacity);
+        }
         DEME_GPU_CALL(
             cudaMemcpyAsync(m_host_vec_ptr->data(), m_device_ptr, size() * sizeof(T), cudaMemcpyDeviceToHost, stream));
         m_host_dirty = false;
@@ -493,9 +873,13 @@ class DualArray : private NonCopyable {
 
     void toHostAsync(cudaStream_t& stream, size_t start, size_t n) {
         assert(m_host_vec_ptr && m_device_ptr);
-        // Async partial flavor aims for speed, no size check
+        if (start + n > m_device_capacity) {
+            DEME_ERROR("DualArray::toHostAsync range would read past device capacity for %s: range [%zu,%zu), device capacity %zu",
+                       m_mem_name.c_str(), start, start + n, m_device_capacity);
+        }
         DEME_GPU_CALL(cudaMemcpyAsync(m_host_vec_ptr->data() + start, m_device_ptr + start, n * sizeof(T),
                                       cudaMemcpyDeviceToHost, stream));
+        m_host_dirty = false;
     }
 
     T getVal(size_t start) {
@@ -562,6 +946,18 @@ class DualArray : private NonCopyable {
 
     void setHostMemoryCounter(size_t* counter) { m_host_mem_counter = counter; }
     void setDeviceMemoryCounter(size_t* counter) { m_device_mem_counter = counter; }
+
+    void setMemoryContext(const std::string& owner, const std::string& name, MemoryRole role) {
+        m_mem_owner = owner;
+        m_mem_name = name;
+        m_mem_role = role;
+        recordMemory("setMemoryContext");
+    }
+
+    void setMemoryPhase(const std::string& phase) {
+        m_mem_phase = phase;
+        recordMemory(phase);
+    }
     // You can use nullptr to unbind
 
     void attachHostVector(const std::vector<T>* external_vec, bool deep_copy = true) {
@@ -574,6 +970,7 @@ class DualArray : private NonCopyable {
             m_host_vec_ptr = const_cast<PinnedVector*>(reinterpret_cast<const PinnedVector*>(external_vec));
         }
         m_host_dirty = true;
+        recordMemory("attachHostVector");
     }
 
     T& operator[](size_t i) { return (*m_host_vec_ptr)[i]; }
@@ -595,6 +992,12 @@ class DualArray : private NonCopyable {
 
     bool m_host_dirty = false;
 
+    std::string m_mem_owner = "unassigned";
+    std::string m_mem_name;
+    MemoryRole m_mem_role = MemoryRole::Unknown;
+    std::string m_mem_phase = "construct";
+    size_t m_high_water_capacity = 0;
+
     void ensureHostVector(size_t n = 0) {
         if (!m_host_vec_ptr) {
             m_pinned_vec = std::make_unique<PinnedVector>(n);
@@ -605,6 +1008,38 @@ class DualArray : private NonCopyable {
     void updateBoundDevicePointer() {
         if (m_bound_device_ptr)
             *m_bound_device_ptr = m_device_ptr;
+    }
+
+    void recordMemory(const std::string& phase) {
+        if (!detail::mem_trace_enabled())
+            return;
+        m_mem_phase = phase;
+        const size_t host_bytes = m_host_vec_ptr ? m_host_vec_ptr->size() * sizeof(T) : 0;
+        const size_t cap_bytes = m_device_capacity * sizeof(T);
+        m_high_water_capacity = std::max(m_high_water_capacity, cap_bytes);
+        if (!host_bytes && !cap_bytes && !m_device_ptr) {
+            detail::erase_memory_ledger_record(this);
+            return;
+        }
+        detail::MemoryLedgerRecord rec;
+        rec.array_object = this;
+        rec.owner = m_mem_owner;
+        rec.name = m_mem_name.empty() ? (std::string("DualArray<") + typeid(T).name() + ">@" +
+                                         std::to_string(reinterpret_cast<std::uintptr_t>(this))) : m_mem_name;
+        rec.role = MemoryRoleName(m_mem_role);
+        rec.type_name = typeid(T).name();
+        rec.type_size = sizeof(T);
+        rec.logical_bytes = host_bytes;
+        rec.capacity_bytes = cap_bytes;
+        rec.committed_bytes = m_device_owned ? cap_bytes : 0;
+        rec.host_bytes = host_bytes;
+        rec.high_water_capacity_bytes = m_high_water_capacity;
+        rec.device_ptr = m_device_ptr;
+        rec.is_view = !m_device_owned && m_device_ptr != nullptr;
+        rec.has_host_mirror = m_host_vec_ptr != nullptr;
+        rec.backend = m_device_owned ? "legacy" : "view";
+        rec.phase = m_mem_phase;
+        detail::upsert_memory_ledger_record(rec);
     }
 
     void updateHostMemCounter(ssize_t delta) {
@@ -663,6 +1098,7 @@ class DualArray : private NonCopyable {
         size_t new_bytes = m_host_vec_ptr->size() * sizeof(T);
         updateMemCounter(static_cast<ssize_t>(new_bytes) - static_cast<ssize_t>(old_bytes));
         updateBoundDevicePointer();
+        recordMemory("resizeHost");
     }
 
     void resizeHost(size_t n, const T& val) {
@@ -672,6 +1108,7 @@ class DualArray : private NonCopyable {
         size_t new_bytes = m_host_vec_ptr->size() * sizeof(T);
         updateMemCounter(static_cast<ssize_t>(new_bytes) - static_cast<ssize_t>(old_bytes));
         updateBoundDevicePointer();
+        recordMemory("resizeHost");
     }
 
     // m_device_capacity is allocated memory, not array usable data range
@@ -684,6 +1121,7 @@ class DualArray : private NonCopyable {
         m_pinned_vec.reset();
         m_host_vec_ptr = nullptr;
         updateBoundDevicePointer();
+        recordMemory("freeHost");
     }
 
     void freeDevice() {}
@@ -763,6 +1201,18 @@ class DualArray : private NonCopyable {
 
     void setHostMemoryCounter(size_t* counter) { m_host_mem_counter = counter; }
     void setDeviceMemoryCounter(size_t* counter) { m_device_mem_counter = counter; }
+
+    void setMemoryContext(const std::string& owner, const std::string& name, MemoryRole role) {
+        m_mem_owner = owner;
+        m_mem_name = name;
+        m_mem_role = role;
+        recordMemory("setMemoryContext");
+    }
+
+    void setMemoryPhase(const std::string& phase) {
+        m_mem_phase = phase;
+        recordMemory(phase);
+    }
     // You can use nullptr to unbind
 
     T& operator[](size_t i) { return (*m_host_vec_ptr)[i]; }
@@ -780,6 +1230,12 @@ class DualArray : private NonCopyable {
 
     bool m_host_dirty = false;
 
+    std::string m_mem_owner = "unassigned";
+    std::string m_mem_name;
+    MemoryRole m_mem_role = MemoryRole::Unknown;
+    std::string m_mem_phase = "construct";
+    size_t m_high_water_capacity = 0;
+
     void ensureHostVector(size_t n = 0) {
         if (!m_host_vec_ptr) {
             m_pinned_vec = std::make_unique<ManagedVector>(n);
@@ -790,6 +1246,37 @@ class DualArray : private NonCopyable {
     void updateBoundDevicePointer() {
         if (m_bound_device_ptr)
             *m_bound_device_ptr = host();
+    }
+
+    void recordMemory(const std::string& phase) {
+        if (!detail::mem_trace_enabled())
+            return;
+        m_mem_phase = phase;
+        const size_t bytes = m_host_vec_ptr ? m_host_vec_ptr->size() * sizeof(T) : 0;
+        m_high_water_capacity = std::max(m_high_water_capacity, bytes);
+        if (!bytes) {
+            detail::erase_memory_ledger_record(this);
+            return;
+        }
+        detail::MemoryLedgerRecord rec;
+        rec.array_object = this;
+        rec.owner = m_mem_owner;
+        rec.name = m_mem_name.empty() ? (std::string("ManagedDualArray<") + typeid(T).name() + ">@" +
+                                         std::to_string(reinterpret_cast<std::uintptr_t>(this))) : m_mem_name;
+        rec.role = MemoryRoleName(m_mem_role);
+        rec.type_name = typeid(T).name();
+        rec.type_size = sizeof(T);
+        rec.logical_bytes = bytes;
+        rec.capacity_bytes = bytes;
+        rec.committed_bytes = bytes;
+        rec.host_bytes = bytes;
+        rec.high_water_capacity_bytes = m_high_water_capacity;
+        rec.device_ptr = m_host_vec_ptr ? m_host_vec_ptr->data() : nullptr;
+        rec.is_view = false;
+        rec.has_host_mirror = true;
+        rec.backend = "managed";
+        rec.phase = m_mem_phase;
+        detail::upsert_memory_ledger_record(rec);
     }
 
     void updateMemCounter(ssize_t delta) {
@@ -813,15 +1300,27 @@ class DeviceArray : private NonCopyable {
 
     ~DeviceArray() { free(); }
 
-    // In practice, we use device array as temp arrays so we never really resize, let alone preserving existing data
-    void resize(size_t n, bool allow_shrink = false) {
-        if (!allow_shrink && m_capacity >= n)
+    // In practice, we use device array as temp arrays. The default preserves legacy behavior, but scratch/transfer
+    // call sites can explicitly use PreserveOnResize::Discard to avoid a pointless device-to-device copy.
+    void resize(size_t n,
+                bool allow_shrink = false,
+                PreserveOnResize preserve = PreserveOnResize::Preserve) {
+        // Preserve legacy semantics: resize(0) must not free an already allocated scratch buffer unless
+        // the caller explicitly allows shrinking. Some call sites keep bound device pointers valid even
+        // while the logical work count is zero.
+        if (!allow_shrink && m_capacity >= n) {
+            recordMemory("resize-reuse");
             return;
+        }
+        if (n == 0) {
+            free();
+            return;
+        }
         T* new_device_ptr = nullptr;
         DevicePtrAlloc(new_device_ptr, n);
 
-        // If previous data exists, copy the minimum amount
-        if (m_data && m_capacity > 0) {
+        // If previous data exists, copy the minimum amount only when the caller asked to preserve it.
+        if (preserve == PreserveOnResize::Preserve && m_data && m_capacity > 0) {
             size_t copy_count = std::min(n, m_capacity);
             DEME_GPU_CALL(cudaMemcpy(new_device_ptr, m_data, copy_count * sizeof(T), cudaMemcpyDeviceToDevice));
         }
@@ -834,6 +1333,11 @@ class DeviceArray : private NonCopyable {
 
         updateMemCounter(static_cast<ssize_t>(n * sizeof(T)));
         m_capacity = n;
+        recordMemory(preserve == PreserveOnResize::Discard ? "resizeDiscard" : "resize");
+    }
+
+    void resizeDiscard(size_t n, bool allow_shrink = false) {
+        resize(n, allow_shrink, PreserveOnResize::Discard);
     }
 
     void free() {
@@ -842,6 +1346,7 @@ class DeviceArray : private NonCopyable {
         m_data = nullptr;
         m_capacity = 0;
         updateBoundDevicePointer();
+        recordMemory("free");
     }
 
     void bindDevicePointer(T** external_ptr_to_ptr) {
@@ -861,15 +1366,64 @@ class DeviceArray : private NonCopyable {
 
     void setMemoryCounter(size_t* counter) { m_mem_counter = counter; }
 
+    void setMemoryContext(const std::string& owner, const std::string& name, MemoryRole role) {
+        m_mem_owner = owner;
+        m_mem_name = name;
+        m_mem_role = role;
+        recordMemory("setMemoryContext");
+    }
+
+    void setMemoryPhase(const std::string& phase) {
+        m_mem_phase = phase;
+        recordMemory(phase);
+    }
+
   private:
     T* m_data = nullptr;
     T** m_bound_device_ptr = nullptr;
     size_t m_capacity = 0;
     size_t* m_mem_counter = nullptr;
 
+    std::string m_mem_owner = "unassigned";
+    std::string m_mem_name;
+    MemoryRole m_mem_role = MemoryRole::Unknown;
+    std::string m_mem_phase = "construct";
+    size_t m_high_water_capacity = 0;
+
     void updateBoundDevicePointer() {
         if (m_bound_device_ptr)
             *m_bound_device_ptr = m_data;
+    }
+
+    void recordMemory(const std::string& phase) {
+        if (!detail::mem_trace_enabled())
+            return;
+        m_mem_phase = phase;
+        const size_t cap_bytes = m_capacity * sizeof(T);
+        m_high_water_capacity = std::max(m_high_water_capacity, cap_bytes);
+        if (!cap_bytes && !m_data) {
+            detail::erase_memory_ledger_record(this);
+            return;
+        }
+        detail::MemoryLedgerRecord rec;
+        rec.array_object = this;
+        rec.owner = m_mem_owner;
+        rec.name = m_mem_name.empty() ? (std::string("DeviceArray<") + typeid(T).name() + ">@" +
+                                         std::to_string(reinterpret_cast<std::uintptr_t>(this))) : m_mem_name;
+        rec.role = MemoryRoleName(m_mem_role);
+        rec.type_name = typeid(T).name();
+        rec.type_size = sizeof(T);
+        rec.logical_bytes = cap_bytes;
+        rec.capacity_bytes = cap_bytes;
+        rec.committed_bytes = cap_bytes;
+        rec.host_bytes = 0;
+        rec.high_water_capacity_bytes = m_high_water_capacity;
+        rec.device_ptr = m_data;
+        rec.is_view = false;
+        rec.has_host_mirror = false;
+        rec.backend = "legacy";
+        rec.phase = m_mem_phase;
+        detail::upsert_memory_ledger_record(rec);
     }
 
     void updateMemCounter(ssize_t delta) {
@@ -888,6 +1442,8 @@ inline bool swap_device_buffer(DualArray<T>& lhs, DeviceArray<T>& rhs) {
     swap(lhs.m_device_ptr, rhs.m_data);
     swap(lhs.m_device_capacity, rhs.m_capacity);
     lhs.updateBoundDevicePointer();
+    lhs.recordMemory("swapDeviceBuffer");
+    rhs.recordMemory("swapDeviceBuffer");
     return true;
 }
 #else
@@ -953,6 +1509,40 @@ class ResourcePool : private NonCopyable {
         name_to_index.clear();
     }
 
+    size_t cachedFreeBytes() const {
+        size_t bytes = 0;
+        for (size_t i = 0; i < vectors.size(); ++i) {
+            if (i >= in_use.size() || !in_use[i]) {
+                bytes += vectors[i]->getNumBytes();
+            }
+        }
+        return bytes;
+    }
+
+    size_t trimFreeMemory(size_t keep_bytes = 0) {
+        size_t cached = cachedFreeBytes();
+        size_t freed = 0;
+        while (cached > keep_bytes) {
+            size_t best = static_cast<size_t>(-1);
+            size_t best_bytes = 0;
+            for (size_t i = 0; i < vectors.size(); ++i) {
+                if (i < in_use.size() && in_use[i])
+                    continue;
+                const size_t bytes = vectors[i]->getNumBytes();
+                if (bytes > best_bytes) {
+                    best = i;
+                    best_bytes = bytes;
+                }
+            }
+            if (best == static_cast<size_t>(-1) || best_bytes == 0)
+                break;
+            vectors[best]->free();
+            cached -= best_bytes;
+            freed += best_bytes;
+        }
+        return freed;
+    }
+
     void printStatus() const {
         for (size_t i = 0; i < in_use.size(); ++i) {
             if (in_use[i]) {
@@ -982,6 +1572,7 @@ class DeviceVectorPool : public ResourcePool<T, DeviceArray<T>> {
         if (Base::name_to_index.count(name)) {
             if (allow_duplicate) {
                 size_t index = Base::name_to_index[name];
+                Base::vectors[index]->setMemoryContext("scratch", name, MemoryRole::ScratchTemporary);
                 Base::vectors[index]->resize(size);
                 return Base::vectors[index]->data();
             } else {
@@ -989,8 +1580,12 @@ class DeviceVectorPool : public ResourcePool<T, DeviceArray<T>> {
             }
         }
 
-        for (size_t i = 0; i < Base::in_use.size(); ++i) {
+        // Preserve the legacy first-free reuse policy. A previous best-fit experiment looked attractive locally,
+        // but in patch-heavy runs it prevented large scratch slots from being recycled by later phases and caused
+        // several phase-local arrays to remain resident at once, regressing peak VRAM.
+        for (size_t i = 0; i < Base::in_use.size(); i++) {
             if (!Base::in_use[i]) {
+                Base::vectors[i]->setMemoryContext("scratch", name, MemoryRole::ScratchTemporary);
                 Base::vectors[i]->resize(size);
                 Base::in_use[i] = name;
                 Base::name_to_index[name] = i;
@@ -998,11 +1593,22 @@ class DeviceVectorPool : public ResourcePool<T, DeviceArray<T>> {
             }
         }
 
-        Base::vectors.emplace_back(std::make_unique<DeviceArray<T>>(size, m_mem_counter));
+        Base::vectors.emplace_back(std::make_unique<DeviceArray<T>>(m_mem_counter));
         Base::in_use.emplace_back(name);
         size_t new_index = Base::vectors.size() - 1;
         Base::name_to_index[name] = new_index;
+        Base::vectors[new_index]->setMemoryContext("scratch", name, MemoryRole::ScratchTemporary);
+        Base::vectors[new_index]->resize(size);
         return Base::vectors[new_index]->data();
+    }
+
+
+    void resize(const std::string& name, size_t new_size) {
+        auto it = this->name_to_index.find(name);
+        if (it == this->name_to_index.end()) {
+            DEME_ERROR(std::string("Cannot resize: name not found"));
+        }
+        this->vectors[it->second]->resize(new_size);
     }
 
     T* get(const std::string& name) {
@@ -1038,6 +1644,7 @@ class DualArrayPool : public ResourcePool<T, DualArray<T>> {
         if (Base::name_to_index.count(name)) {
             if (allow_duplicate) {
                 size_t index = Base::name_to_index[name];
+                Base::vectors[index]->setMemoryContext("scratch", name, MemoryRole::ScratchTemporary);
                 Base::vectors[index]->resize(size);
                 return Base::vectors[index].get();
             } else {
@@ -1045,19 +1652,40 @@ class DualArrayPool : public ResourcePool<T, DualArray<T>> {
             }
         }
 
+        size_t chosen = static_cast<size_t>(-1);
+        size_t chosen_cap = static_cast<size_t>(-1);
+        size_t fallback = static_cast<size_t>(-1);
+        size_t fallback_cap = static_cast<size_t>(-1);
         for (size_t i = 0; i < Base::in_use.size(); ++i) {
-            if (!Base::in_use[i]) {
-                Base::vectors[i]->resize(size);
-                Base::in_use[i] = name;
-                Base::name_to_index[name] = i;
-                return Base::vectors[i].get();
+            if (Base::in_use[i])
+                continue;
+            const size_t cap = Base::vectors[i]->size();
+            if (cap >= size) {
+                if (cap < chosen_cap) {
+                    chosen = i;
+                    chosen_cap = cap;
+                }
+            } else if (cap < fallback_cap) {
+                fallback = i;
+                fallback_cap = cap;
             }
         }
+        if (chosen == static_cast<size_t>(-1))
+            chosen = fallback;
+        if (chosen != static_cast<size_t>(-1)) {
+            Base::vectors[chosen]->setMemoryContext("scratch", name, MemoryRole::ScratchTemporary);
+            Base::vectors[chosen]->resize(size);
+            Base::in_use[chosen] = name;
+            Base::name_to_index[name] = chosen;
+            return Base::vectors[chosen].get();
+        }
 
-        Base::vectors.emplace_back(std::make_unique<DualArray<T>>(size, m_host_mem_counter, m_device_mem_counter));
+        Base::vectors.emplace_back(std::make_unique<DualArray<T>>(m_host_mem_counter, m_device_mem_counter));
         Base::in_use.emplace_back(name);
         size_t new_index = Base::vectors.size() - 1;
         Base::name_to_index[name] = new_index;
+        Base::vectors[new_index]->setMemoryContext("scratch", name, MemoryRole::ScratchTemporary);
+        Base::vectors[new_index]->resize(size);
         return Base::vectors[new_index].get();
     }
 

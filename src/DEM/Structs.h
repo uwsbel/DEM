@@ -516,6 +516,9 @@ struct SolverFlags {
     bool canFamilyChangeOnDevice = false;
     // If mesh will deform in the next kT-update cycle
     std::atomic<bool> willMeshDeform = false;
+    // Contract-level mesh node mutability. True means every currently loaded mesh keeps immutable local triangle-node
+    // coordinates; owners may still move/rotate freely. False means at least one mesh can rewrite relPosNode*.
+    bool meshNodeRelPosImmutable = true;
     // Some output-related flags
     unsigned int outputFlags = OUTPUT_CONTENT::QUAT | OUTPUT_CONTENT::ABSV;
     unsigned int cntOutFlags;
@@ -681,6 +684,14 @@ class DEMSolverScratchData {
         m_dualArrPool.printStatus();
         m_dualStructPool.printStatus();
     }
+
+    size_t trimDeviceVectorCache(size_t keep_bytes = detail::scratch_cache_limit_bytes()) {
+        if (keep_bytes == static_cast<size_t>(-1))
+            return 0;
+        return m_deviceVecPool.trimFreeMemory(keep_bytes);
+    }
+
+    void trimDeviceVectorCacheFromEnv() { trimDeviceVectorCache(detail::scratch_cache_limit_bytes()); }
 
     void releaseMemory() {
         m_deviceVecPool.releaseAll();
