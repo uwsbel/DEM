@@ -228,6 +228,7 @@ class DEMDynamicThread {
     cudaEvent_t kT_numContactsReadyEvent = nullptr;
     bool kT_numContacts_copy_pending = false;
     bool contactMappingUsesBuffer = false;
+    bool contactArraysUseTransferBuffer = false;
     uint64_t last_kT_produce_stamp = 0;  // last seen kT->dT update count (same-device fast path)
     int64_t recv_stamp_override = -1;
     static constexpr int kProgressEventDepth = 8;
@@ -1139,8 +1140,10 @@ class DEMDynamicThread {
     void sendToTheirBuffer();
     // Resize some work arrays based on the number of contact pairs provided by kT
     void contactPrimitivesArraysResize(size_t nContactPairs);
+    void contactPrimitivesArraysResizeHostOnly(size_t nContactPairs, size_t nForcePairs);
     // Resize mesh patch pair array based on the number of mesh-involved contact pairs
     void contactPatchArrayResize(size_t nMeshInvolvedContactPairs);
+    void contactPatchArrayResizeHostOnly(size_t nMeshInvolvedContactPairs);
     // Compact triangle-heavy contact storage with conservative hysteresis to stabilize VRAM across runs.
     void compactTriangleContactStorage(size_t nPrimitivePairs, size_t nPatchPairs);
     // Publish a dT -> kT work order under mailbox lock. Can safely refresh an unclaimed order.

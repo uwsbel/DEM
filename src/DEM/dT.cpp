@@ -3277,6 +3277,28 @@ inline void DEMDynamicThread::contactPatchArrayResize(size_t nPatchPairs) {
     // Sync pointers to device can be delayed... we'll only need to do that before kernel calls
 }
 
+inline void DEMDynamicThread::contactPrimitivesArraysResizeHostOnly(size_t nContactPairs, size_t nForcePairs) {
+    idPrimitiveA.resizeHost(nContactPairs, 0);
+    idPrimitiveB.resizeHost(nContactPairs, 0);
+    contactTypePrimitive.resizeHost(nContactPairs, NOT_A_CONTACT);
+    geomToPatchMap.resizeHost(nContactPairs, 0);
+
+    if (!(solverFlags.useNoContactRecord && simParams->nTriGM == 0)) {
+        DEME_DUAL_ARRAY_RESIZE(contactForces, nForcePairs, make_float3(0));
+        DEME_DUAL_ARRAY_RESIZE(contactTorque_convToForce, nForcePairs, make_float3(0));
+    }
+}
+
+inline void DEMDynamicThread::contactPatchArrayResizeHostOnly(size_t nPatchPairs) {
+    idPatchA.resizeHost(nPatchPairs, 0);
+    idPatchB.resizeHost(nPatchPairs, 0);
+    contactTypePatch.resizeHost(nPatchPairs, NOT_A_CONTACT);
+    contactPatchIsland.resizeHost(nPatchPairs, NULL_BODYID);
+    if (!(solverFlags.useNoContactRecord && simParams->nTriGM == 0)) {
+        contactPointGeometryA.resizeHost(nPatchPairs, make_float3(0));
+    }
+}
+
 inline void DEMDynamicThread::unpackMyBuffer() {
     DEME_NVTX_RANGE("dT::unpack");
     if (kT) {
@@ -3308,13 +3330,6 @@ inline void DEMDynamicThread::unpackMyBuffer() {
                              cudaMemcpyDeviceToDevice));
     solverScratchSpace.numContacts.toHost();
     solverScratchSpace.numPrimitiveContacts.toHost();
-    // Need to resize those contact event-based arrays before usage
-    if (*solverScratchSpace.numPrimitiveContacts > idPrimitiveA.size()) {
-        contactPrimitivesArraysResize(*solverScratchSpace.numPrimitiveContacts);
-    }
-    if (*solverScratchSpace.numContacts > idPatchA.size()) {
-        contactPatchArrayResize(*solverScratchSpace.numContacts);
-    }
 
     const size_t nPrimitive = *solverScratchSpace.numPrimitiveContacts;
     const size_t nPatch = *solverScratchSpace.numContacts;
@@ -3334,9 +3349,47 @@ inline void DEMDynamicThread::unpackMyBuffer() {
         }
         return !(env[0] == '0' && env[1] == '\0');
     }();
+    static const bool allow_direct_contact_view = []() {
+        const char* env = std::getenv("DEME_DT_DIRECT_CONTACT_VIEW");
+        if (!env || !*env) {
+            return true;
+        }
+        return !(env[0] == '0' && env[1] == '\0');
+    }();
+    const bool same_dev = (kT && streamInfo.device == kT->streamInfo.device);
+    const bool direct_contact_view = same_dev && allow_direct_contact_view && triangle_scene(simParams);
+
+    if (direct_contact_view) {
+        const size_t prim_view_capacity = idPrimitiveA_buffer[read_idx].size();
+        const size_t patch_view_capacity = idPatchA_buffer[read_idx].size();
+        contactPrimitivesArraysResizeHostOnly(prim_view_capacity, nPrimitive);
+        contactPatchArrayResizeHostOnly(patch_view_capacity);
+    } else {
+        if (nPrimitive > idPrimitiveA.size() || idPrimitiveA.isDeviceView() || idPrimitiveB.isDeviceView() ||
+            contactTypePrimitive.isDeviceView() || geomToPatchMap.isDeviceView()) {
+            contactPrimitivesArraysResize(nPrimitive);
+        }
+        if (nPatch > idPatchA.size() || idPatchA.isDeviceView() || idPatchB.isDeviceView() ||
+            contactTypePatch.isDeviceView() || contactPatchIsland.isDeviceView()) {
+            contactPatchArrayResize(nPatch);
+        }
+    }
     bool swapped = false;
 #ifndef DEME_USE_MANAGED_ARRAYS
-    if (kT && allow_swap && streamInfo.device == kT->streamInfo.device) {
+    if (direct_contact_view) {
+        idPrimitiveA.setDeviceView(idPrimitiveA_buffer[read_idx].data(), idPrimitiveA_buffer[read_idx].size());
+        idPrimitiveB.setDeviceView(idPrimitiveB_buffer[read_idx].data(), idPrimitiveB_buffer[read_idx].size());
+        contactTypePrimitive.setDeviceView(contactTypePrimitive_buffer[read_idx].data(),
+                                           contactTypePrimitive_buffer[read_idx].size());
+        geomToPatchMap.setDeviceView(geomToPatchMap_buffer[read_idx].data(), geomToPatchMap_buffer[read_idx].size());
+        idPatchA.setDeviceView(idPatchA_buffer[read_idx].data(), idPatchA_buffer[read_idx].size());
+        idPatchB.setDeviceView(idPatchB_buffer[read_idx].data(), idPatchB_buffer[read_idx].size());
+        contactTypePatch.setDeviceView(contactTypePatch_buffer[read_idx].data(), contactTypePatch_buffer[read_idx].size());
+        contactPatchIsland.setDeviceView(contactPatchIsland_buffer[read_idx].data(),
+                                         contactPatchIsland_buffer[read_idx].size());
+        contactArraysUseTransferBuffer = true;
+        swapped = true;
+    } else if (kT && allow_swap && streamInfo.device == kT->streamInfo.device) {
         swapped = swap_device_buffer(idPrimitiveA, idPrimitiveA_buffer[read_idx]);
         swapped = swap_device_buffer(idPrimitiveB, idPrimitiveB_buffer[read_idx]) && swapped;
         swapped = swap_device_buffer(contactTypePrimitive, contactTypePrimitive_buffer[read_idx]) && swapped;
@@ -3345,7 +3398,12 @@ inline void DEMDynamicThread::unpackMyBuffer() {
         swapped = swap_device_buffer(idPatchB, idPatchB_buffer[read_idx]) && swapped;
         swapped = swap_device_buffer(contactTypePatch, contactTypePatch_buffer[read_idx]) && swapped;
         swapped = swap_device_buffer(contactPatchIsland, contactPatchIsland_buffer[read_idx]) && swapped;
+        contactArraysUseTransferBuffer = false;
+    } else {
+        contactArraysUseTransferBuffer = false;
     }
+#else
+    contactArraysUseTransferBuffer = false;
 #endif
     xfer::XferList xu;
     if (!swapped) {
@@ -3452,10 +3510,12 @@ void DEMDynamicThread::compactTriangleContactStorage(size_t nPrimitivePairs, siz
     const size_t patch_target = quantized_contact_capacity(std::max<size_t>(nPatchPairs, 1));
 
     if (idPrimitiveA.size() > prim_target * 3 / 2) {
-        compact_dual_array(idPrimitiveA, prim_target);
-        compact_dual_array(idPrimitiveB, prim_target);
-        compact_dual_array(contactTypePrimitive, prim_target);
-        compact_dual_array(geomToPatchMap, prim_target);
+        if (!contactArraysUseTransferBuffer) {
+            compact_dual_array(idPrimitiveA, prim_target);
+            compact_dual_array(idPrimitiveB, prim_target);
+            compact_dual_array(contactTypePrimitive, prim_target);
+            compact_dual_array(geomToPatchMap, prim_target);
+        }
         if (!(solverFlags.useNoContactRecord && simParams->nTriGM == 0)) {
             compact_dual_array(contactForces, prim_target);
             compact_dual_array(contactTorque_convToForce, prim_target);
@@ -3464,10 +3524,12 @@ void DEMDynamicThread::compactTriangleContactStorage(size_t nPrimitivePairs, siz
     }
 
     if (idPatchA.size() > patch_target * 3 / 2) {
-        compact_dual_array(idPatchA, patch_target);
-        compact_dual_array(idPatchB, patch_target);
-        compact_dual_array(contactTypePatch, patch_target);
-        compact_dual_array(contactPatchIsland, patch_target);
+        if (!contactArraysUseTransferBuffer) {
+            compact_dual_array(idPatchA, patch_target);
+            compact_dual_array(idPatchB, patch_target);
+            compact_dual_array(contactTypePatch, patch_target);
+            compact_dual_array(contactPatchIsland, patch_target);
+        }
         if (!(solverFlags.useNoContactRecord && simParams->nTriGM == 0)) {
             contactPointGeometryA.resizeHost(patch_target, make_float3(0));
             // Contact aux arena is sized lazily in bindPrimitiveContactWorkspace(), after contact type ranges are known.

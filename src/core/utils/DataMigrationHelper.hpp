@@ -360,30 +360,57 @@ class DualArray : private NonCopyable {
     }
 
     // m_device_capacity is allocated memory, not array usable data range.
-    // Also, this method preserves already-existing device data.
+    // Also, this method preserves already-existing device data. If this DualArray
+    // currently views an external DeviceArray, resizeDevice detaches from that
+    // borrowed pointer and creates owned storage before returning.
     void resizeDevice(size_t n, bool allow_shrink = false) {
-        if (!allow_shrink && m_device_capacity >= n)
+        if (n == 0) {
+            freeDevice();
+            return;
+        }
+        if (m_device_owned && !allow_shrink && m_device_capacity >= n)
             return;
 
         T* new_device_ptr = nullptr;
         DevicePtrAlloc(new_device_ptr, n);
 
-        // If previous data exists, copy the minimum amount
+        // If previous data exists, copy the minimum amount. This is valid for both
+        // owned storage and non-owning views of another device allocation.
         if (m_device_ptr && m_device_capacity > 0) {
             size_t copy_count = std::min(n, m_device_capacity);
             DEME_GPU_CALL(cudaMemcpy(new_device_ptr, m_device_ptr, copy_count * sizeof(T), cudaMemcpyDeviceToDevice));
         }
 
-        // Free old memory and update bookkeeping
-        updateDeviceMemCounter(-(ssize_t)(m_device_capacity * sizeof(T)));
-        DevicePtrDealloc(m_device_ptr);
+        // Free old memory and update bookkeeping only when this DualArray owned it.
+        if (m_device_owned) {
+            updateDeviceMemCounter(-(ssize_t)(m_device_capacity * sizeof(T)));
+            DevicePtrDealloc(m_device_ptr);
+        }
 
         m_device_ptr = new_device_ptr;
+        m_device_owned = true;
         updateBoundDevicePointer();
 
         updateDeviceMemCounter(static_cast<ssize_t>(n * sizeof(T)));
         m_device_capacity = n;
     }
+
+    // Borrow an already-owned device buffer without taking ownership. This is used
+    // by same-GPU dT contact-array views: dT kernels read directly from the kT->dT
+    // ping-pong buffer, while the DeviceArray remains responsible for freeing that
+    // allocation. Host size is managed separately through resizeHost().
+    void setDeviceView(T* external_device_ptr, size_t capacity) {
+        if (m_device_owned) {
+            updateDeviceMemCounter(-(ssize_t)(m_device_capacity * sizeof(T)));
+            DevicePtrDealloc(m_device_ptr);
+        }
+        m_device_ptr = external_device_ptr;
+        m_device_capacity = capacity;
+        m_device_owned = false;
+        updateBoundDevicePointer();
+    }
+
+    bool isDeviceView() const { return !m_device_owned && m_device_ptr != nullptr; }
 
     void freeHost() {
         if (m_host_vec_ptr) {
@@ -395,10 +422,13 @@ class DualArray : private NonCopyable {
     }
 
     void freeDevice() {
-        DevicePtrDealloc(m_device_ptr);
-        updateDeviceMemCounter(-(ssize_t)(m_device_capacity * sizeof(T)));
+        if (m_device_owned) {
+            DevicePtrDealloc(m_device_ptr);
+            updateDeviceMemCounter(-(ssize_t)(m_device_capacity * sizeof(T)));
+        }
         m_device_ptr = nullptr;
         m_device_capacity = 0;
+        m_device_owned = true;
         updateBoundDevicePointer();
     }
 
@@ -410,7 +440,7 @@ class DualArray : private NonCopyable {
     void toDevice() {
         assert(m_host_vec_ptr);
         size_t count = size();
-        if (count > m_device_capacity)
+        if (!m_device_owned || count > m_device_capacity)
             resizeDevice(count);
         DEME_GPU_CALL(cudaMemcpy(m_device_ptr, m_host_vec_ptr->data(), count * sizeof(T), cudaMemcpyHostToDevice));
         m_host_dirty = false;
@@ -426,7 +456,7 @@ class DualArray : private NonCopyable {
     void toDeviceAsync(cudaStream_t& stream) {
         assert(m_host_vec_ptr);
         size_t count = size();
-        if (count > m_device_capacity)
+        if (!m_device_owned || count > m_device_capacity)
             resizeDevice(count);
         DEME_GPU_CALL(
             cudaMemcpyAsync(m_device_ptr, m_host_vec_ptr->data(), count * sizeof(T), cudaMemcpyHostToDevice, stream));
@@ -559,6 +589,7 @@ class DualArray : private NonCopyable {
 
     T* m_device_ptr = nullptr;
     size_t m_device_capacity = 0;
+    bool m_device_owned = true;
 
     T** m_bound_device_ptr = nullptr;
 
@@ -656,6 +687,10 @@ class DualArray : private NonCopyable {
     }
 
     void freeDevice() {}
+
+    void setDeviceView(T*, size_t) {}
+
+    bool isDeviceView() const { return false; }
 
     void free() {
         freeDevice();
@@ -846,6 +881,9 @@ class DeviceArray : private NonCopyable {
 #ifndef DEME_USE_MANAGED_ARRAYS
 template <typename T>
 inline bool swap_device_buffer(DualArray<T>& lhs, DeviceArray<T>& rhs) {
+    if (!lhs.m_device_owned) {
+        return false;
+    }
     using std::swap;
     swap(lhs.m_device_ptr, rhs.m_data);
     swap(lhs.m_device_capacity, rhs.m_capacity);
