@@ -605,6 +605,7 @@ class DEMSolverScratchData {
     // NOTE! The type MUST be scratch_t, since all DEMSolverScratchData's allocation methods use num of bytes as
     // arguments, but DeviceVectorPool's resize considers number of elements
     DeviceVectorPool<scratch_t> m_deviceVecPool;
+    detail::VmmTempScratchArena m_vmmTempArena;
     DualArrayPool<scratch_t> m_dualArrPool;
     DualStructPool<size_t> m_dualStructPool;
 
@@ -625,7 +626,9 @@ class DEMSolverScratchData {
     DualStruct<size_t> numPrevMeshPatches = DualStruct<size_t>(0);
 
     DEMSolverScratchData(size_t* external_host_counter = nullptr, size_t* external_device_counter = nullptr)
-        : m_deviceVecPool(external_device_counter), m_dualArrPool(external_host_counter, external_device_counter) {
+        : m_deviceVecPool(external_device_counter),
+          m_vmmTempArena(external_device_counter),
+          m_dualArrPool(external_host_counter, external_device_counter) {
         m_deviceVecPool.claim("ScratchSpace", 42);
     }
     ~DEMSolverScratchData() { releaseMemory(); }
@@ -643,6 +646,13 @@ class DEMSolverScratchData {
 
     // This flavor prevents you from forgeting to recycle before this time step ends
     scratch_t* allocateTempVector(const std::string& name, size_t sizeNeeded) {
+        if (m_vmmTempArena.enabled()) {
+            if (m_deviceVecPool.exist(name))
+                DEME_ERROR("Name already claimed: %s", name.c_str());
+            if (void* p = m_vmmTempArena.allocate(name, sizeNeeded))
+                return static_cast<scratch_t*>(p);
+            // Reserve exhausted or VMM unavailable after startup: fall back to the legacy pool without changing semantics.
+        }
         return m_deviceVecPool.claim(name, sizeNeeded);
     }
 
@@ -669,17 +679,24 @@ class DEMSolverScratchData {
     void syncDualStructDeviceToHost(const std::string& name) { m_dualStructPool.get(name)->toHost(); }
     void syncDualStructHostToDevice(const std::string& name) { m_dualStructPool.get(name)->toDevice(); }
 
-    void finishUsingTempVector(const std::string& name) { m_deviceVecPool.unclaim(name); }
+    void finishUsingTempVector(const std::string& name) {
+        if (m_vmmTempArena.owns(name)) {
+            m_vmmTempArena.freeByName(name);
+            return;
+        }
+        m_deviceVecPool.unclaim(name);
+    }
     void finishUsingVector(const std::string& name) { finishUsingTempVector(name); }
     void finishUsingDualArray(const std::string& name) { m_dualArrPool.unclaim(name); }
     void finishUsingDualStruct(const std::string& name) { m_dualStructPool.unclaim(name); }
 
     bool existDualArray(const std::string& name) { return m_dualArrPool.exist(name); }
     bool existDualStruct(const std::string& name) { return m_dualStructPool.exist(name); }
-    bool existTempVector(const std::string& name) { return m_deviceVecPool.exist(name); }
+    bool existTempVector(const std::string& name) { return m_vmmTempArena.owns(name) || m_deviceVecPool.exist(name); }
 
     // Debug util
     void printVectorUsage() const {
+        m_vmmTempArena.printStatus();
         m_deviceVecPool.printStatus();
         m_dualArrPool.printStatus();
         m_dualStructPool.printStatus();
@@ -694,6 +711,7 @@ class DEMSolverScratchData {
     void trimDeviceVectorCacheFromEnv() { trimDeviceVectorCache(detail::scratch_cache_limit_bytes()); }
 
     void releaseMemory() {
+        m_vmmTempArena.releaseAll();
         m_deviceVecPool.releaseAll();
         m_dualArrPool.releaseAll();
         m_dualStructPool.releaseAll();

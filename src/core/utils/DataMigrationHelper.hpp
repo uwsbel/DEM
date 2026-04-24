@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -23,6 +24,14 @@
 #include <utility>
 #include <unordered_map>
 #include <vector>
+
+#include <cuda_runtime_api.h>
+#if __has_include(<cuda.h>)
+#include <cuda.h>
+#define DEME_HAS_CUDA_DRIVER_VMM 1
+#else
+#define DEME_HAS_CUDA_DRIVER_VMM 0
+#endif
 
 #include "Logger.hpp"
 #include "BaseClasses.hpp"
@@ -98,6 +107,114 @@ inline size_t scratch_cache_limit_bytes() {
     // Opt-in experimental trimming only. Throughput and compact modes both keep legacy unlimited caching unless
     // DEME_EXPERIMENTAL_SCRATCH_TRIM=1 is explicitly set.
     return 16ull * 1024ull * 1024ull;
+}
+
+inline bool vmm_temp_arena_requested() {
+    // Default-on safe VMM path: only temp scratch vectors, no per-array VMM, no page decommit while kernels run.
+    // It remains fully opt-out and falls back to the legacy pool automatically when CUDA VMM is unavailable.
+    if (env_truthy(std::getenv("DEME_DISABLE_VMM_TEMP_ARENA")))
+        return false;
+    const char* arena = std::getenv("DEME_VMM_TEMP_ARENA");
+    if (arena && *arena && !env_truthy(arena))
+        return false;
+    const char* vmm = std::getenv("DEME_VMM");
+    if (vmm && *vmm && !env_truthy(vmm))
+        return false;
+    const char* scratch = std::getenv("DEME_VMM_SCRATCH");
+    if (scratch && *scratch && !env_truthy(scratch))
+        return false;
+    return true;
+}
+
+inline size_t parse_env_mb_to_bytes(const char* env, double fallback_mb) {
+    double mb = fallback_mb;
+    if (env && *env) {
+        char* end = nullptr;
+        const double parsed = std::strtod(env, &end);
+        if (end != env && parsed > 0.0)
+            mb = parsed;
+    }
+    return static_cast<size_t>(mb * 1024.0 * 1024.0);
+}
+
+inline size_t parse_optional_env_mb_to_bytes(const char* env) {
+    if (!env || !*env)
+        return 0;
+    char* end = nullptr;
+    const double parsed = std::strtod(env, &end);
+    if (end == env || parsed <= 0.0)
+        return 0;
+    return static_cast<size_t>(parsed * 1024.0 * 1024.0);
+}
+
+inline size_t vmm_temp_arena_explicit_first_segment_bytes() {
+    // Backward compatibility with earlier patches. This is only a virtual-reserve hint for the first segment; physical
+    // pages are committed lazily. Leaving it unset enables the adaptive segmented policy below.
+    size_t bytes = parse_optional_env_mb_to_bytes(std::getenv("DEME_VMM_TEMP_ARENA_RESERVE_MB"));
+    if (!bytes)
+        bytes = parse_optional_env_mb_to_bytes(std::getenv("DEME_VMM_SCRATCH_RESERVE_MB"));
+    return bytes;
+}
+
+inline size_t vmm_temp_arena_min_segment_bytes() {
+    // Small first segments avoid the v4 "always reserve 512 MiB" behavior while still amortizing CUDA VMM calls.
+    return parse_env_mb_to_bytes(std::getenv("DEME_VMM_TEMP_ARENA_SEGMENT_MIN_MB"), 64.0);
+}
+
+inline size_t vmm_temp_arena_max_segment_bytes() {
+    // A 128 MiB segment cap is large enough for DEME's current scratch bursts but prevents a single bad request from
+    // reserving a huge virtual window. Larger scenes can raise this explicitly.
+    return parse_env_mb_to_bytes(std::getenv("DEME_VMM_TEMP_ARENA_SEGMENT_MAX_MB"), 128.0);
+}
+
+inline size_t vmm_temp_arena_user_budget_bytes() {
+    // Preferred explicit budget knob. Older HARD_LIMIT/SCRATCH_HARD_LIMIT names remain accepted.
+    size_t bytes = parse_optional_env_mb_to_bytes(std::getenv("DEME_VMM_TEMP_ARENA_BUDGET_MB"));
+    if (!bytes)
+        bytes = parse_optional_env_mb_to_bytes(std::getenv("DEME_VMM_TEMP_ARENA_HARD_LIMIT_MB"));
+    if (!bytes)
+        bytes = parse_optional_env_mb_to_bytes(std::getenv("DEME_VMM_SCRATCH_HARD_LIMIT_MB"));
+    return bytes;
+}
+
+inline double vmm_temp_arena_budget_fraction() {
+    const char* env = std::getenv("DEME_VMM_TEMP_ARENA_BUDGET_FRACTION");
+    if (!env || !*env)
+        return 1.0 / 64.0;  // about 1.56% of currently free VRAM, clamped below
+    char* end = nullptr;
+    const double parsed = std::strtod(env, &end);
+    if (end == env || parsed <= 0.0)
+        return 1.0 / 64.0;
+    return parsed > 0.25 ? 0.25 : parsed;
+}
+
+inline size_t vmm_temp_arena_min_budget_bytes() {
+    return parse_env_mb_to_bytes(std::getenv("DEME_VMM_TEMP_ARENA_MIN_BUDGET_MB"), 192.0);
+}
+
+inline size_t vmm_temp_arena_max_budget_bytes() {
+    return parse_env_mb_to_bytes(std::getenv("DEME_VMM_TEMP_ARENA_MAX_BUDGET_MB"), 512.0);
+}
+
+inline double vmm_temp_arena_growth_factor() {
+    const char* env = std::getenv("DEME_VMM_TEMP_ARENA_GROWTH");
+    if (!env || !*env)
+        return 1.5;
+    char* end = nullptr;
+    const double parsed = std::strtod(env, &end);
+    if (end == env || parsed < 1.0)
+        return 1.5;
+    return parsed > 3.0 ? 3.0 : parsed;
+}
+
+inline bool vmm_temp_arena_trace_enabled() {
+    return env_truthy(std::getenv("DEME_VMM_TRACE")) || env_truthy(std::getenv("DEME_VMM_TEMP_ARENA_TRACE"));
+}
+
+inline bool vmm_temp_arena_validate_enabled() {
+    // Tracing must stay cheap.  v3 accidentally made DEME_VMM_TRACE imply O(N^2) overlap validation on every
+    // scratch claim/free, which made startup and early frames much slower.  Keep heavy validation explicit.
+    return env_truthy(std::getenv("DEME_VMM_TEMP_ARENA_VALIDATE"));
 }
 
 inline bool immutable_metadata_share_enabled() {
@@ -399,6 +516,30 @@ inline void unregister_device_allocation(const void* ptr) {
         tracker.live_bytes.fetch_sub(bytes, std::memory_order_relaxed);
 }
 
+inline void update_tracked_device_allocation(const void* ptr, size_t bytes) {
+    if (!ptr)
+        return;
+    auto& tracker = tracked_device_mem();
+    size_t old_bytes = 0;
+    {
+        std::lock_guard<std::mutex> lock(tracker.mutex);
+        auto it = tracker.allocations.find(ptr);
+        if (it != tracker.allocations.end())
+            old_bytes = it->second;
+        if (bytes)
+            tracker.allocations[ptr] = bytes;
+        else if (it != tracker.allocations.end())
+            tracker.allocations.erase(it);
+    }
+    if (bytes > old_bytes) {
+        const size_t delta = bytes - old_bytes;
+        const size_t live_now = tracker.live_bytes.fetch_add(delta, std::memory_order_relaxed) + delta;
+        update_atomic_max(tracker.peak_bytes, live_now);
+    } else if (old_bytes > bytes) {
+        tracker.live_bytes.fetch_sub(old_bytes - bytes, std::memory_order_relaxed);
+    }
+}
+
 inline size_t get_tracked_program_device_peak_memory_usage() {
     return tracked_device_mem().peak_bytes.load(std::memory_order_relaxed);
 }
@@ -407,6 +548,622 @@ inline void reset_tracked_program_device_peak_memory_usage() {
     auto& tracker = tracked_device_mem();
     tracker.peak_bytes.store(tracker.live_bytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
 }
+
+#if DEME_HAS_CUDA_DRIVER_VMM
+inline std::string cuda_driver_error_string(CUresult result) {
+    const char* name = nullptr;
+    const char* text = nullptr;
+    cuGetErrorName(result, &name);
+    cuGetErrorString(result, &text);
+    std::ostringstream os;
+    os << (name ? name : "CUresult") << ": " << (text ? text : "unknown CUDA driver error");
+    return os.str();
+}
+#endif
+
+class VmmTempScratchArena : private NonCopyable {
+  public:
+    explicit VmmTempScratchArena(size_t* external_counter = nullptr) : m_mem_counter(external_counter) {}
+    ~VmmTempScratchArena() { releaseAll(); }
+
+    void setMemoryCounter(size_t* counter) { m_mem_counter = counter; }
+
+    bool requested() const { return vmm_temp_arena_requested(); }
+    bool enabled() {
+        if (!requested())
+            return false;
+        initializeIfNeeded();
+        return m_enabled;
+    }
+
+    void* allocate(const std::string& name, size_t bytes) {
+        if (!bytes)
+            bytes = 1;
+        if (!enabled())
+            return nullptr;
+        if (m_name_to_block.count(name))
+            DEME_ERROR("Scratch temp arena name already claimed: %s", name.c_str());
+
+        const size_t aligned = alignUp(bytes, kAlignment);
+        size_t chosen = static_cast<size_t>(-1);
+        size_t chosen_size = static_cast<size_t>(-1);
+        for (size_t i = 0; i < m_blocks.size(); ++i) {
+            const Block& b = m_blocks[i];
+            if (!b.free || b.size < aligned)
+                continue;
+            if (b.size < chosen_size) {
+                chosen = i;
+                chosen_size = b.size;
+            }
+        }
+
+        if (chosen == static_cast<size_t>(-1)) {
+            chosen = allocateFromUnbumpedSpace(name, bytes, aligned);
+            if (chosen == static_cast<size_t>(-1))
+                return nullptr;
+        } else {
+            // IMPORTANT: do not keep a Block& across push_back.  push_back may reallocate m_blocks,
+            // and an invalidated reference here can leave the chosen block marked free while its
+            // address is returned to a live kernel.  That produces silent slice aliasing and quickly
+            // corrupts physics state.
+            const size_t block_segment = m_blocks[chosen].segment;
+            const size_t block_offset = m_blocks[chosen].offset;
+            const size_t block_size = m_blocks[chosen].size;
+            if (block_size >= aligned + kMinSplitBytes) {
+                m_blocks[chosen].size = aligned;
+                m_blocks.push_back(Block{block_segment, block_offset + aligned, block_size - aligned, 0, true,
+                                         std::string()});
+            }
+            Block& b = m_blocks[chosen];
+            b.requested = bytes;
+            b.free = false;
+            b.name = name;
+        }
+
+        m_name_to_block[name] = chosen;
+        validateClaimedBlock(name, chosen, aligned);
+        if (vmm_temp_arena_validate_enabled())
+            validateNoLiveOverlap("arenaClaim");
+        recordBlock(chosen, "arenaClaim");
+        recordArena("arenaClaim");
+        return ptrForBlock(m_blocks[chosen]);
+    }
+
+    bool owns(const std::string& name) const { return m_name_to_block.count(name) != 0; }
+
+    void freeByName(const std::string& name) {
+        auto it = m_name_to_block.find(name);
+        if (it == m_name_to_block.end())
+            return;
+        const size_t idx = it->second;
+        if (idx < m_blocks.size()) {
+            Block& b = m_blocks[idx];
+            b.free = true;
+            b.name.clear();
+            b.requested = 0;
+            recordBlock(idx, "arenaFree");
+        }
+        m_name_to_block.erase(it);
+        coalesceFreeBlocks();
+        if (vmm_temp_arena_validate_enabled())
+            validateNoLiveOverlap("arenaFree");
+        recordArena("arenaFree");
+    }
+
+    void releaseAll() {
+#if DEME_HAS_CUDA_DRIVER_VMM
+        for (auto& seg : m_segments) {
+            for (auto& h : seg.handles) {
+                if (h.handle) {
+                    cuMemUnmap(seg.base + h.offset, h.bytes);
+                    cuMemRelease(h.handle);
+                }
+            }
+            if (seg.base)
+                cuMemAddressFree(seg.base, seg.reserved);
+            update_tracked_device_allocation(reinterpret_cast<const void*>(seg.base), 0);
+        }
+#endif
+        if (m_mem_counter && m_total_committed_bytes)
+            *m_mem_counter -= std::min(*m_mem_counter, m_total_committed_bytes);
+        eraseArenaAndBlocks();
+        m_segments.clear();
+        m_blocks.clear();
+        m_name_to_block.clear();
+        m_total_reserved_bytes = 0;
+        m_total_committed_bytes = 0;
+        m_peak_committed_bytes = 0;
+        m_next_segment_reserve_bytes = 0;
+        m_failed_allocations = 0;
+        m_budget_bytes = static_cast<size_t>(-1);
+        m_enabled = false;
+        m_initialized = false;
+    }
+
+    size_t committedBytes() const { return m_total_committed_bytes; }
+    size_t reservedBytes() const { return m_total_reserved_bytes; }
+    size_t peakCommittedBytes() const { return m_peak_committed_bytes; }
+    size_t failedAllocations() const { return m_failed_allocations; }
+    size_t activeBytes() const {
+        size_t out = 0;
+        for (const auto& b : m_blocks)
+            if (!b.free)
+                out += b.requested;
+        return out;
+    }
+
+    void printStatus() const {
+        if (!m_enabled)
+            return;
+        std::cout << "VMM temp arena: segments=" << m_segments.size() << " reserved=" << m_total_reserved_bytes
+                  << " committed=" << m_total_committed_bytes << " peak=" << m_peak_committed_bytes
+                  << " budget=" << m_budget_bytes << " active=" << activeBytes()
+                  << " failed=" << m_failed_allocations << "\n";
+    }
+
+  private:
+    static constexpr size_t kAlignment = 256;
+    static constexpr size_t kMinSplitBytes = 4096;
+
+    struct Block {
+        size_t segment = 0;
+        size_t offset = 0;
+        size_t size = 0;
+        size_t requested = 0;
+        bool free = true;
+        std::string name;
+    };
+
+#if DEME_HAS_CUDA_DRIVER_VMM
+    struct HandleRange {
+        size_t offset = 0;
+        size_t bytes = 0;
+        CUmemGenericAllocationHandle handle = 0;
+    };
+    struct Segment {
+        CUdeviceptr base = 0;
+        size_t reserved = 0;
+        size_t committed = 0;
+        size_t bump = 0;
+        std::vector<HandleRange> handles;
+    };
+#else
+    struct Segment {
+        uintptr_t base = 0;
+        size_t reserved = 0;
+        size_t committed = 0;
+        size_t bump = 0;
+    };
+#endif
+
+    size_t* m_mem_counter = nullptr;
+    bool m_initialized = false;
+    bool m_enabled = false;
+    int m_device = 0;
+    size_t m_granularity = 0;
+    size_t m_total_reserved_bytes = 0;
+    size_t m_total_committed_bytes = 0;
+    size_t m_peak_committed_bytes = 0;
+    size_t m_next_segment_reserve_bytes = 0;
+    size_t m_failed_allocations = 0;
+    size_t m_budget_bytes = static_cast<size_t>(-1);
+    std::vector<Segment> m_segments;
+    std::vector<Block> m_blocks;
+    std::unordered_map<std::string, size_t> m_name_to_block;
+
+    static size_t alignUp(size_t value, size_t alignment) {
+        return ((value + alignment - 1) / alignment) * alignment;
+    }
+
+    static size_t nextPow2(size_t value) {
+        if (value <= 1)
+            return 1;
+        --value;
+        for (size_t shift = 1; shift < sizeof(size_t) * 8; shift <<= 1)
+            value |= value >> shift;
+        return value + 1;
+    }
+
+    static size_t safeScale(size_t value, double factor) {
+        if (factor <= 1.0)
+            return value;
+        const double scaled = static_cast<double>(value) * factor;
+        const double max_size = static_cast<double>(static_cast<size_t>(-1));
+        if (scaled >= max_size)
+            return static_cast<size_t>(-1);
+        return static_cast<size_t>(scaled);
+    }
+
+    void initializeIfNeeded() {
+        if (m_initialized)
+            return;
+        m_initialized = true;
+#if DEME_HAS_CUDA_DRIVER_VMM
+        cudaError_t rt = cudaFree(nullptr);  // creates the primary context without allocating
+        if (rt != cudaSuccess)
+            return;
+        rt = cudaGetDevice(&m_device);
+        if (rt != cudaSuccess)
+            return;
+        CUresult cr = cuInit(0);
+        if (cr != CUDA_SUCCESS)
+            return;
+        CUdevice cu_device;
+        cr = cuDeviceGet(&cu_device, m_device);
+        if (cr != CUDA_SUCCESS)
+            return;
+
+        CUmemAllocationProp prop{};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = m_device;
+        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_NONE;
+
+        size_t gran = 0;
+        cr = cuMemGetAllocationGranularity(&gran, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+        if (cr != CUDA_SUCCESS || gran == 0)
+            return;
+        m_granularity = gran;
+
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        rt = cudaMemGetInfo(&free_bytes, &total_bytes);
+        if (rt != cudaSuccess || free_bytes == 0)
+            return;
+        m_budget_bytes = computeAdaptiveBudget(free_bytes, total_bytes);
+        if (m_budget_bytes < m_granularity)
+            return;
+
+        m_enabled = true;
+        if (vmm_temp_arena_trace_enabled()) {
+            std::cerr << "DEME VMM temp scratch arena available on device " << m_device
+                      << ": commit granularity " << (double)m_granularity / (1024.0 * 1024.0)
+                      << " MiB, adaptive physical budget " << (double)m_budget_bytes / (1024.0 * 1024.0)
+                      << " MiB, segmented virtual reserve on demand\n";
+        }
+#endif
+    }
+
+    size_t computeAdaptiveBudget(size_t free_bytes, size_t total_bytes) const {
+        const size_t user_budget = vmm_temp_arena_user_budget_bytes();
+        if (user_budget)
+            return alignUp(user_budget, m_granularity);
+
+        const double fraction = vmm_temp_arena_budget_fraction();
+        size_t budget = static_cast<size_t>(static_cast<double>(free_bytes) * fraction);
+        const size_t min_budget = vmm_temp_arena_min_budget_bytes();
+        const size_t max_budget = vmm_temp_arena_max_budget_bytes();
+        budget = std::max(budget, min_budget);
+        budget = std::min(budget, max_budget);
+
+        // Never let the automatic scratch arena take most of a small GPU.  This is a safety budget, not a target.
+        budget = std::min(budget, free_bytes / 4);
+        budget = std::min(budget, total_bytes / 8);
+        return alignUp(budget, m_granularity);
+    }
+
+    size_t remainingBudgetBytes() const {
+        if (m_budget_bytes == static_cast<size_t>(-1))
+            return static_cast<size_t>(-1);
+        return (m_total_committed_bytes < m_budget_bytes) ? (m_budget_bytes - m_total_committed_bytes) : 0;
+    }
+
+    size_t computeSegmentReserve(size_t required_bytes) const {
+        const size_t min_seg = alignUp(std::max(vmm_temp_arena_min_segment_bytes(), m_granularity), m_granularity);
+        const size_t max_cfg = std::max(vmm_temp_arena_max_segment_bytes(), min_seg);
+        const size_t max_seg = alignUp(max_cfg, m_granularity);
+        const size_t explicit_first = vmm_temp_arena_explicit_first_segment_bytes();
+
+        size_t wanted = required_bytes;
+        if (m_segments.empty() && explicit_first)
+            wanted = std::max(wanted, explicit_first);
+        else
+            wanted = std::max(wanted, safeScale(required_bytes, vmm_temp_arena_growth_factor()));
+        wanted = std::max(wanted, min_seg);
+        wanted = nextPow2(wanted);
+        wanted = alignUp(wanted, m_granularity);
+        wanted = std::min(wanted, max_seg);
+        if (wanted < required_bytes)
+            wanted = alignUp(required_bytes, m_granularity);
+
+        // Virtual reservations are cheap, but bounding them by the physical budget prevents v3-style runaway growth
+        // and makes reserve size automatic instead of a fixed 512 MiB knob.  Requests larger than the budget fall
+        // back to the legacy pool instead of risking OOM.
+        if (m_budget_bytes != static_cast<size_t>(-1)) {
+            const size_t reserved_left = (m_total_reserved_bytes < m_budget_bytes) ? (m_budget_bytes - m_total_reserved_bytes) : 0;
+            if (reserved_left < required_bytes)
+                return 0;
+            wanted = std::min(wanted, reserved_left);
+            wanted = alignUp(wanted, m_granularity);
+        }
+        return wanted;
+    }
+
+    void updateNextSegmentReserve(size_t just_reserved) {
+        const size_t min_seg = alignUp(std::max(vmm_temp_arena_min_segment_bytes(), m_granularity), m_granularity);
+        const size_t max_seg = alignUp(std::max(vmm_temp_arena_max_segment_bytes(), min_seg), m_granularity);
+        size_t next = safeScale(just_reserved, vmm_temp_arena_growth_factor());
+        next = std::max(next, min_seg);
+        if (next > max_seg)
+            next = max_seg;
+        m_next_segment_reserve_bytes = alignUp(next, m_granularity);
+    }
+
+    bool addSegment(size_t required_bytes) {
+#if DEME_HAS_CUDA_DRIVER_VMM
+        const size_t reserve = computeSegmentReserve(required_bytes);
+        if (!reserve)
+            return false;
+        CUdeviceptr base = 0;
+        CUresult cr = cuMemAddressReserve(&base, reserve, 0, 0, 0);
+        if (cr != CUDA_SUCCESS) {
+            if (vmm_temp_arena_trace_enabled())
+                std::cerr << "DEME VMM temp arena cuMemAddressReserve failed for " << reserve
+                          << " bytes: " << cuda_driver_error_string(cr) << "\n";
+            return false;
+        }
+        Segment seg;
+        seg.base = base;
+        seg.reserved = reserve;
+        m_segments.push_back(std::move(seg));
+        m_total_reserved_bytes += reserve;
+        updateNextSegmentReserve(reserve);
+        if (vmm_temp_arena_trace_enabled()) {
+            std::cerr << "DEME VMM temp arena added segment " << (m_segments.size() - 1)
+                      << ": reserved " << (double)reserve / (1024.0 * 1024.0)
+                      << " MiB virtual, total reserved " << (double)m_total_reserved_bytes / (1024.0 * 1024.0)
+                      << " MiB\n";
+        }
+        recordArena("arenaReserveSegment");
+        return true;
+#else
+        (void)required_bytes;
+        return false;
+#endif
+    }
+
+    bool ensureCommitted(size_t segment_idx, size_t required_bytes) {
+#if DEME_HAS_CUDA_DRIVER_VMM
+        if (segment_idx >= m_segments.size())
+            return false;
+        Segment& seg = m_segments[segment_idx];
+        required_bytes = alignUp(required_bytes, m_granularity);
+        if (required_bytes <= seg.committed)
+            return true;
+        const size_t old_committed = seg.committed;
+        const size_t grow = required_bytes - old_committed;
+        if (m_budget_bytes != static_cast<size_t>(-1) && m_total_committed_bytes + grow > m_budget_bytes) {
+            if (vmm_temp_arena_trace_enabled())
+                std::cerr << "DEME VMM temp arena adaptive budget would be exceeded by " << grow
+                          << " bytes; falling back to legacy scratch for this allocation\n";
+            return false;
+        }
+
+        CUmemAllocationProp prop{};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = m_device;
+        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_NONE;
+
+        CUmemGenericAllocationHandle handle = 0;
+        CUresult cr = cuMemCreate(&handle, grow, &prop, 0);
+        if (cr != CUDA_SUCCESS) {
+            if (vmm_temp_arena_trace_enabled())
+                std::cerr << "DEME VMM temp arena cuMemCreate failed for " << grow << " bytes: "
+                          << cuda_driver_error_string(cr) << "\n";
+            return false;
+        }
+        cr = cuMemMap(seg.base + old_committed, grow, 0, handle, 0);
+        if (cr != CUDA_SUCCESS) {
+            cuMemRelease(handle);
+            if (vmm_temp_arena_trace_enabled())
+                std::cerr << "DEME VMM temp arena cuMemMap failed: " << cuda_driver_error_string(cr) << "\n";
+            return false;
+        }
+        CUmemAccessDesc access{};
+        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id = m_device;
+        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        cr = cuMemSetAccess(seg.base + old_committed, grow, &access, 1);
+        if (cr != CUDA_SUCCESS) {
+            cuMemUnmap(seg.base + old_committed, grow);
+            cuMemRelease(handle);
+            if (vmm_temp_arena_trace_enabled())
+                std::cerr << "DEME VMM temp arena cuMemSetAccess failed: " << cuda_driver_error_string(cr) << "\n";
+            return false;
+        }
+        seg.handles.push_back(HandleRange{old_committed, grow, handle});
+        seg.committed = required_bytes;
+        m_total_committed_bytes += grow;
+        m_peak_committed_bytes = std::max(m_peak_committed_bytes, m_total_committed_bytes);
+        update_tracked_device_allocation(reinterpret_cast<const void*>(seg.base), seg.committed);
+        if (m_mem_counter)
+            *m_mem_counter += grow;
+        recordArena("arenaCommit");
+        return true;
+#else
+        (void)segment_idx;
+        (void)required_bytes;
+        return false;
+#endif
+    }
+
+    size_t allocateFromUnbumpedSpace(const std::string& name, size_t requested, size_t aligned) {
+        for (size_t seg_idx = 0; seg_idx < m_segments.size(); ++seg_idx) {
+            Segment& seg = m_segments[seg_idx];
+            const size_t off = alignUp(seg.bump, kAlignment);
+            if (off + aligned > seg.reserved)
+                continue;
+            if (!ensureCommitted(seg_idx, off + aligned)) {
+                ++m_failed_allocations;
+                return static_cast<size_t>(-1);
+            }
+            const size_t idx = m_blocks.size();
+            m_blocks.push_back(Block{seg_idx, off, aligned, requested, false, name});
+            seg.bump = off + aligned;
+            return idx;
+        }
+
+        if (!addSegment(aligned)) {
+            ++m_failed_allocations;
+            return static_cast<size_t>(-1);
+        }
+        const size_t seg_idx = m_segments.size() - 1;
+        Segment& seg = m_segments[seg_idx];
+        const size_t off = alignUp(seg.bump, kAlignment);
+        if (off + aligned > seg.reserved || !ensureCommitted(seg_idx, off + aligned)) {
+            ++m_failed_allocations;
+            return static_cast<size_t>(-1);
+        }
+        const size_t idx = m_blocks.size();
+        m_blocks.push_back(Block{seg_idx, off, aligned, requested, false, name});
+        seg.bump = off + aligned;
+        return idx;
+    }
+
+    void* ptrForBlock(const Block& b) const {
+        if (b.segment >= m_segments.size())
+            return nullptr;
+#if DEME_HAS_CUDA_DRIVER_VMM
+        return reinterpret_cast<void*>(m_segments[b.segment].base + b.offset);
+#else
+        return reinterpret_cast<void*>(m_segments[b.segment].base + b.offset);
+#endif
+    }
+
+    const void* firstSegmentPtr() const {
+        if (m_segments.empty())
+            return nullptr;
+        return reinterpret_cast<const void*>(m_segments.front().base);
+    }
+
+    void coalesceFreeBlocks() {
+        std::sort(m_blocks.begin(), m_blocks.end(), [](const Block& a, const Block& b) {
+            if (a.segment != b.segment)
+                return a.segment < b.segment;
+            return a.offset < b.offset;
+        });
+        std::vector<Block> merged;
+        merged.reserve(m_blocks.size());
+        for (const auto& b : m_blocks) {
+            if (!merged.empty() && merged.back().segment == b.segment && merged.back().free && b.free &&
+                merged.back().offset + merged.back().size == b.offset) {
+                merged.back().size += b.size;
+            } else {
+                merged.push_back(b);
+            }
+        }
+        m_blocks.swap(merged);
+        m_name_to_block.clear();
+        for (size_t i = 0; i < m_blocks.size(); ++i)
+            if (!m_blocks[i].free)
+                m_name_to_block[m_blocks[i].name] = i;
+    }
+
+    void validateClaimedBlock(const std::string& name, size_t idx, size_t min_size) const {
+        if (idx >= m_blocks.size())
+            DEME_ERROR("VMM temp arena internal error: block index out of range for %s", name.c_str());
+        const Block& b = m_blocks[idx];
+        if (b.segment >= m_segments.size() || b.free || b.name != name || b.size < min_size)
+            DEME_ERROR("VMM temp arena internal error: inconsistent live block for %s", name.c_str());
+    }
+
+    void validateNoLiveOverlap(const char* where) const {
+        for (const auto& kv : m_name_to_block) {
+            if (kv.second >= m_blocks.size())
+                DEME_ERROR("VMM temp arena map corruption at %s: index out of range for %s", where, kv.first.c_str());
+            const Block& b = m_blocks[kv.second];
+            if (b.free || b.name != kv.first)
+                DEME_ERROR("VMM temp arena map corruption at %s: stale/free entry for %s", where, kv.first.c_str());
+        }
+        for (size_t i = 0; i < m_blocks.size(); ++i) {
+            if (m_blocks[i].free)
+                continue;
+            const size_t a0 = m_blocks[i].offset;
+            const size_t a1 = m_blocks[i].offset + m_blocks[i].size;
+            for (size_t j = i + 1; j < m_blocks.size(); ++j) {
+                if (m_blocks[j].free || m_blocks[i].segment != m_blocks[j].segment)
+                    continue;
+                const size_t b0 = m_blocks[j].offset;
+                const size_t b1 = m_blocks[j].offset + m_blocks[j].size;
+                if (a0 < b1 && b0 < a1)
+                    DEME_ERROR("VMM temp arena live slice overlap at %s: %s overlaps %s", where,
+                               m_blocks[i].name.c_str(), m_blocks[j].name.c_str());
+            }
+        }
+    }
+
+    void recordArena(const std::string& phase) const {
+        if (!mem_trace_enabled() || (!firstSegmentPtr() && !m_total_committed_bytes))
+            return;
+        MemoryLedgerRecord rec;
+        rec.array_object = this;
+        rec.owner = "scratch";
+        rec.name = "VmmTempArena";
+        rec.role = "ScratchTemporary";
+        rec.type_name = "byte-arena";
+        rec.type_size = 1;
+        rec.logical_bytes = activeBytes();
+        rec.capacity_bytes = usedVirtualBytes();
+        rec.committed_bytes = m_total_committed_bytes;
+        rec.host_bytes = 0;
+        rec.high_water_capacity_bytes = m_peak_committed_bytes;
+        rec.device_ptr = firstSegmentPtr();
+        rec.is_view = false;
+        rec.has_host_mirror = false;
+        rec.backend = "vmm-temp-arena-adaptive";
+        rec.phase = phase;
+        upsert_memory_ledger_record(rec);
+    }
+
+    size_t usedVirtualBytes() const {
+        size_t out = 0;
+        for (const auto& seg : m_segments)
+            out += seg.bump;
+        return out;
+    }
+
+    void recordBlock(size_t idx, const std::string& phase) const {
+        if (!mem_trace_enabled() || !env_truthy(std::getenv("DEME_VMM_TEMP_ARENA_SLICE_TRACE")) ||
+            idx >= m_blocks.size())
+            return;
+        const Block& b = m_blocks[idx];
+        const void* ptr = ptrForBlock(b);
+        if (!ptr)
+            return;
+        MemoryLedgerRecord rec;
+        rec.array_object = ptr;
+        rec.owner = "scratch";
+        rec.name = b.free ? std::string("arena-free") : b.name;
+        rec.role = "ScratchTemporary";
+        rec.type_name = "scratch_t";
+        rec.type_size = 1;
+        rec.logical_bytes = b.requested;
+        rec.capacity_bytes = b.size;
+        rec.committed_bytes = 0;  // physical bytes are owned by the aggregate arena record, avoiding double count
+        rec.host_bytes = 0;
+        rec.high_water_capacity_bytes = b.size;
+        rec.device_ptr = ptr;
+        rec.is_view = false;
+        rec.has_host_mirror = false;
+        rec.backend = "vmm-temp-arena-slice";
+        rec.phase = phase;
+        upsert_memory_ledger_record(rec);
+    }
+
+    void eraseArenaAndBlocks() const {
+        if (!mem_trace_enabled())
+            return;
+        erase_memory_ledger_record(this);
+        for (const auto& b : m_blocks) {
+            const void* ptr = ptrForBlock(b);
+            if (ptr)
+                erase_memory_ledger_record(ptr);
+        }
+    }
+};
+
+
 
 }  // namespace detail
 

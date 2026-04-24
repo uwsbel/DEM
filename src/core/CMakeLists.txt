@@ -56,6 +56,9 @@ else()
 	)
 endif()
 
+if(TARGET CUDA::cuda_driver)
+    target_link_libraries(core PUBLIC CUDA::cuda_driver)
+endif()
 
 set(core_headers
 	${CMAKE_BINARY_DIR}/src/core/ApiVersion.h
