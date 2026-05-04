@@ -465,7 +465,7 @@ class DEMDynamicThread {
     // Host mirror for the final world-space contact point (owner-A primary frame). Device storage is either this
     // DualArray's own device buffer (fallback/mixed-contact mode) or contactAuxArena (40N alias mode).
     DualArray<float3> contactPointGeometryA = DualArray<float3>(&m_approxHostBytesUsed, &m_approxDeviceBytesUsed);
-    // Deprecated/unused device array retained only to avoid a wider ABI/JIT refactor. It is not allocated.
+    // Primitive mesh-contact scratch during patch aggregation. Device storage is phase-bound to contactPointGeometryB.
     DualArray<float3> contactPointGeometryB = DualArray<float3>(&m_approxHostBytesUsed, &m_approxDeviceBytesUsed);
     // Wildcard (extra property) arrays associated with contacts and owners
     std::vector<std::unique_ptr<DualArray<float>>> contactWildcards;

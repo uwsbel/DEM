@@ -314,6 +314,31 @@ void getContactForcesConcerningOwners(float3* d_points,
 // Patch-based voting kernels for mesh contact correction
 ////////////////////////////////////////////////////////////////////////////////
 
+__device__ __forceinline__ bool primitiveMeshScratchAvailable(const DEMDataDT* granData,
+                                                              contactPairs_t contactID) {
+    return granData->contactPointGeometryB &&
+           contactID >= granData->contactScalarOffset &&
+           contactID < granData->contactScalarOffset + granData->contactScalarCount;
+}
+
+__device__ __forceinline__ float3 primitiveMeshScratchNormal(const DEMDataDT* granData,
+                                                            contactPairs_t contactID) {
+    if (primitiveMeshScratchAvailable(granData, contactID)) {
+        const contactPairs_t scalarID = contactID - granData->contactScalarOffset;
+        return granData->contactPointGeometryB[scalarID];
+    }
+    return granData->contactForces[contactID];
+}
+
+__device__ __forceinline__ float3 primitiveMeshScratchContactPoint(const DEMDataDT* granData,
+                                                                   contactPairs_t contactID) {
+    if (primitiveMeshScratchAvailable(granData, contactID)) {
+        const contactPairs_t scalarID = contactID - granData->contactScalarOffset;
+        return granData->contactPointGeometryB[granData->contactScalarCount + scalarID];
+    }
+    return granData->contactTorque_convToForce[contactID];
+}
+
 // Kernel to compute weighted normals (normal * area / penetration) for voting
 // Also prepares the area values for reduction and extracts the keys (geomToPatchMap values)
 
@@ -327,7 +352,7 @@ __global__ void prepareWeightedNormalsForVoting_impl(DEMDataDT* granData,
         contactPairs_t myContactID = startOffset + idx;
 
         // Normal and geometric quantities were produced by the primitive contact kernels.
-        float3 normal = granData->contactForces[myContactID];
+        float3 normal = primitiveMeshScratchNormal(granData, myContactID);
 
         // TODO: is this block necessary?
 
@@ -504,7 +529,7 @@ __global__ void prepareTriTriNormalsForPatchVote_impl(const DEMSimParams* simPar
     }
 
     const contactPairs_t myContactID = startOffset + idx;
-    float3 n_raw = granData->contactForces[myContactID];
+    float3 n_raw = primitiveMeshScratchNormal(granData, myContactID);
     if (granData->contactTypePrimitive[myContactID] != TRIANGLE_TRIANGLE_CONTACT) {
         orientedNormals[idx] = n_raw;
         return;
@@ -577,9 +602,9 @@ __global__ void prepareTriTriPlaneFitAccumulators_impl(DEMDataDT* granData,
     if (granData->contactTypePrimitive[myContactID] == TRIANGLE_TRIANGLE_CONTACT) {
         const double rawPen = granData->contactPenetration[myContactID - granData->contactScalarOffset];
         if (rawPen >= 0.0) {
-            const double3 cp = to_double3(granData->contactTorque_convToForce[myContactID]);
+            const double3 cp = to_double3(primitiveMeshScratchContactPoint(granData, myContactID));
             if (finiteDouble3(cp)) {
-                const float3 n_unit = normalizeFloat3OrZero(granData->contactForces[myContactID]);
+                const float3 n_unit = normalizeFloat3OrZero(primitiveMeshScratchNormal(granData, myContactID));
                 const double w = (rawPen > 0.0) ? rawPen : 1.0;
                 acc.weightSum = w;
                 acc.sumPx = w * cp.x;
@@ -719,7 +744,7 @@ __global__ void recomputeTriTriAreaAndPrepareLiteAccumulators_impl(const DEMSimP
         return;
     }
 
-    const float3 cpFallbackStorage = granData->contactTorque_convToForce[myContactID];
+    const float3 cpFallbackStorage = primitiveMeshScratchContactPoint(granData, myContactID);
     double3 cp = to_double3(cpFallbackStorage);
     double area = 0.0;
 
@@ -795,6 +820,10 @@ __global__ void recomputeTriTriAreaAndPrepareLiteAccumulators_impl(const DEMSimP
     }
 
     granData->contactArea[myContactID - granData->contactScalarOffset] = area > 0.0 ? area : 0.0;
+    if (primitiveMeshScratchAvailable(granData, myContactID)) {
+        const contactPairs_t scalarID = myContactID - granData->contactScalarOffset;
+        granData->contactPointGeometryB[granData->contactScalarCount + scalarID] = to_float3(cp);
+    }
     granData->contactTorque_convToForce[myContactID] = to_float3(cp);
     // Do not kill the primitive candidate here. This stage only reconstructs patch area; candidate lifetime belongs to
     // kT/pass-1. Zeroing the type here turns tiny numerical seam misses into visible patch-area flicker.
@@ -926,13 +955,13 @@ __global__ void computePatchContactAccumulators_impl(DEMDataDT* granData,
         // sph-tri face rejects), and allowing them into max-penetration voting can inject invalid normals.
         const double projectedPenetration = contributes ? originalPenetration : 0.0;
 
-        const double3 contactPointRaw = to_double3(granData->contactTorque_convToForce[myContactID]);
+        const double3 contactPointRaw = to_double3(primitiveMeshScratchContactPoint(granData, myContactID));
         const double3 contactPoint = contributes ? contactPointRaw : make_double3(0.0, 0.0, 0.0);
         const double3 areaWeightedCP =
             make_double3(contactPoint.x * projectedArea,
                          contactPoint.y * projectedArea,
                          contactPoint.z * projectedArea);
-        const float3 primitiveNormal = contributes ? granData->contactForces[myContactID] : make_float3(0.f, 0.f, 0.f);
+        const float3 primitiveNormal = contributes ? primitiveMeshScratchNormal(granData, myContactID) : make_float3(0.f, 0.f, 0.f);
 
         PatchContactAccum acc{};
         acc.sumProjArea = projectedArea;
@@ -1154,7 +1183,7 @@ __global__ void findMaxPenetrationPrimitiveForZeroAreaPatches_impl(DEMDataDT* gr
             // This primitive has the max penetration - use its normal, penetration, and contact point
             // Note: if multiple primitives have the same max, any one of them is fine
             // The race condition is acceptable since all competing values are valid
-            float3 myNormal = granData->contactForces[myContactID];
+            float3 myNormal = primitiveMeshScratchNormal(granData, myContactID);
             zeroAreaNormals[localPatchIdx] = myNormal;
             zeroAreaPenetrations[localPatchIdx] = myPenetration < 0.0 ? myPenetration : -DEME_HUGE_FLOAT;
             // This zeroAreaPenetrations should store a negative number, as when it is needed, it's usually the
@@ -1164,7 +1193,7 @@ __global__ void findMaxPenetrationPrimitiveForZeroAreaPatches_impl(DEMDataDT* gr
             // calculation, this one is considered a non-contact.
 
             // Also store the contact point from this max-penetration primitive
-            double3 myContactPoint = to_double3(granData->contactTorque_convToForce[myContactID]);
+            double3 myContactPoint = to_double3(primitiveMeshScratchContactPoint(granData, myContactID));
             zeroAreaContactPoints[localPatchIdx] = myContactPoint;
         }
     }

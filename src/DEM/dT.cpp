@@ -631,7 +631,7 @@ void DEMDynamicThread::migrateDataToDevice() {
 
     contactForces.toDeviceAsync(streamInfo.stream);
     contactTorque_convToForce.toDeviceAsync(streamInfo.stream);
-    // contactPointGeometryA device storage is phase-bound later; contactPointGeometryB is deprecated.
+    // contactPointGeometryA/B device storage is phase-bound later.
 
     for (unsigned int i = 0; i < simParams->nContactWildcards; i++) {
         contactWildcards[i]->toDeviceAsync(streamInfo.stream);
@@ -3201,11 +3201,13 @@ inline void DEMDynamicThread::bindPrimitiveContactWorkspace(bool separate_final_
     if (contactScalarCount > 0) {
         granData->contactPenetration = reinterpret_cast<double*>(arena + scalar_offset_bytes);
         granData->contactArea = granData->contactPenetration + contactScalarCount;
+        contactPointGeometryB.resizeDevice(2 * contactScalarCount);
+        granData->contactPointGeometryB = contactPointGeometryB.device();
     } else {
         granData->contactPenetration = nullptr;
         granData->contactArea = nullptr;
+        granData->contactPointGeometryB = nullptr;
     }
-    granData->contactPointGeometryB = nullptr;
 
     contactFinalPointUsesSeparateDeviceArray = separate_final_points;
     contactFinalPointUsesArena = !separate_final_points;

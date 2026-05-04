@@ -455,7 +455,9 @@ struct DEMDataDT {
     // During the primitive pass this can be null; patch/contact-output kernels bind it only once pen/area
     // scratch is no longer needed.
     float3* contactPointGeometryA;
-    // Deprecated device storage. Kept in DEMDataDT for ABI/JIT compatibility, but intentionally not allocated.
+    // Primitive mesh-contact scratch during patch aggregation. First contactScalarCount entries store primitive normals,
+    // second contactScalarCount entries store primitive contact points, indexed by contactID - contactScalarOffset.
+    // It is kept separate from final force/torque output slots, whose patch indices can overlap mesh primitive indices.
     float3* contactPointGeometryB;
     // Primitive-contact scalar payloads. These alias a raw contact workspace arena during the primitive/aggregation
     // phase and are invalid after the workspace is rebound for final contact points.

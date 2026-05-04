@@ -1272,9 +1272,8 @@ __device__ __forceinline__ void calculatePrimitiveContactForces_impl(deme::DEMSi
             overlapDepth = -1.0;
             overlapArea = 0.0;
         }
-        // Use two float3 lanes plus two double scalar lanes for the next patch aggregation kernels:
-        // contactForces stores the primitive normal, contactTorque_convToForce stores the primitive contact point,
-        // contactPenetration/contactArea store the scalar payload without the old float3 packing overhead.
+        // Use independent scratch lanes for patch aggregation. contactPointGeometryB stores primitive normals and contact
+        // points by scalar-local index so direct patch force/torque output cannot overwrite mesh primitive geometry.
 
         // Store contact normal (B2A is already a float3)
         granData->contactForces[myPrimitiveContactID] = B2A;
@@ -1288,6 +1287,10 @@ __device__ __forceinline__ void calculatePrimitiveContactForces_impl(deme::DEMSi
                 myPrimitiveContactID, ContactType, granData->contactScalarOffset, granData->contactScalarCount);
         }
         const deme::contactPairs_t scalarID = myPrimitiveContactID - granData->contactScalarOffset;
+        if (granData->contactPointGeometryB) {
+            granData->contactPointGeometryB[scalarID] = B2A;
+            granData->contactPointGeometryB[granData->contactScalarCount + scalarID] = to_float3(contactPnt);
+        }
         // Store contact penetration depth and area in dedicated double scratch lanes.
         granData->contactPenetration[scalarID] = overlapDepth;
         // If this is not a contact, store 0.0 in area, so it has no voting power in the next kernels. Note the
