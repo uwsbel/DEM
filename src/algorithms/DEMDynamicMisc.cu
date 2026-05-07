@@ -1468,10 +1468,21 @@ void computePatchPVScalars(DEMSimParams* simParams,
     }
 }
 
+__device__ __forceinline__ float primitiveTriangleReferenceArea(const DEMDataDT* granData, bodyID_t triID) {
+    const float3 a = granData->relPosNode1[triID];
+    const float3 b = granData->relPosNode2[triID];
+    const float3 c = granData->relPosNode3[triID];
+    const float3 e1 = b - a;
+    const float3 e2 = c - a;
+    const float area = 0.5f * length(cross(e1, e2));
+    return (isfinite(area) && area > DEME_TINY_FLOAT) ? area : 0.f;
+}
+
 __global__ void accumulateTrianglePVFromPatchContacts_impl(const DEMSimParams* simParams,
                                                            DEMDataDT* granData,
                                                            const contactPairs_t* keys,
                                                            const PatchContactAccum* primitiveAccumulators,
+                                                           const PatchContactAccum* patchAccumulators,
                                                            const double* finalPatchAreas,
                                                            const float* patchNormalForce,
                                                            const float* patchSlipSpeed,
@@ -1495,12 +1506,15 @@ __global__ void accumulateTrianglePVFromPatchContacts_impl(const DEMSimParams* s
     const contactPairs_t localPatchIdx = patchContactID - startOffsetPatch;
 
     const double patchWeight = finalPatchAreas[localPatchIdx];
+    const double rawPatchWeight =
+        patchAccumulators ? patchAccumulators[localPatchIdx].sumProjArea : patchWeight;
     const double primitiveWeight = primitiveAccumulators[idx].sumProjArea;
     if (patchWeight <= 0.0 || primitiveWeight <= 0.0) {
         return;
     }
 
-    float share = static_cast<float>(primitiveWeight / patchWeight);
+    const double shareDenom = (rawPatchWeight > 0.0) ? rawPatchWeight : patchWeight;
+    float share = static_cast<float>(primitiveWeight / shareDenom);
     if (!(share > 0.f)) {
         return;
     }
@@ -1512,7 +1526,6 @@ __global__ void accumulateTrianglePVFromPatchContacts_impl(const DEMSimParams* s
     }
     const float pContribution = normalForce * share;
     const float slipSpeed = patchSlipSpeed[localPatchIdx];
-    const float pvContribution = pContribution * slipSpeed;
 
     const contact_t primType = granData->contactTypePrimitive[primContactID];
     if (primType == NOT_A_CONTACT) {
@@ -1528,9 +1541,11 @@ __global__ void accumulateTrianglePVFromPatchContacts_impl(const DEMSimParams* s
         const bodyID_t triA = cylPeriodicDecodeID(granData->idPrimitiveA[primContactID], triGhost, triGhostNeg);
         if (triA < simParams->nTriGM) {
             const int localIdx = triGlobalToLocal[triA];
-            if (localIdx >= 0) {
-                atomicAdd(triAccumP + localIdx, pContribution);
-                atomicAdd(triAccumPV + localIdx, pvContribution);
+            const float triArea = primitiveTriangleReferenceArea(granData, triA);
+            if (localIdx >= 0 && triArea > 0.f) {
+                const float pressure = pContribution / triArea;
+                atomicAdd(triAccumP + localIdx, pressure);
+                atomicAdd(triAccumPV + localIdx, pressure * slipSpeed);
             }
         }
     }
@@ -1539,9 +1554,11 @@ __global__ void accumulateTrianglePVFromPatchContacts_impl(const DEMSimParams* s
         const bodyID_t triB = cylPeriodicDecodeID(granData->idPrimitiveB[primContactID], triGhost, triGhostNeg);
         if (triB < simParams->nTriGM) {
             const int localIdx = triGlobalToLocal[triB];
-            if (localIdx >= 0) {
-                atomicAdd(triAccumP + localIdx, pContribution);
-                atomicAdd(triAccumPV + localIdx, pvContribution);
+            const float triArea = primitiveTriangleReferenceArea(granData, triB);
+            if (localIdx >= 0 && triArea > 0.f) {
+                const float pressure = pContribution / triArea;
+                atomicAdd(triAccumP + localIdx, pressure);
+                atomicAdd(triAccumPV + localIdx, pressure * slipSpeed);
             }
         }
     }
@@ -1551,6 +1568,7 @@ void accumulateTrianglePVFromPatchContacts(DEMSimParams* simParams,
                                            DEMDataDT* granData,
                                            const contactPairs_t* keys,
                                            const PatchContactAccum* primitiveAccumulators,
+                                           const PatchContactAccum* patchAccumulators,
                                            const double* finalPatchAreas,
                                            const float* patchNormalForce,
                                            const float* patchSlipSpeed,
@@ -1565,8 +1583,9 @@ void accumulateTrianglePVFromPatchContacts(DEMSimParams* simParams,
     size_t blocks_needed = (countPrimitive + DEME_MAX_THREADS_PER_BLOCK - 1) / DEME_MAX_THREADS_PER_BLOCK;
     if (blocks_needed > 0) {
         accumulateTrianglePVFromPatchContacts_impl<<<blocks_needed, DEME_MAX_THREADS_PER_BLOCK, 0, this_stream>>>(
-            simParams, granData, keys, primitiveAccumulators, finalPatchAreas, patchNormalForce, patchSlipSpeed,
-            startOffsetPrimitive, startOffsetPatch, countPatch, countPrimitive, triGlobalToLocal, triAccumP, triAccumPV);
+            simParams, granData, keys, primitiveAccumulators, patchAccumulators, finalPatchAreas, patchNormalForce,
+            patchSlipSpeed, startOffsetPrimitive, startOffsetPatch, countPatch, countPrimitive, triGlobalToLocal,
+            triAccumP, triAccumPV);
     }
 }
 

@@ -4159,7 +4159,7 @@ inline void DEMDynamicThread::dispatchPatchBasedForceCorrections(
                                           patchNormalForce, patchSlipSpeed, streamInfo.stream);
                     if (patchContactAccumulators) {
                         accumulateTrianglePVFromPatchContacts(
-                            &simParams, &granData, keys, primitivePatchAccumulators, finalAreas,
+                            &simParams, &granData, keys, primitivePatchAccumulators, patchContactAccumulators, finalAreas,
                             patchNormalForce, patchSlipSpeed, startOffsetPrimitive, startOffsetPatch, countPatch, countPrimitive,
                             triPVGlobalTriToLocal.device(), triPVAccumP.device(),
                             triPVAccumPV.device(), streamInfo.stream);
