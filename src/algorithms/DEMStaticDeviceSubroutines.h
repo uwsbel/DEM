@@ -484,6 +484,7 @@ void accumulateTrianglePVFromPatchContacts(DEMSimParams* simParams,
                                            const int* triGlobalToLocal,
                                            float* triAccumP,
                                            float* triAccumPV,
+                                           float* triAccumV,
                                            cudaStream_t& this_stream);
 
 ////////////////////////////////////////////////////////////////////////////////

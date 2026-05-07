@@ -3343,6 +3343,7 @@ void DEMSolver::cacheTrackedTrianglePVWindow() {
     if (dT->triPVWindowSteps > 0) {
         dT->triPVAccumP.toHost();
         dT->triPVAccumPV.toHost();
+        dT->triPVAccumV.toHost();
     }
     const float inv_steps = (dT->triPVWindowSteps > 0) ? (1.f / static_cast<float>(dT->triPVWindowSteps)) : 0.f;
 
@@ -3368,7 +3369,7 @@ void DEMSolver::cacheTrackedTrianglePVWindow() {
                 if (!std::isfinite(pv) || pv < 0.f) {
                     pv = 0.f;
                 }
-                float v = (p > DEME_TINY_FLOAT) ? (pv / p) : 0.f;
+                float v = dT->triPVAccumV[offset + i] * inv_steps;
                 if (!std::isfinite(v) || v < 0.f) {
                     v = 0.f;
                 }

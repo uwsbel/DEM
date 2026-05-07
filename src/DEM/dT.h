@@ -297,6 +297,7 @@ class DEMDynamicThread {
     DualArray<float> triPVStepPV = DualArray<float>(&m_approxHostBytesUsed, &m_approxDeviceBytesUsed);
     DualArray<float> triPVAccumP = DualArray<float>(&m_approxHostBytesUsed, &m_approxDeviceBytesUsed);
     DualArray<float> triPVAccumPV = DualArray<float>(&m_approxHostBytesUsed, &m_approxDeviceBytesUsed);
+    DualArray<float> triPVAccumV = DualArray<float>(&m_approxHostBytesUsed, &m_approxDeviceBytesUsed);
     std::vector<bodyID_t> triPVOwnerOrder;
     std::vector<size_t> triPVOwnerOffsets;
     std::vector<size_t> triPVOwnerCounts;

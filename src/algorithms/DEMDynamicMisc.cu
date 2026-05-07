@@ -1492,9 +1492,11 @@ __global__ void accumulateTrianglePVFromPatchContacts_impl(const DEMSimParams* s
                                                            contactPairs_t countPrimitive,
                                                            const int* triGlobalToLocal,
                                                            float* triAccumP,
-                                                           float* triAccumPV) {
+                                                           float* triAccumPV,
+                                                           float* triAccumV) {
     contactPairs_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= countPrimitive || !triGlobalToLocal || !triAccumP || !triAccumPV || !finalPatchAreas) {
+    if (idx >= countPrimitive || !triGlobalToLocal || !triAccumP || !triAccumPV || !triAccumV ||
+        !finalPatchAreas) {
         return;
     }
 
@@ -1546,6 +1548,7 @@ __global__ void accumulateTrianglePVFromPatchContacts_impl(const DEMSimParams* s
                 const float pressure = pContribution / triArea;
                 atomicAdd(triAccumP + localIdx, pressure);
                 atomicAdd(triAccumPV + localIdx, pressure * slipSpeed);
+                atomicAdd(triAccumV + localIdx, slipSpeed);
             }
         }
     }
@@ -1559,6 +1562,7 @@ __global__ void accumulateTrianglePVFromPatchContacts_impl(const DEMSimParams* s
                 const float pressure = pContribution / triArea;
                 atomicAdd(triAccumP + localIdx, pressure);
                 atomicAdd(triAccumPV + localIdx, pressure * slipSpeed);
+                atomicAdd(triAccumV + localIdx, slipSpeed);
             }
         }
     }
@@ -1579,13 +1583,14 @@ void accumulateTrianglePVFromPatchContacts(DEMSimParams* simParams,
                                            const int* triGlobalToLocal,
                                            float* triAccumP,
                                            float* triAccumPV,
+                                           float* triAccumV,
                                            cudaStream_t& this_stream) {
     size_t blocks_needed = (countPrimitive + DEME_MAX_THREADS_PER_BLOCK - 1) / DEME_MAX_THREADS_PER_BLOCK;
     if (blocks_needed > 0) {
         accumulateTrianglePVFromPatchContacts_impl<<<blocks_needed, DEME_MAX_THREADS_PER_BLOCK, 0, this_stream>>>(
             simParams, granData, keys, primitiveAccumulators, patchAccumulators, finalPatchAreas, patchNormalForce,
             patchSlipSpeed, startOffsetPrimitive, startOffsetPatch, countPatch, countPrimitive, triGlobalToLocal,
-            triAccumP, triAccumPV);
+            triAccumP, triAccumPV, triAccumV);
     }
 }
 

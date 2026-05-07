@@ -686,6 +686,7 @@ void DEMDynamicThread::migrateDataToDevice() {
     }
     triPVAccumP.toDeviceAsync(streamInfo.stream);
     triPVAccumPV.toDeviceAsync(streamInfo.stream);
+    triPVAccumV.toDeviceAsync(streamInfo.stream);
 
     // Might not be necessary... but it's a big call anyway, let's sync
     syncMemoryTransfer();
@@ -1050,6 +1051,7 @@ void DEMDynamicThread::allocateGPUArrays(size_t nOwnerBodies,
     triPVStepPV.free();
     DEME_DUAL_ARRAY_RESIZE(triPVAccumP, 1, 0.f);
     DEME_DUAL_ARRAY_RESIZE(triPVAccumPV, 1, 0.f);
+    DEME_DUAL_ARRAY_RESIZE(triPVAccumV, 1, 0.f);
 
     // Resize to the number of clumps
     DEME_DUAL_ARRAY_RESIZE(familyID, nOwnerBodies, 0);
@@ -4162,7 +4164,7 @@ inline void DEMDynamicThread::dispatchPatchBasedForceCorrections(
                             &simParams, &granData, keys, primitivePatchAccumulators, patchContactAccumulators, finalAreas,
                             patchNormalForce, patchSlipSpeed, startOffsetPrimitive, startOffsetPatch, countPatch, countPrimitive,
                             triPVGlobalTriToLocal.device(), triPVAccumP.device(),
-                            triPVAccumPV.device(), streamInfo.stream);
+                            triPVAccumPV.device(), triPVAccumV.device(), streamInfo.stream);
                     }
                     solverScratchSpace.finishUsingTempVector("patchNormalForce");
                     solverScratchSpace.finishUsingTempVector("patchSlipSpeed");
@@ -5293,6 +5295,7 @@ void DEMDynamicThread::registerMemoryLedgerNames() {
     DEME_DT_MEM(triPVStepPV, MemoryRole::OutputStaging);
     DEME_DT_MEM(triPVAccumP, MemoryRole::OutputStaging);
     DEME_DT_MEM(triPVAccumPV, MemoryRole::OutputStaging);
+    DEME_DT_MEM(triPVAccumV, MemoryRole::OutputStaging);
 
     DEME_DT_MEM(massOwnerBody, MemoryRole::StaticReadOnly);
     DEME_DT_MEM(mmiXX, MemoryRole::StaticReadOnly);
@@ -6073,10 +6076,12 @@ void DEMDynamicThread::configureTrianglePVTracking(const std::vector<bodyID_t>& 
     triPVStepPV.free();
     DEME_DUAL_ARRAY_RESIZE(triPVAccumP, alloc_size, 0.f);
     DEME_DUAL_ARRAY_RESIZE(triPVAccumPV, alloc_size, 0.f);
+    DEME_DUAL_ARRAY_RESIZE(triPVAccumV, alloc_size, 0.f);
 
     triPVGlobalTriToLocal.toDeviceAsync(streamInfo.stream);
     triPVAccumP.toDeviceAsync(streamInfo.stream);
     triPVAccumPV.toDeviceAsync(streamInfo.stream);
+    triPVAccumV.toDeviceAsync(streamInfo.stream);
     syncMemoryTransfer();
 
     triPVOwnerOrder = std::move(owner_order);
@@ -6119,6 +6124,9 @@ void DEMDynamicThread::disableTrianglePVTracking() {
         DEME_GPU_CALL(
             cudaMemsetAsync(triPVAccumPV.device(), 0, triPVAccumPV.size() * sizeof(float), streamInfo.stream));
     }
+    if (triPVAccumV.size() > 0) {
+        DEME_GPU_CALL(cudaMemsetAsync(triPVAccumV.device(), 0, triPVAccumV.size() * sizeof(float), streamInfo.stream));
+    }
     syncMemoryTransfer();
 }
 
@@ -6145,6 +6153,7 @@ bool DEMDynamicThread::getTrackedOwnerTrianglePV(bodyID_t ownerID,
     if (count > 0 && triPVWindowSteps > 0) {
         triPVAccumP.toHost();
         triPVAccumPV.toHost();
+        triPVAccumV.toHost();
         const float inv_steps = 1.f / static_cast<float>(triPVWindowSteps);
         for (size_t i = 0; i < count; i++) {
             avgP[i] = triPVAccumP[offset + i] * inv_steps;
@@ -6155,7 +6164,7 @@ bool DEMDynamicThread::getTrackedOwnerTrianglePV(bodyID_t ownerID,
             if (!std::isfinite(avgPV[i]) || avgPV[i] < 0.f) {
                 avgPV[i] = 0.f;
             }
-            avgV[i] = (avgP[i] > DEME_TINY_FLOAT) ? (avgPV[i] / avgP[i]) : 0.f;
+            avgV[i] = triPVAccumV[offset + i] * inv_steps;
             if (!std::isfinite(avgV[i]) || avgV[i] < 0.f) {
                 avgV[i] = 0.f;
             }
@@ -6177,6 +6186,9 @@ void DEMDynamicThread::resetTrackedTrianglePVWindow() {
     if (triPVAccumPV.size() > 0) {
         DEME_GPU_CALL(
             cudaMemsetAsync(triPVAccumPV.device(), 0, triPVAccumPV.size() * sizeof(float), streamInfo.stream));
+    }
+    if (triPVAccumV.size() > 0) {
+        DEME_GPU_CALL(cudaMemsetAsync(triPVAccumV.device(), 0, triPVAccumV.size() * sizeof(float), streamInfo.stream));
     }
     syncMemoryTransfer();
 }
