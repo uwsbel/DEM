@@ -57,6 +57,10 @@ inline bool triangle_scene(const DualStruct<DEMSimParams>& simParams) {
     return triangle_scene(&(*simParams));
 }
 
+inline bool triangle_prescribed_motion_guard(const SolverFlags& solverFlags) {
+    return solverFlags.prescribedAngVelMagnitudeHint > 20.f || solverFlags.prescribedLinVelMagnitudeHint > 1.f;
+}
+
 inline size_t quantized_contact_capacity(size_t n) {
     const size_t floor_cap = 1024;
     n = std::max(n, floor_cap);
@@ -205,10 +209,9 @@ void DEMKinematicThread::calibrateParams() {
             const bool tri_scene = triangle_scene(simParams);
             const float top_rate = tri_scene ? std::min(stateParams.binTopChangeRate, 0.03f)
                                              : stateParams.binTopChangeRate;
-            const bool strong_prescribed_motion =
-                (solverFlags.prescribedAngVelMagnitudeHint > 20.f);
+            const bool strong_prescribed_motion = triangle_prescribed_motion_guard(solverFlags);
             if (tri_scene && strong_prescribed_motion) {
-                // In strong prescribed-rotation tri scenes, timing-noise-driven bin adaptation causes
+                // In strong prescribed-motion tri scenes, timing-noise-driven bin adaptation causes
                 // large run-to-run variability and occasional candidate spikes. Keep bin size fixed.
                 stateParams.binCurrentChangeRate = 0.f;
                 DEME_DEBUG_PRINTF("Strong-motion tri scene: freezing adaptive bin-size updates.");

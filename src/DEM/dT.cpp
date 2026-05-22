@@ -56,6 +56,13 @@ inline bool triangle_scene(const DualStruct<DEMSimParams>& simParams) {
     return triangle_scene(&(*simParams));
 }
 
+inline bool triangle_prescribed_motion_guard(const SolverFlags& solverFlags) {
+    // VMM did not create the large allocation request; it made transient scratch bursts visible/retained.
+    // Treat fast prescribed linear motion like fast prescribed rotation for triangle scenes, because both stale
+    // kT geometry horizons can inflate bin-touch/contact-candidate scratch by orders of magnitude.
+    return solverFlags.prescribedAngVelMagnitudeHint > 20.f || solverFlags.prescribedLinVelMagnitudeHint > 1.f;
+}
+
 struct DriftSchedulerTuning {
     // Tune these first if you want to trade speed against VRAM growth.
     // Higher gains / lower gates => stricter scheduler, lower drift, lower VRAM.
@@ -3614,7 +3621,7 @@ bool DEMDynamicThread::publishKinematicWorkOrder(bool allow_overwrite_pending, b
                              (double)simParams->errOutBinTriNum,
                          0.0, 1.0)
             : 0.0;
-    const bool strong_prescribed_motion = (solverFlags.prescribedAngVelMagnitudeHint > 20.f);
+    const bool strong_prescribed_motion = triangle_prescribed_motion_guard(solverFlags);
     const double pressure =
         strong_prescribed_motion ? std::max(contact_pressure, std::max(sph_bin_pressure, tri_bin_pressure))
                                  : contact_pressure;
@@ -3724,7 +3731,7 @@ inline void DEMDynamicThread::sendToTheirBuffer() {
     // Note that perhapsIdealFutureDrift is non-negative, and it will be used to determine the margin size; however, if
     // scheduleHelper is instructed to have negative future drift then perhapsIdealFutureDrift no longer affects them.
     unsigned int drift_to_send = std::max(1u, *perhapsIdealFutureDrift);
-    if (triangle_scene(simParams) && solverFlags.prescribedAngVelMagnitudeHint > 20.f) {
+    if (triangle_scene(simParams) && triangle_prescribed_motion_guard(solverFlags)) {
         // Strong prescribed-motion + triangle scenes are sensitive to one-step drift overshoots.
         // Clamp commanded drift before sending to kT so candidate memory cannot spike in one update.
         unsigned int hard_cap = (simParams->nContactWildcards > 0) ? 6u : 8u;
@@ -3744,20 +3751,16 @@ inline void DEMDynamicThread::sendToTheirBuffer() {
                              0.0, 1.0)
                 : 0.0;
         const double bin_pressure = std::max(sph_bin_pressure, tri_bin_pressure);
-        // Early-step guard: startup spikes can be catastrophic in larger cases (OOM-risk), so be conservative briefly.
-        if (dyn_stamp >= 0 && dyn_stamp < 8000) {
+        (void)dyn_stamp;
+        // Keep the geometric horizon bounded for the whole prescribed-motion interval, not just startup.
+        // A cap of 3 is very safe but forces dT to refresh almost every third step. In low-pressure
+        // prescribed-translation triangle scenes, cap at 4 so dT can keep roughly the old simple-case lead
+        // while still avoiding the 6--8 step horizon that creates VMM-visible scratch bursts.
+        hard_cap = std::min(hard_cap, 4u);
+        // Contact/bin-pressure rich scenes are at highest risk of transient candidate bursts; fall back to
+        // the stricter 3-step horizon only when kT reports real pressure.
+        if (avg_prim_contacts > 10.0 || bin_pressure > 0.78) {
             hard_cap = std::min(hard_cap, 3u);
-        }
-        // Contact-rich scenes are at highest risk of transient candidate bursts.
-        if (avg_prim_contacts > 10.0) {
-            hard_cap = std::min(hard_cap, 4u);
-        } else if (avg_prim_contacts > 6.0) {
-            hard_cap = std::min(hard_cap, 5u);
-        }
-        if (bin_pressure > 0.78) {
-            hard_cap = std::min(hard_cap, 5u);
-        } else if (bin_pressure > 0.62) {
-            hard_cap = std::min(hard_cap, 6u);
         }
         drift_to_send = std::min(drift_to_send, hard_cap);
     }
@@ -4515,8 +4518,7 @@ inline void DEMDynamicThread::calibrateParams() {
     ema_asym(r.bin_pressure_ema, r.bin_pressure_initialized, bin_pressure_raw, 0.30, 0.12, 0.0);
     const double bin_pressure =
         r.bin_pressure_initialized ? std::max(bin_pressure_raw, r.bin_pressure_ema) : bin_pressure_raw;
-    const bool strong_prescribed_motion =
-        (solverFlags.prescribedAngVelMagnitudeHint > 20.f);
+    const bool strong_prescribed_motion = triangle_prescribed_motion_guard(solverFlags);
     const double avg_prim_contacts =
         std::max(0.0, (double)pSchedSupport->kinematicAvgPrimitiveContacts.load(std::memory_order_relaxed));
     const double early_drift_pressure =
@@ -4801,7 +4803,7 @@ inline void DEMDynamicThread::ifProduceFreshThenUseItAndSendNewOrder() {
                                          (double)simParams->errOutBinTriNum,
                                      0.0, 1.0)
                         : 0.0;
-                const bool strong_prescribed_motion = (solverFlags.prescribedAngVelMagnitudeHint > 20.f);
+                const bool strong_prescribed_motion = triangle_prescribed_motion_guard(solverFlags);
                 const double pressure =
                     strong_prescribed_motion ? std::max(contact_pressure, std::max(sph_bin_pressure, tri_bin_pressure))
                                              : contact_pressure;
@@ -4931,8 +4933,10 @@ void DEMDynamicThread::workerThread() {
             // a soft/hard stale policy:
             // - soft stale: proactively request a kT update (non-blocking)
             // - hard stale: block until fresh kT produce arrives
-            if (triangle_scene(simParams) || (simParams->useCylPeriodic && simParams->cylPeriodicSpan > 0.f)) {
+            const bool tri_scene_guard = triangle_scene(simParams);
+            if (tri_scene_guard || (simParams->useCylPeriodic && simParams->cylPeriodicSpan > 0.f)) {
                 const bool cyl_guard = simParams->useCylPeriodic && simParams->cylPeriodicSpan > 0.f;
+                const bool strong_tri_motion_guard = tri_scene_guard && triangle_prescribed_motion_guard(solverFlags);
                 const int64_t cur_stamp = pSchedSupport->currentStampOfDynamic.load(std::memory_order_relaxed);
                 const int64_t prod_stamp =
                     pSchedSupport->stampLastDynamicUpdateProdDate.load(std::memory_order_relaxed);
@@ -4946,8 +4950,13 @@ void DEMDynamicThread::workerThread() {
                         : -1;
                 const int64_t stale_lag = (prod_stamp >= 0) ? (cur_stamp - prod_stamp) : 0;
                 const bool stale_soft = (soft_horizon >= 0) ? (cur_stamp >= soft_horizon) : ((prod_stamp >= 0) && (stale_lag > 1));
+                // For fast prescribed triangle motion, do not consume kT-produced broadphase beyond the maxDrift
+                // horizon that was used to compute triangle margins. usableDrift is an early-refresh trigger;
+                // dynamicMaxFutureDrift is the correctness boundary. The legacy +1 slack is kept only for other cases.
                 const bool stale_hard = cyl_guard ? ((prod_stamp >= 0) && (stale_lag > 2))
-                                                  : ((total_horizon >= 0) && (cur_stamp > total_horizon + 1));
+                                                  : ((total_horizon >= 0) &&
+                                                     (strong_tri_motion_guard ? (cur_stamp > total_horizon)
+                                                                              : (cur_stamp > total_horizon + 1)));
                 unsigned int skip_potential_total = 0u;
                 if (cyl_guard && stale_soft && granData->ownerCylSkipPotentialTotal) {
                     DEME_GPU_CALL(cudaMemcpy(&skip_potential_total, granData->ownerCylSkipPotentialTotal,
@@ -4956,7 +4965,7 @@ void DEMDynamicThread::workerThread() {
                 constexpr unsigned int kSkipPotentialHardResyncThreshold = 32u;
                 const bool stale_with_skips =
                     cyl_guard && stale_soft && (skip_potential_total > kSkipPotentialHardResyncThreshold);
-                if ((stale_soft || stale_with_skips) &&
+                if ((stale_soft || stale_hard || stale_with_skips) &&
                     !pSchedSupport->dynamicOwned_Prod2ConsBuffer_isFresh.load(std::memory_order_acquire)) {
                     if (!pSchedSupport->kinematicOwned_Cons2ProdBuffer_isFresh.load(std::memory_order_acquire)) {
                         auto& reg = futureDriftRegulator;
